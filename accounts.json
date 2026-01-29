@@ -1,14 +1,14 @@
 [
   {
-    "susankheinz@yahoo.com": "ACCOUNT_1_USERNAME",
-    "DSJEX2026!": "ACCOUNT_1_PASSWORD"
+    "username": "Susankheinz@yahoo.com",
+    "password": "DSJEX2026!"
   },
   {
-    "sbheinz@gmail.com": "ACCOUNT_2_USERNAME",
-    "DSJEX2026!": "ACCOUNT_2_PASSWORD"
+    "username": "sbheinz@gmail.com",
+    "password": "DSJEX2026!"
   },
   {
-    "brandtheinz4@gmail.com": "ACCOUNT_2_USERNAME",
-    "DSJEX2026!": "ACCOUNT_2_PASSWORD"
+    "username": "brandtheinz4@gmail.com",
+    "password": "DSJEX2026!"
   }
 ]
