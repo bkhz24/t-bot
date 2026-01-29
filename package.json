@@ -4,8 +4,9 @@
   "description": "A bot using Playwright",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
-  },
+  "postinstall": "npx playwright install --with-deps chromium",
+  "start": "node index.js"
+},
   "dependencies": {
     "playwright": "^1.44.0"
   },
