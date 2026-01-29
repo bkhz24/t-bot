@@ -1,8 +1,8 @@
 const { chromium } = require("playwright");
 const accounts = require("./accounts.json");
 
-const LOGIN_URL = "https://YOUR_PLATFORM_LOGIN_URL";
-const FUTURES_URL = "https://YOUR_PLATFORM_FUTURES_URL";
+const LOGIN_URL = "https://bgol.pro/pc/#/login";
+const FUTURES_URL = "https://bgol.pro/pc/#/contractTransaction";
 
 async function runAccount(account) {
   const browser = await chromium.launch({ headless: true });
