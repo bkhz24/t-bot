@@ -2,12 +2,12 @@ FROM mcr.microsoft.com/playwright:v1.44.0-jammy
 
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm ci
+COPY package.json ./
+RUN npm install --omit=dev
 
 COPY . .
 
 ENV NODE_ENV=production
-ENV PORT=8080
+ENV PORT=3000
 
 CMD ["node", "index.js"]
