@@ -1,3 +1,4 @@
+process.env.PLAYWRIGHT_BROWSERS_PATH = process.env.PLAYWRIGHT_BROWSERS_PATH || "/ms-playwright";
 const express = require("express");
 const { chromium } = require("playwright");
 
