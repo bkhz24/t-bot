@@ -5,7 +5,7 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev
 
-# Install browsers explicitly (belt and suspenders)
+# Force browser install inside the container
 RUN npx playwright install --with-deps chromium
 
 COPY . .
