@@ -1,6 +1,5 @@
 const express = require("express");
 const { chromium } = require("playwright");
-const accounts = require("./accounts.json");
 
 let twilioClient = null;
 try {
@@ -15,13 +14,12 @@ app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
 
-// Protect the form
+// Password for the web form
 const RUN_PASSWORD = process.env.RUN_PASSWORD || "change-me";
 
-// Comma-separated login URLs, in order
-// Example:
-// https://bgol.pro/h5/#/login,https://dsj89.com/h5/#/login,https://dsj72.com/h5/#/login
-const LOGIN_URLS = (process.env.LOGIN_URLS || "https://bgol.pro/h5/#/login,https://dsj89.com/h5/#/login,https://dsj72.com/h5/#/login")
+// Fallback login URLs (comma-separated)
+const LOGIN_URLS = (process.env.LOGIN_URLS ||
+  "https://bgol.pro/h5/#/login,https://dsj89.com/h5/#/login,https://dsj72.com/h5/#/login")
   .split(",")
   .map((s) => String(s).trim())
   .filter(Boolean);
@@ -45,6 +43,23 @@ function escapeHtml(str) {
     .replaceAll(">", "&gt;");
 }
 
+function loadAccountsFromEnv() {
+  const pw = process.env.ACCOUNT_PASSWORD;
+  if (!pw) throw new Error("Missing ACCOUNT_PASSWORD in Railway Variables.");
+
+  const users = [];
+  for (let i = 1; i <= 20; i++) {
+    const u = process.env[`ACCOUNT_${i}_USERNAME`];
+    if (u && String(u).trim()) users.push(String(u).trim());
+  }
+
+  if (users.length === 0) {
+    throw new Error("No accounts found. Add ACCOUNT_1_USERNAME, ACCOUNT_2_USERNAME, etc.");
+  }
+
+  return users.map((username) => ({ username, password: pw }));
+}
+
 async function sendText(message) {
   if (!twilioClient) return;
   const from = process.env.TWILIO_FROM;
@@ -53,6 +68,7 @@ async function sendText(message) {
 
   try {
     await twilioClient.messages.create({ from, to, body: message });
+    console.log("SMS sent:", message);
   } catch (e) {
     console.log("SMS send failed:", e && e.message ? e.message : String(e));
   }
@@ -82,18 +98,38 @@ app.get("/", (req, res) => {
       "<div style='margin-bottom:8px;'><input name='password' type='password' placeholder='Password' required /></div>" +
       "<div style='margin-bottom:8px;'><input name='code' placeholder='Paste order code' required /></div>" +
       "<button type='submit'>Run Bot</button>" +
-      "</form>"
+      "</form>" +
+      "<p style='margin-top:12px; font-size:12px; color:#666;'>Health: <a href='/health'>/health</a> | SMS test: <a href='/sms-test'>/sms-test</a></p>"
   );
 });
 
 app.get("/health", (req, res) => {
+  let accountsCount = 0;
+  let configOk = true;
+  let configError = null;
+
+  try {
+    accountsCount = loadAccountsFromEnv().length;
+  } catch (e) {
+    configOk = false;
+    configError = e && e.message ? e.message : String(e);
+  }
+
   res.status(200).json({
     ok: true,
     running: isRunning,
     lastRun,
     lastError,
-    loginUrls: LOGIN_URLS
+    loginUrls: LOGIN_URLS,
+    configOk,
+    configError,
+    accountsCount
   });
+});
+
+app.get("/sms-test", async (req, res) => {
+  await sendText("T-Bot SMS test OK at " + nowStr());
+  res.status(200).send("SMS test attempted. If Twilio is configured, you should receive a text.");
 });
 
 app.post("/run", async (req, res) => {
@@ -104,14 +140,21 @@ app.post("/run", async (req, res) => {
   if (!code) return res.status(400).send("No code provided.");
   if (isRunning) return res.status(409).send("Already running. Try again soon.");
 
+  let accounts;
+  try {
+    accounts = loadAccountsFromEnv();
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    lastError = msg;
+    return res.status(500).send("Config error: " + msg);
+  }
+
   isRunning = true;
   lastRun = nowStr();
   lastError = null;
 
-  // Respond immediately so the URL never hangs
   res.status(200).send("Started. Check Railway logs. You will get a text when completed or failed.");
 
-  // Run in background
   (async () => {
     const startedAt = nowStr();
 
@@ -139,8 +182,7 @@ app.post("/run", async (req, res) => {
 async function runAccountAcrossSites(account, code) {
   let lastSiteErr = null;
 
-  for (let i = 0; i < LOGIN_URLS.length; i++) {
-    const loginUrl = LOGIN_URLS[i];
+  for (const loginUrl of LOGIN_URLS) {
     try {
       console.log("Trying site:", loginUrl, "for", account.username);
       await runAccountOnSite(account, code, loginUrl);
@@ -151,7 +193,12 @@ async function runAccountAcrossSites(account, code) {
     }
   }
 
-  throw new Error("All sites failed for " + account.username + ". Last error: " + (lastSiteErr && lastSiteErr.message ? lastSiteErr.message : String(lastSiteErr)));
+  throw new Error(
+    "All sites failed for " +
+      account.username +
+      ". Last error: " +
+      (lastSiteErr && lastSiteErr.message ? lastSiteErr.message : String(lastSiteErr))
+  );
 }
 
 async function runAccountOnSite(account, code, loginUrl) {
@@ -164,7 +211,6 @@ async function runAccountOnSite(account, code, loginUrl) {
   const page = await context.newPage();
 
   try {
-    // Login retry loop
     let loggedIn = false;
 
     for (let attempt = 1; attempt <= 12; attempt++) {
@@ -179,12 +225,10 @@ async function runAccountOnSite(account, code, loginUrl) {
         await page.fill('input[type="password"]', account.password);
         await sleep(700);
 
-        // Login button is often generic
         await page.click("button");
         await sleep(4500);
 
-        const futuresVisible = await visibleText(page, "Futures");
-        if (futuresVisible) {
+        if (await visibleText(page, "Futures")) {
           loggedIn = true;
           break;
         }
@@ -195,37 +239,29 @@ async function runAccountOnSite(account, code, loginUrl) {
 
     if (!loggedIn) throw new Error("Login failed");
 
-    // Futures
-    const futuresClicked = await clickText(page, "Futures");
-    if (!futuresClicked) throw new Error("Could not find Futures");
+    if (!(await clickText(page, "Futures"))) throw new Error("Could not find Futures");
     await sleep(2000);
 
-    // Invited Me
     let invitedClicked = await clickText(page, "Invited me");
     if (!invitedClicked) invitedClicked = await clickText(page, "Invited Me");
     if (!invitedClicked) throw new Error("Could not find Invited Me");
     await sleep(2000);
 
-    // Fill the code and confirm
     await page.waitForSelector("input", { timeout: 30000 });
     await page.fill("input", code);
     await sleep(900);
 
-    const confirmClicked = await clickText(page, "Confirm");
-    if (!confirmClicked) throw new Error("Could not find Confirm");
+    if (!(await clickText(page, "Confirm"))) throw new Error("Could not find Confirm");
     await sleep(2500);
 
-    // Popup is optional
     const popupSeen = await visibleText(page, "Already followed the order");
     console.log("Popup seen:", popupSeen ? "YES" : "NO");
 
-    // Position Order
     let posClicked = await clickText(page, "Position order");
     if (!posClicked) posClicked = await clickText(page, "Position Order");
     if (!posClicked) throw new Error("Could not find Position Order");
     await sleep(2000);
 
-    // Wait for Pending, refresh loop
     const start = Date.now();
     const timeoutMs = 120000;
 
@@ -239,7 +275,6 @@ async function runAccountOnSite(account, code, loginUrl) {
       await page.reload();
       await sleep(2500);
 
-      // Re-open Position Order if needed
       posClicked = await clickText(page, "Position order");
       if (!posClicked) posClicked = await clickText(page, "Position Order");
       await sleep(1500);
