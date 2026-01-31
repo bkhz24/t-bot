@@ -1,8 +1,9 @@
 {
   "name": "t-bot",
   "version": "1.0.0",
-  "description": "T-Bot",
+  "description": "T-Bot (Playwright + Railway)",
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
@@ -11,6 +12,7 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "twilio": "^5.4.1"
+    "playwright": "1.44.0",
+    "twilio": "^5.4.0"
   }
 }
