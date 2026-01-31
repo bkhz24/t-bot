@@ -1,16 +1,16 @@
 {
   "name": "t-bot",
   "version": "1.0.0",
-  "private": true,
-  "description": "Simple Railway web form with /run endpoint",
+  "description": "T-Bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
-  "dependencies": {
-    "express": "^4.19.2"
-  },
   "engines": {
     "node": "20.x"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "twilio": "^5.4.1"
   }
 }
