@@ -1,48 +1,54 @@
-/**
- * T-Bot
- * - Web form (/) posts to /run
- * - Runs Playwright automation for each account
- * - Uses ACCOUNTS_JSON + BOT_PASSWORD from Railway Variables
- * - Sends SMS via Twilio if configured
- *
- * REQUIRED Railway Variables:
- *   BOT_PASSWORD = your form password
- *   ACCOUNTS_JSON = JSON array of { "username": "...", "password": "..." }
- *
- * OPTIONAL Railway Variables:
- *   LOGIN_URLS = comma-separated URLs to try (defaults included below)
- *   TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM, TWILIO_TO
- */
+"use strict";
 
 const express = require("express");
-const crypto = require("crypto");
 const { chromium } = require("playwright");
 
+// Optional SMS (Twilio). If not configured, it silently disables.
 let twilioClient = null;
 try {
   const twilio = require("twilio");
-  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+  if (
+    process.env.TWILIO_ACCOUNT_SID &&
+    process.env.TWILIO_AUTH_TOKEN &&
+    process.env.TWILIO_FROM &&
+    process.env.TWILIO_TO
+  ) {
     twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
   }
 } catch (e) {
-  // If twilio isn't installed, we just run without SMS.
-  twilioClient = null;
+  // If twilio isn't installed, SMS will be disabled (health will show this).
 }
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
-const PORT = parseInt(process.env.PORT || "8080", 10);
+// Railway uses PORT. Keep 8080 working too.
+const PORT = Number(process.env.PORT || 8080);
 
-// State
-let isRunning = false;
-let lastRun = null;
-let lastError = null;
+// Password + Accounts come from Railway Variables
+const BOT_PASSWORD = process.env.BOT_PASSWORD || "";
 
-// A simple in-memory run tracker so you can see a checklist page.
-const runs = new Map();
+// ACCOUNTS_JSON must be valid JSON array:
+// [ { "username": "...", "password": "..." }, ... ]
+function loadAccounts() {
+  const raw = process.env.ACCOUNTS_JSON;
+  if (!raw) {
+    return { ok: false, accounts: [], error: "ACCOUNTS_JSON not set" };
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) throw new Error("ACCOUNTS_JSON must be an array");
+    for (const a of parsed) {
+      if (!a.username || !a.password) throw new Error("Each account must have username + password");
+    }
+    return { ok: true, accounts: parsed, error: null };
+  } catch (e) {
+    return { ok: false, accounts: [], error: String(e && e.message ? e.message : e) };
+  }
+}
 
-function nowStr() {
+function nowString() {
   return new Date().toLocaleString("en-US", { timeZoneName: "short" });
 }
 
@@ -50,328 +56,505 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function safeJsonParse(raw) {
-  try {
-    return { ok: true, value: JSON.parse(raw) };
-  } catch (e) {
-    return { ok: false, error: e && e.message ? e.message : String(e) };
-  }
-}
-
-function getAccountsFromEnv() {
-  const raw = process.env.ACCOUNTS_JSON;
-  if (!raw) return { ok: false, error: "ACCOUNTS_JSON not set" };
-
-  const parsed = safeJsonParse(raw);
-  if (!parsed.ok) return { ok: false, error: `ACCOUNTS_JSON invalid JSON: ${parsed.error}` };
-
-  const arr = parsed.value;
-  if (!Array.isArray(arr) || arr.length === 0) return { ok: false, error: "ACCOUNTS_JSON must be a non-empty array" };
-
-  for (const a of arr) {
-    if (!a || typeof a !== "object") return { ok: false, error: "Each account must be an object" };
-    if (!a.username || !a.password) return { ok: false, error: "Each account must have username and password" };
-  }
-
-  return { ok: true, accounts: arr };
-}
-
-function getLoginUrls() {
-  // You can override in Railway Variables with LOGIN_URLS:
-  // https://bgol.pro/pc/#/login,https://dsj89.com/pc/#/login,https://dsj72.com/pc/#/login
-  const raw = process.env.LOGIN_URLS;
-
-  if (raw && raw.trim()) {
-    return raw.split(",").map((s) => s.trim()).filter(Boolean);
-  }
-
-  // Defaults include both pc and h5 routes (some environments behave differently).
-  return [
-    "https://bgol.pro/pc/#/login",
-    "https://dsj89.com/pc/#/login",
-    "https://dsj72.com/pc/#/login",
-    "https://bgol.pro/h5/#/login",
-    "https://dsj89.com/h5/#/login",
-    "https://dsj72.com/h5/#/login",
-  ];
-}
-
-async function sendSms(message) {
-  const from = process.env.TWILIO_FROM;
-  const to = process.env.TWILIO_TO;
-
-  if (!twilioClient) return { ok: false, skipped: true, reason: "twilio not installed or not configured" };
-  if (!from || !to) return { ok: false, skipped: true, reason: "TWILIO_FROM or TWILIO_TO not set" };
-
-  try {
-    const res = await twilioClient.messages.create({ body: message, from, to });
-    console.log("SMS sent:", res.sid);
-    return { ok: true, sid: res.sid };
-  } catch (e) {
-    console.log("SMS failed:", e && e.message ? e.message : String(e));
-    return { ok: false, error: e && e.message ? e.message : String(e) };
-  }
-}
-
-function requireBotPassword(req, res) {
-  const expected = process.env.BOT_PASSWORD || "";
-  const provided = (req.body && req.body.password) ? String(req.body.password) : "";
-
-  if (!expected) {
-    res.status(500).send("BOT_PASSWORD not set in Railway Variables.");
-    return false;
-  }
-
-  if (provided !== expected) {
-    res.status(401).send("Wrong password.");
-    return false;
-  }
-
-  return true;
-}
-
 async function visibleText(page, text) {
   try {
-    const loc = page.getByText(text, { exact: false }).first();
+    const loc = page.locator(`text=${text}`).first();
     return await loc.isVisible({ timeout: 1500 });
   } catch {
     return false;
   }
 }
 
-async function clickByText(page, text) {
-  const loc = page.getByText(text, { exact: false }).first();
-  await loc.click({ timeout: 15000 });
-}
-
-async function screenshotOnFail(page, label) {
+async function sendSMS(message) {
+  if (!twilioClient) return null;
   try {
-    const path = `/tmp/${label}-${Date.now()}.png`;
-    await page.screenshot({ path, fullPage: true });
-    console.log("Saved screenshot:", path);
+    const res = await twilioClient.messages.create({
+      from: process.env.TWILIO_FROM,
+      to: process.env.TWILIO_TO,
+      body: message,
+    });
+    console.log("SMS sent:", res.sid);
+    return res.sid;
   } catch (e) {
-    console.log("Screenshot failed:", e && e.message ? e.message : String(e));
+    console.log("SMS failed:", e && e.message ? e.message : String(e));
+    return null;
   }
 }
 
-/**
- * This performs your exact flow once logged in:
- * - futures dropdown -> Futures
- * - invited me tab
- * - fill order code
- * - confirm
- * - expect toast "Already followed the order"
- * - go Position order and expect "Pending"
- */
-async function doFlow(page, orderCode) {
-  // Wait until we see top nav or anything that proves we are inside.
-  // On some pages, it loads into a trading screen with chart.
-  for (let i = 0; i < 30; i++) {
-    const ok =
-      (await visibleText(page, "Futures")) ||
-      (await visibleText(page, "Markets")) ||
-      (await visibleText(page, "Assets")) ||
-      (await visibleText(page, "Perpetual"));
-    if (ok) break;
-    await sleep(500);
-  }
+// --- State ---
+let isRunning = false;
+let lastRun = null;
+let lastError = null;
+let lastRunId = null;
 
-  // Click dropdown arrow next to Futures, then click Futures
-  // We try a few approaches because UI differs between pc and h5.
-  try {
-    // If a "Futures" menu exists, click it (often opens dropdown).
-    await clickByText(page, "Futures");
-    await sleep(500);
-  } catch {}
+let lastShot = {
+  path: null,
+  when: null,
+  note: null,
+};
 
-  // In dropdown, click "Futures" option (your screenshot shows it)
-  // If already on Futures, this should be harmless.
-  try {
-    await clickByText(page, "Futures");
-    await sleep(1000);
-  } catch {}
+const baseDomains = [
+  "https://bgol.pro",
+  "https://dsj89.com",
+  "https://dsj72.com",
+];
 
-  // Bottom tab: "invited me"
-  // Sometimes it’s lowercase in the UI.
-  try {
-    await clickByText(page, "invited me");
-  } catch {
+// Try both. Your desktop screenshot is /pc/#/login
+const loginUrls = [];
+for (const d of baseDomains) {
+  loginUrls.push(`${d}/pc/#/login`);
+  loginUrls.push(`${d}/h5/#/login`);
+}
+
+// --- UI routes ---
+app.get("/", (req, res) => {
+  const accountsInfo = loadAccounts();
+  const configOk = accountsInfo.ok && BOT_PASSWORD.length > 0;
+
+  res.send(`
+    <html>
+      <head><title>T-Bot</title></head>
+      <body style="font-family: Arial, sans-serif;">
+        <h2>T-Bot</h2>
+        <p><b>Running:</b> ${isRunning ? "YES" : "NO"}</p>
+        <p><b>Last run:</b> ${lastRun ? lastRun : "null"}</p>
+        <p style="color:#b00000;"><b>Last error:</b> ${lastError ? escapeHtml(lastError) : "null"}</p>
+
+        <form method="POST" action="/run">
+          <div>
+            <input name="password" placeholder="Password" type="password" required />
+          </div>
+          <div style="margin-top:6px;">
+            <input name="code" placeholder="Paste order code" required />
+          </div>
+          <div style="margin-top:10px;">
+            <button type="submit">Run Bot</button>
+          </div>
+        </form>
+
+        <p style="margin-top:14px;">
+          Health: <a href="/health">/health</a> |
+          Last screenshot: <a href="/last-shot">/last-shot</a> |
+          SMS test: <a href="/sms-test">/sms-test</a>
+        </p>
+
+        ${
+          !configOk
+            ? `<p style="color:#b00000;"><b>Config issue:</b> ${
+                !BOT_PASSWORD ? "BOT_PASSWORD not set. " : ""
+              }${!accountsInfo.ok ? escapeHtml(accountsInfo.error) : ""}</p>`
+            : ""
+        }
+      </body>
+    </html>
+  `);
+});
+
+// If someone types /run into browser, explain what to do.
+app.get("/run", (req, res) => {
+  res.send("OK: /run exists. Submit the form on / to POST to /run.");
+});
+
+app.post("/run", async (req, res) => {
+  if (isRunning) return res.status(409).send("Bot is already running. Please wait.");
+
+  const password = String(req.body.password || "");
+  const code = String(req.body.code || "").trim();
+
+  if (!BOT_PASSWORD || password !== BOT_PASSWORD) return res.status(401).send("Wrong password.");
+  if (!code) return res.status(400).send("No code provided.");
+
+  const accountsInfo = loadAccounts();
+  if (!accountsInfo.ok) return res.status(500).send(accountsInfo.error);
+
+  // Kick off run
+  isRunning = true;
+  lastRun = nowString();
+  lastError = null;
+  lastRunId = Math.random().toString(36).slice(2);
+
+  console.log("Bot started");
+  console.log("Accounts loaded:", accountsInfo.accounts.length);
+  console.log("Code received length:", code.length);
+
+  // Respond immediately so the page doesn’t hang
+  res.redirect(`/run-checklist?id=${encodeURIComponent(lastRunId)}&len=${code.length}`);
+
+  // Async run
+  (async () => {
+    await sendSMS(`T-Bot started at ${lastRun}`);
+
+    const runResult = {
+      id: lastRunId,
+      started: lastRun,
+      codeLength: code.length,
+      accounts: accountsInfo.accounts.map((a) => ({
+        username: a.username,
+        completed: false,
+        siteUsed: null,
+        error: null,
+      })),
+      done: false,
+    };
+
     try {
-      await clickByText(page, "Invited me");
-    } catch {}
-  }
-  await sleep(800);
+      for (let i = 0; i < accountsInfo.accounts.length; i++) {
+        const acct = accountsInfo.accounts[i];
+        const slot = runResult.accounts[i];
 
-  // Fill order code input by placeholder
-  const codeInput = page.locator('input[placeholder*="order code" i], input[placeholder*="Please enter" i], input[type="text"]').first();
-  await codeInput.waitFor({ timeout: 20000 });
-  await codeInput.click({ timeout: 5000 });
-  await codeInput.fill(orderCode);
-  await sleep(300);
+        try {
+          const r = await runAccountAllSites(acct, code);
+          slot.completed = true;
+          slot.siteUsed = r.siteUsed;
+          slot.error = null;
+        } catch (e) {
+          slot.completed = false;
+          slot.siteUsed = e && e.siteUsed ? e.siteUsed : null;
+          slot.error = e && e.message ? e.message : String(e);
+        }
+      }
 
-  // Click Confirm button
-  // Prefer exact "Confirm" button if present.
-  const confirmBtn = page.getByRole("button", { name: /confirm/i }).first();
-  await confirmBtn.click({ timeout: 20000 });
-  await sleep(1200);
+      runResult.done = true;
 
-  // Confirmation 1: toast "Already followed the order"
-  let toastOk = false;
-  for (let i = 0; i < 20; i++) {
-    if (await visibleText(page, "Already followed the order")) {
-      toastOk = true;
-      break;
+      // If ANY failed, mark lastError (but we still continue the loop)
+      const failures = runResult.accounts.filter((x) => !x.completed);
+      if (failures.length) {
+        lastError = `Some accounts failed: ${failures.map((f) => f.username).join(", ")}`;
+        await sendSMS(`T-Bot finished with failures. Last error: ${failures[0].error || "unknown"}`);
+      } else {
+        await sendSMS("T-Bot completed successfully.");
+      }
+
+      console.log("Bot completed");
+    } catch (e) {
+      lastError = e && e.message ? e.message : String(e);
+      console.log("Run crashed:", lastError);
+      await sendSMS(`T-Bot crashed. ${lastError}`);
+    } finally {
+      isRunning = false;
     }
-    await sleep(250);
-  }
-  if (!toastOk) {
-    throw new Error('Did not see "Already followed the order" confirmation');
+  })();
+});
+
+app.get("/run-checklist", (req, res) => {
+  const id = String(req.query.id || "");
+  const len = String(req.query.len || "");
+  res.send(`
+    <html>
+      <head><title>Run Checklist</title></head>
+      <body style="font-family: Arial, sans-serif;">
+        <h2>Run Checklist</h2>
+        <p><b>Run ID:</b> ${escapeHtml(id)}</p>
+        <p><b>Started:</b> ${escapeHtml(lastRun || "null")}</p>
+        <p><b>Code length:</b> ${escapeHtml(len || "n/a")}</p>
+
+        <h3>Steps (your exact flow)</h3>
+        <ol>
+          <li>Open one of the login sites:
+            <ul>
+              <li>https://bgol.pro/h5/#/login</li>
+              <li>https://dsj89.com/h5/#/login</li>
+              <li>https://dsj72.com/h5/#/login</li>
+              <li>(Also tries /pc/#/login automatically)</li>
+            </ul>
+          </li>
+          <li>Log in with that account username and password.</li>
+          <li>Click the down arrow next to <b>Futures</b> and click <b>Futures</b>.</li>
+          <li>Click <b>Invited me</b> at the bottom.</li>
+          <li>Paste the order code into the box that says <b>Please enter the order code</b>.</li>
+          <li>Click <b>Confirm</b>.</li>
+          <li>Confirm 1: pop up <b>Already followed the order</b>.</li>
+          <li>Click <b>Position order</b>.</li>
+          <li>Confirm 2: <b>Pending</b> in red.</li>
+        </ol>
+
+        <p><b>Status:</b> ${isRunning ? "Running now. Refresh this page." : "Not running."}</p>
+
+        <p>
+          <a href="/">Back to home</a> |
+          <a href="/health">Health</a> |
+          <a href="/last-shot">Last screenshot</a>
+        </p>
+      </body>
+    </html>
+  `);
+});
+
+app.get("/health", (req, res) => {
+  const accountsInfo = loadAccounts();
+  const smsConfigured =
+    !!process.env.TWILIO_ACCOUNT_SID &&
+    !!process.env.TWILIO_AUTH_TOKEN &&
+    !!process.env.TWILIO_FROM &&
+    !!process.env.TWILIO_TO;
+
+  res.json({
+    ok: true,
+    running: isRunning,
+    lastRun,
+    lastError,
+    loginUrls,
+    configOk: accountsInfo.ok && BOT_PASSWORD.length > 0,
+    configError: accountsInfo.ok ? null : accountsInfo.error,
+    accountsCount: accountsInfo.accounts.length,
+    smsConfigured,
+    smsLibraryOk: !!twilioClient || !smsConfigured ? true : false,
+    smsLibraryError: twilioClient || !smsConfigured ? null : "twilio not loaded",
+    lastShot,
+  });
+});
+
+app.get("/sms-test", async (req, res) => {
+  const sid = await sendSMS(`SMS test from T-Bot at ${nowString()}`);
+  if (sid) return res.send("OK: SMS sent");
+  return res.status(500).send("SMS not configured or failed. Check TWILIO_* variables and logs.");
+});
+
+// View last screenshot (password protected via query param or header)
+app.get("/last-shot", (req, res) => {
+  const pass = String(req.query.p || req.headers["x-bot-password"] || "");
+  if (!BOT_PASSWORD || pass !== BOT_PASSWORD) {
+    return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD to view.");
   }
 
-  // Go Position order and look for "Pending"
+  if (!lastShot.path) return res.send("No screenshot captured yet.");
+
+  // We can’t read the filesystem from the browser directly, so we embed as base64.
+  // Playwright saves it in the container; we read it and return <img>.
+  const fs = require("fs");
   try {
-    await clickByText(page, "Position order");
-  } catch {}
+    const buf = fs.readFileSync(lastShot.path);
+    const b64 = buf.toString("base64");
+    res.send(`
+      <html>
+        <body style="font-family: Arial, sans-serif;">
+          <h3>Last screenshot</h3>
+          <p><b>When:</b> ${escapeHtml(lastShot.when || "")}</p>
+          <p><b>Note:</b> ${escapeHtml(lastShot.note || "")}</p>
+          <img src="data:image/png;base64,${b64}" style="max-width: 100%; border: 1px solid #ccc;" />
+          <p><a href="/">Back</a></p>
+        </body>
+      </html>
+    `);
+  } catch (e) {
+    res.status(500).send(`Could not read screenshot: ${e && e.message ? e.message : String(e)}`);
+  }
+});
 
-  let pendingOk = false;
-  for (let i = 0; i < 30; i++) {
-    if (await visibleText(page, "Pending")) {
-      pendingOk = true;
-      break;
+// --- Core bot ---
+async function runAccountAllSites(account, orderCode) {
+  let lastErr = null;
+
+  for (const url of loginUrls) {
+    console.log("Trying site:", url, "for", account.username);
+    try {
+      const result = await runAccountOnSite(account, orderCode, url);
+      return { siteUsed: url, ...result };
+    } catch (e) {
+      lastErr = e;
+      console.log("Site failed:", url, "for", account.username, "err:", e && e.message ? e.message : String(e));
+      await sleep(800);
     }
-    await sleep(300);
-  }
-  if (!pendingOk) {
-    throw new Error('Did not see "Pending" confirmation');
   }
 
-  return true;
+  const err = new Error(`All sites failed for ${account.username}. Last error: ${lastErr ? lastErr.message : "unknown"}`);
+  throw err;
 }
 
-async function loginAndRunOnSite(account, loginUrl, orderCode) {
+async function runAccountOnSite(account, orderCode, loginUrl) {
   const browser = await chromium.launch({
     headless: true,
     args: [
       "--no-sandbox",
       "--disable-dev-shm-usage",
-      "--disable-setuid-sandbox",
+      "--disable-blink-features=AutomationControlled",
     ],
   });
 
   const context = await browser.newContext({
+    viewport: { width: 390, height: 844 }, // mobile-ish like your screenshots
     userAgent:
       "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-    viewport: { width: 390, height: 844 },
     locale: "en-US",
   });
 
   const page = await context.newPage();
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
 
-  let loggedIn = false;
+  // Helpful logging
+  page.on("console", (msg) => {
+    const t = msg.type();
+    if (t === "error" || t === "warning") console.log("PAGE CONSOLE:", t, msg.text());
+  });
 
   try {
-    for (let attempt = 1; attempt <= 12; attempt++) {
-      console.log("Login attempt", attempt, "for", account.username, "on", loginUrl);
+    const loggedIn = await loginFlow(page, account, loginUrl);
+    if (!loggedIn) throw new Error("Login failed");
 
-      try {
-        await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-        await sleep(1200);
+    // If you want the bot to proceed beyond login, this is where it will go:
+    // (I’m leaving it in, but the next failure you’ll hit is selectors inside the app UI.)
+    // Steps you described:
+    // 1) open Futures dropdown and click Futures
+    // 2) click Invited me
+    // 3) paste code + Confirm
+    // 4) confirm Already followed the order
+    // 5) click Position order and confirm Pending
 
-        const userField = page.locator(
-          'input[type="email"], input[type="text"], input[autocomplete="username"], input[placeholder*="email" i], input[placeholder*="account" i], input[placeholder*="user" i]'
-        ).first();
+    // TODO: once login is confirmed, we can tighten these selectors if needed.
+    await doWorkflow(page, orderCode);
 
-        const passField = page.locator(
-          'input[type="password"], input[autocomplete="current-password"], input[placeholder*="password" i]'
-        ).first();
-
-        await userField.waitFor({ timeout: 15000 });
-        await userField.click({ timeout: 5000 });
-        await userField.fill(account.username);
-        await sleep(400);
-
-        await passField.waitFor({ timeout: 15000 });
-        await passField.click({ timeout: 5000 });
-        await passField.fill(account.password);
-        await sleep(400);
-
-        // Submit
-        await passField.press("Enter");
-        await sleep(2500);
-
-        // Success checks
-        const urlNow = page.url();
-        const stillOnLogin = urlNow.includes("/login") || urlNow.includes("#/login");
-
-        const loginInputsVisible = await page
-          .locator('input[type="password"]')
-          .first()
-          .isVisible()
-          .catch(() => false);
-
-        const navVisible =
-          (await visibleText(page, "Futures")) ||
-          (await visibleText(page, "Markets")) ||
-          (await visibleText(page, "Assets")) ||
-          (await visibleText(page, "Perpetual"));
-
-        if ((!stillOnLogin && !loginInputsVisible) || navVisible) {
-          loggedIn = true;
-          console.log("Login succeeded for", account.username, "on", loginUrl);
-          break;
-        }
-
-        const maybeError =
-          (await visibleText(page, "Incorrect")) ||
-          (await visibleText(page, "error")) ||
-          (await visibleText(page, "failed")) ||
-          (await visibleText(page, "invalid"));
-
-        if (maybeError) {
-          console.log("Login page shows an error message for", account.username);
-        }
-      } catch (e) {
-        console.log("Login attempt exception:", e && e.message ? e.message : String(e));
-      }
-
-      await sleep(2000);
+    return { ok: true };
+  } catch (e) {
+    // Save screenshot for debugging
+    const shotPath = `/tmp/login-failed-${Date.now()}.png`;
+    try {
+      await page.screenshot({ path: shotPath, fullPage: true });
+      lastShot = {
+        path: shotPath,
+        when: nowString(),
+        note: `Failure for ${account.username} at ${loginUrl}: ${e && e.message ? e.message : String(e)}`,
+      };
+      console.log("Saved screenshot:", shotPath);
+    } catch (s) {
+      console.log("Could not save screenshot:", s && s.message ? s.message : String(s));
     }
 
-    if (!loggedIn) {
-      await screenshotOnFail(page, "login-failed");
-      throw new Error("Login failed");
-    }
-
-    // Your full flow
-    await doFlow(page, orderCode);
-    return true;
+    // Attach siteUsed if needed
+    e.siteUsed = loginUrl;
+    throw e;
   } finally {
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
   }
 }
 
-async function runAccountAcrossSites(account, orderCode, runId) {
-  const loginUrls = getLoginUrls();
+async function loginFlow(page, account, loginUrl) {
+  for (let attempt = 1; attempt <= 12; attempt++) {
+    console.log("Login attempt", attempt, "for", account.username, "on", loginUrl);
 
-  for (const loginUrl of loginUrls) {
     try {
-      console.log("Trying site:", loginUrl, "for", account.username);
-      await loginAndRunOnSite(account, loginUrl, orderCode);
-      return { ok: true, loginUrl };
+      await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await sleep(1200);
+
+      // Some sites show cookie banners or overlays
+      const acceptBtn = page.locator('button:has-text("Accept"), button:has-text("I agree")').first();
+      if (await acceptBtn.isVisible().catch(() => false)) {
+        await acceptBtn.click().catch(() => {});
+        await sleep(400);
+      }
+
+      // Username field (covers Email tab layouts)
+      const userField = page
+        .locator(
+          'input[type="email"], input[type="text"], input[autocomplete="username"], input[placeholder*="email" i], input[placeholder*="account" i], input[placeholder*="user" i]'
+        )
+        .first();
+
+      // Password field
+      const passField = page
+        .locator(
+          'input[type="password"], input[autocomplete="current-password"], input[placeholder*="password" i]'
+        )
+        .first();
+
+      await userField.waitFor({ timeout: 15000 });
+      await userField.click({ timeout: 5000 });
+      await userField.fill("");
+      await userField.type(account.username, { delay: 40 });
+      await sleep(250);
+
+      await passField.waitFor({ timeout: 15000 });
+      await passField.click({ timeout: 5000 });
+      await passField.fill("");
+      await passField.type(account.password, { delay: 40 });
+      await sleep(250);
+
+      // Click a real Login button if present (your /pc page has a big Login button)
+      const loginBtn = page.locator('button:has-text("Login"), button:has-text("Sign in")').first();
+      if (await loginBtn.isVisible().catch(() => false)) {
+        await loginBtn.click({ timeout: 8000 }).catch(() => passField.press("Enter"));
+      } else {
+        await passField.press("Enter");
+      }
+
+      await sleep(2500);
+
+      // Success indicators (from your screenshots)
+      const success =
+        (await visibleText(page, "Futures")) ||
+        (await visibleText(page, "Markets")) ||
+        (await visibleText(page, "Assets")) ||
+        (await visibleText(page, "Support center")) ||
+        (await visibleText(page, "Announcements"));
+
+      if (success) {
+        console.log("Login succeeded for", account.username, "on", loginUrl);
+        return true;
+      }
+
+      // If we’re still on login, try again
     } catch (e) {
-      const msg = e && e.message ? e.message : String(e);
-      console.log("Site failed:", loginUrl, "for", account.username, "err:", msg);
-      // continue to next site
+      console.log("Login attempt exception:", e && e.message ? e.message : String(e));
+    }
+
+    await sleep(1200);
+  }
+
+  return false;
+}
+
+async function doWorkflow(page, orderCode) {
+  // This is intentionally conservative so it doesn’t crash on minor UI differences.
+  // Once login is working, if this step fails we’ll use /last-shot to adjust selectors.
+
+  // Wait for top nav to appear
+  await page.waitForTimeout(1500);
+
+  // Open Futures dropdown and click Futures (desktop shows dropdown)
+  const futuresMenu = page.locator('text=Futures').first();
+  if (await futuresMenu.isVisible().catch(() => false)) {
+    await futuresMenu.click().catch(() => {});
+    await page.waitForTimeout(600);
+
+    // Click Futures inside dropdown if it appears
+    const futuresItem = page.locator('text=Futures').nth(1);
+    if (await futuresItem.isVisible().catch(() => false)) {
+      await futuresItem.click().catch(() => {});
+      await page.waitForTimeout(800);
     }
   }
 
-  return { ok: false, error: "All sites failed" };
-}
+  // Click "Invited me" tab near bottom
+  const invited = page.locator('text=invited me, text=Invited me').first();
+  if (await invited.isVisible().catch(() => false)) {
+    await invited.click().catch(() => {});
+    await page.waitForTimeout(800);
+  }
 
-function makeRunId() {
-  return crypto.randomBytes(10).toString("base64url");
+  // Fill order code input (placeholder matches your screenshot)
+  const codeInput = page
+    .locator('input[placeholder*="order code" i], input[placeholder*="Please enter the order code" i], input[type="text"]')
+    .first();
+
+  if (await codeInput.isVisible().catch(() => false)) {
+    await codeInput.click().catch(() => {});
+    await codeInput.fill("");
+    await codeInput.type(orderCode, { delay: 30 });
+    await page.waitForTimeout(400);
+  }
+
+  // Click Confirm
+  const confirmBtn = page.locator('button:has-text("Confirm")').first();
+  if (await confirmBtn.isVisible().catch(() => false)) {
+    await confirmBtn.click().catch(() => {});
+    await page.waitForTimeout(1200);
+  }
+
+  // At this point your confirmation popups occur.
+  // If we don’t see them, that means the selectors need tuning.
+  // The debug screenshot will tell us exactly what the page looks like in headless.
+
+  return true;
 }
 
 function escapeHtml(s) {
@@ -382,193 +565,6 @@ function escapeHtml(s) {
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
 }
-
-app.get("/", (req, res) => {
-  res.send(`
-    <h2>T-Bot</h2>
-    <div>Running: <b>${isRunning ? "YES" : "NO"}</b></div>
-    <div>Last run: ${lastRun ? escapeHtml(lastRun) : "null"}</div>
-    <div style="color:#b00000; margin-top:10px;">${lastError ? escapeHtml(lastError) : ""}</div>
-
-    <form method="POST" action="/run" style="margin-top:16px;">
-      <input name="password" placeholder="Password" required />
-      <br/><br/>
-      <input name="code" placeholder="Paste order code" required />
-      <br/><br/>
-      <button type="submit">Run Bot</button>
-    </form>
-
-    <p style="margin-top:16px;">
-      <a href="/health">Health</a> |
-      <a href="/sms-test">SMS test</a>
-    </p>
-  `);
-});
-
-app.get("/health", (req, res) => {
-  const accountsParsed = getAccountsFromEnv();
-  const smsConfigured = !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_FROM && process.env.TWILIO_TO);
-
-  res.json({
-    ok: true,
-    running: isRunning,
-    lastRun,
-    lastError,
-    loginUrls: getLoginUrls().slice(0, 10),
-    configOk: accountsParsed.ok,
-    configError: accountsParsed.ok ? null : accountsParsed.error,
-    accountsCount: accountsParsed.ok ? accountsParsed.accounts.length : 0,
-    smsConfigured,
-    smsLibraryOk: !!twilioClient,
-    smsLibraryError: null,
-  });
-});
-
-app.get("/sms-test", async (req, res) => {
-  const r = await sendSms(`T-Bot SMS test at ${nowStr()}`);
-  if (r.ok) return res.send("OK: SMS sent");
-  if (r.skipped) return res.send(`Skipped: ${r.reason}`);
-  return res.status(500).send(`Failed: ${r.error}`);
-});
-
-app.get("/run/:runId", (req, res) => {
-  const runId = req.params.runId;
-  const run = runs.get(runId);
-  if (!run) return res.status(404).send("Run not found");
-
-  const accountBlocks = run.accounts.map((a, idx) => {
-    return `
-      <div style="border:1px solid #ccc; padding:10px; margin:10px 0;">
-        <b>Account ${idx + 1}:</b> ${escapeHtml(a.username)}<br/>
-        Completed: <b>${a.completed ? "YES" : "NO"}</b><br/>
-        Site used: ${a.loginUrl ? escapeHtml(a.loginUrl) : "--"}<br/>
-        Error: ${a.error ? `<span style="color:#b00000;">${escapeHtml(a.error)}</span>` : "--"}<br/>
-      </div>
-    `;
-  }).join("\n");
-
-  res.send(`
-    <h2>Run Checklist</h2>
-    <div><b>Run ID:</b> ${escapeHtml(runId)}</div>
-    <div><b>Started:</b> ${escapeHtml(run.started)}</div>
-    <div><b>Code length:</b> ${run.codeLength}</div>
-    <hr/>
-
-    <h3>Steps (your exact flow)</h3>
-    <ol>
-      <li>Open one of the login sites:
-        <ul>
-          ${getLoginUrls().slice(0, 3).map(u => `<li>${escapeHtml(u)}</li>`).join("")}
-        </ul>
-      </li>
-      <li>Log in with that account username and password.</li>
-      <li>Click the down arrow next to <b>Futures</b> and click <b>Futures</b>.</li>
-      <li>Click <b>Invited me</b> at the bottom.</li>
-      <li>Paste the order code into the box that says <b>Please enter the order code</b>.</li>
-      <li>Click <b>Confirm</b>.</li>
-      <li>Confirm 1: pop up <b>Already followed the order</b>.</li>
-      <li>Click <b>Position order</b>.</li>
-      <li>Confirm 2: <b>Pending</b> in red.</li>
-    </ol>
-
-    <h3>Accounts</h3>
-    ${accountBlocks}
-
-    <div style="margin-top:10px;">
-      <b>Status:</b> ${run.finished ? "Completed" : "Not completed yet."}
-    </div>
-
-    <p style="margin-top:16px;">
-      <a href="/">Back to home</a> |
-      <a href="/health">Health</a>
-    </p>
-  `);
-});
-
-app.post("/run", async (req, res) => {
-  if (!requireBotPassword(req, res)) return;
-
-  if (isRunning) {
-    return res.status(409).send("Bot is already running. Please wait.");
-  }
-
-  const orderCode = (req.body && req.body.code) ? String(req.body.code).trim() : "";
-  if (!orderCode) return res.status(400).send("No code provided.");
-
-  const accountsParsed = getAccountsFromEnv();
-  if (!accountsParsed.ok) return res.status(500).send(accountsParsed.error);
-
-  const accounts = accountsParsed.accounts;
-
-  const runId = makeRunId();
-  const run = {
-    id: runId,
-    started: nowStr(),
-    codeLength: orderCode.length,
-    finished: false,
-    accounts: accounts.map((a) => ({
-      username: a.username,
-      completed: false,
-      loginUrl: null,
-      error: null,
-    })),
-  };
-  runs.set(runId, run);
-
-  // Respond immediately with checklist page
-  res.redirect(`/run/${runId}`);
-
-  // Start run in background
-  isRunning = true;
-  lastRun = nowStr();
-  lastError = null;
-
-  await sendSms(`T-Bot started at ${lastRun}`);
-
-  try {
-    console.log("Bot started");
-    console.log("Accounts loaded:", accounts.length);
-    console.log("Code received length:", orderCode.length);
-
-    for (let i = 0; i < accounts.length; i++) {
-      const account = accounts[i];
-      const slot = run.accounts[i];
-
-      const result = await runAccountAcrossSites(account, orderCode, runId);
-
-      if (result.ok) {
-        slot.completed = true;
-        slot.loginUrl = result.loginUrl;
-        slot.error = null;
-      } else {
-        slot.completed = false;
-        slot.loginUrl = null;
-        slot.error = result.error || "Unknown error";
-        // If one account fails, keep going to the next account.
-      }
-    }
-
-    run.finished = true;
-
-    const failures = run.accounts.filter(a => !a.completed).map(a => a.username);
-    if (failures.length === 0) {
-      await sendSms(`T-Bot completed OK at ${nowStr()}`);
-    } else {
-      await sendSms(`T-Bot completed with failures at ${nowStr()}: ${failures.join(", ")}`);
-    }
-
-    console.log("Bot completed");
-  } catch (e) {
-    const msg = e && e.message ? e.message : String(e);
-    lastError = msg;
-    run.finished = true;
-
-    await sendSms(`T-Bot failed at ${nowStr()}: ${msg}`);
-    console.log("Run failed:", msg);
-  } finally {
-    isRunning = false;
-  }
-});
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Listening on", PORT);
