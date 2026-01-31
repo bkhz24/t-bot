@@ -2,38 +2,57 @@
 
 const express = require("express");
 
-// Optional SMS via Twilio. If env vars are missing, it will run without SMS.
-let twilioClient = null;
-function getTwilioClient() {
-  const sid = process.env.TWILIO_ACCOUNT_SID;
-  const token = process.env.TWILIO_AUTH_TOKEN;
-  if (!sid || !token) return null;
-  if (!twilioClient) {
-    // Lazy require so the app still runs if twilio is not installed yet.
-    const twilio = require("twilio");
-    twilioClient = twilio(sid, token);
-  }
-  return twilioClient;
-}
-
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Railway sets PORT. Locally you can use 3000.
 const PORT = Number(process.env.PORT || 3000);
 
 // Config
 const BOT_PASSWORD = process.env.BOT_PASSWORD || "";
 const ACCOUNTS_JSON = process.env.ACCOUNTS_JSON || "";
-const TWILIO_FROM = process.env.TWILIO_FROM || "";
-const TWILIO_TO = process.env.TWILIO_TO || ""; // Your phone number to receive texts, in E.164 format like +18015551234
 
+// Twilio env vars
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+const TWILIO_FROM = process.env.TWILIO_FROM || "";
+const TWILIO_TO = process.env.TWILIO_TO || "";
+
+// Sites you mentioned
 const LOGIN_URLS = [
   "https://bgol.pro/h5/#/login",
   "https://dsj89.com/h5/#/login",
-  "https://dsj72.com/h5/#/login",
+  "https://dsj72.com/h5/#/login"
 ];
+
+// In-memory state
+const state = {
+  running: false,
+  lastRun: null,
+  lastError: null,
+  currentRun: null // { runId, startedAt, codeLen, accounts, completed: boolean[], timer }
+};
+
+function nowLocalString() {
+  try {
+    return new Date().toLocaleString();
+  } catch {
+    return new Date().toISOString();
+  }
+}
+
+function makeRunId() {
+  return Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
 
 function safeParseAccounts() {
   if (!ACCOUNTS_JSON) {
@@ -47,35 +66,53 @@ function safeParseAccounts() {
     const accounts = parsed
       .map((a) => ({
         username: String(a.username || "").trim(),
-        password: String(a.password || "").trim(),
+        password: String(a.password || "").trim()
       }))
       .filter((a) => a.username.length > 0);
 
     if (accounts.length === 0) {
       return { ok: false, error: "No accounts found in ACCOUNTS_JSON", accounts: [] };
     }
+
     return { ok: true, error: null, accounts };
   } catch (e) {
     return { ok: false, error: `Invalid JSON: ${e.message}`, accounts: [] };
   }
 }
 
-async function sendSMS(message) {
-  const client = getTwilioClient();
-  if (!client) {
-    console.log("SMS not sent (Twilio not configured):", message);
-    return { ok: false, error: "Twilio not configured" };
+function twilioConfigured() {
+  return Boolean(
+    TWILIO_ACCOUNT_SID &&
+      TWILIO_AUTH_TOKEN &&
+      TWILIO_FROM &&
+      TWILIO_TO
+  );
+}
+
+function getTwilioClientSafe() {
+  if (!twilioConfigured()) return { ok: false, client: null, error: "Twilio env vars not set" };
+
+  try {
+    const twilio = require("twilio");
+    const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+    return { ok: true, client, error: null };
+  } catch (e) {
+    return { ok: false, client: null, error: `Twilio library not installed: ${e.message}` };
   }
-  if (!TWILIO_FROM || !TWILIO_TO) {
-    console.log("SMS not sent (TWILIO_FROM or TWILIO_TO missing):", message);
-    return { ok: false, error: "TWILIO_FROM or TWILIO_TO missing" };
+}
+
+async function sendSMS(message) {
+  const t = getTwilioClientSafe();
+  if (!t.ok || !t.client) {
+    console.log("SMS not sent:", t.error);
+    return { ok: false, error: t.error };
   }
 
   try {
-    const res = await client.messages.create({
+    const res = await t.client.messages.create({
       from: TWILIO_FROM,
       to: TWILIO_TO,
-      body: message,
+      body: message
     });
     console.log("SMS sent:", res.sid);
     return { ok: true, sid: res.sid };
@@ -85,27 +122,7 @@ async function sendSMS(message) {
   }
 }
 
-function nowLocalString() {
-  try {
-    return new Date().toLocaleString();
-  } catch {
-    return new Date().toISOString();
-  }
-}
-
-// In-memory run state (good for Railway single instance)
-const state = {
-  running: false,
-  lastRun: null,
-  lastError: null,
-  currentRun: null, // { runId, startedAt, codeLen, accounts, completed: boolean[], warned15: boolean, timer: Timeout }
-};
-
-function makeRunId() {
-  return Math.random().toString(36).slice(2) + "-" + Date.now().toString(36);
-}
-
-function clearCurrentTimer() {
+function clearRunTimer() {
   if (state.currentRun && state.currentRun.timer) {
     clearTimeout(state.currentRun.timer);
     state.currentRun.timer = null;
@@ -114,14 +131,12 @@ function clearCurrentTimer() {
 
 function renderHomePage(statusText) {
   const config = safeParseAccounts();
+
   const configLine = config.ok
     ? `Accounts loaded: ${config.accounts.length}`
     : `Config error: ${escapeHtml(config.error || "unknown")}`;
 
-  const lastRunLine = state.lastRun
-    ? `Last run: ${escapeHtml(String(state.lastRun))}`
-    : "Last run: null";
-
+  const lastRunLine = state.lastRun ? `Last run: ${escapeHtml(String(state.lastRun))}` : "Last run: null";
   const lastErrLine = state.lastError
     ? `<div style="color:#b00020;margin-top:10px;">Last error: ${escapeHtml(String(state.lastError))}</div>`
     : "";
@@ -142,6 +157,7 @@ function renderHomePage(statusText) {
       <div style="margin-top:6px;">${configLine}</div>
       ${lastErrLine}
       ${hint}
+
       <form method="POST" action="/run" style="margin-top:16px;">
         <div><input name="password" placeholder="Password" type="password" required /></div>
         <div style="margin-top:8px;"><input name="code" placeholder="Paste order code" required /></div>
@@ -150,7 +166,7 @@ function renderHomePage(statusText) {
 
       <div style="margin-top:16px; font-size: 13px;">
         Health: <a href="/health">/health</a>
-        ${getTwilioClient() ? ` | SMS test: <a href="/sms-test">/sms-test</a>` : ""}
+        ${twilioConfigured() ? ` | SMS test: <a href="/sms-test">/sms-test</a>` : ""}
       </div>
     </body>
   </html>
@@ -192,7 +208,7 @@ function renderChecklistPage(run) {
 
       <hr style="margin:16px 0;" />
 
-      <h3>Manual steps (do this for each account)</h3>
+      <h3>Steps (your exact flow)</h3>
       <ol>
         <li>Open one of the login sites:
           <ul>
@@ -204,9 +220,9 @@ function renderChecklistPage(run) {
         <li>Click <b>Invited me</b> at the bottom.</li>
         <li>Paste the order code into the box that says <b>Please enter the order code</b>.</li>
         <li>Click <b>Confirm</b>.</li>
-        <li>Confirm 1: you see the pop up <b>Already followed the order</b>.</li>
+        <li>Confirm 1: pop up <b>Already followed the order</b>.</li>
         <li>Click <b>Position order</b>.</li>
-        <li>Confirm 2: you see <b>Pending</b> in red.</li>
+        <li>Confirm 2: <b>Pending</b> in red.</li>
       </ol>
 
       <hr style="margin:16px 0;" />
@@ -219,21 +235,11 @@ function renderChecklistPage(run) {
       </div>
 
       <div style="margin-top:16px;">
-        <a href="/">Back to home</a>
-        | <a href="/health">Health</a>
+        <a href="/">Back to home</a> | <a href="/health">Health</a>
       </div>
     </body>
   </html>
   `;
-}
-
-function escapeHtml(s) {
-  return String(s)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
 }
 
 // Routes
@@ -243,6 +249,7 @@ app.get("/", (req, res) => {
 
 app.get("/health", (req, res) => {
   const config = safeParseAccounts();
+  const tw = getTwilioClientSafe();
   res.json({
     ok: true,
     running: state.running,
@@ -252,7 +259,9 @@ app.get("/health", (req, res) => {
     configOk: config.ok,
     configError: config.error,
     accountsCount: config.ok ? config.accounts.length : 0,
-    smsConfigured: Boolean(getTwilioClient() && TWILIO_FROM && TWILIO_TO),
+    smsConfigured: twilioConfigured(),
+    smsLibraryOk: tw.ok,
+    smsLibraryError: tw.ok ? null : tw.error
   });
 });
 
@@ -263,23 +272,17 @@ app.get("/sms-test", async (req, res) => {
 
 app.post("/run", async (req, res) => {
   try {
-    if (state.running) {
-      return res.status(429).send("Bot is already running. Please wait.");
-    }
+    if (state.running) return res.status(429).send("Bot is already running. Please wait.");
 
     const password = String(req.body.password || "");
     const code = String(req.body.code || "").trim();
 
     if (!BOT_PASSWORD) {
       state.lastError = "BOT_PASSWORD not set";
-      return res.status(500).send("Server not configured. BOT_PASSWORD not set.");
+      return res.status(500).send("BOT_PASSWORD not set");
     }
-    if (password !== BOT_PASSWORD) {
-      return res.status(401).send("Wrong password.");
-    }
-    if (!code) {
-      return res.status(400).send("No code provided.");
-    }
+    if (password !== BOT_PASSWORD) return res.status(401).send("Wrong password.");
+    if (!code) return res.status(400).send("No code provided.");
 
     const config = safeParseAccounts();
     if (!config.ok) {
@@ -287,7 +290,6 @@ app.post("/run", async (req, res) => {
       return res.status(500).send(`Config error: ${escapeHtml(state.lastError)}`);
     }
 
-    // Start run
     state.running = true;
     state.lastError = null;
 
@@ -298,8 +300,7 @@ app.post("/run", async (req, res) => {
       codeLen: code.length,
       accounts: config.accounts,
       completed: config.accounts.map(() => false),
-      warned15: false,
-      timer: null,
+      timer: null
     };
     state.currentRun = run;
 
@@ -307,38 +308,37 @@ app.post("/run", async (req, res) => {
     console.log("Accounts loaded:", run.accounts.length);
     console.log("Code received length:", run.codeLen);
 
-    // SMS started
-    await sendSMS(`T-Bot started at ${run.startedAt}. Accounts: ${run.accounts.length}. Code length: ${run.codeLen}.`);
+    // Send Started SMS (if configured)
+    const startedMsg = `T-Bot started at ${run.startedAt}. Accounts: ${run.accounts.length}. Code length: ${run.codeLen}.`;
+    const smsStart = await sendSMS(startedMsg);
+    if (!smsStart.ok) console.log("Start SMS not sent:", smsStart.error);
 
-    // 15-minute warning timer
-    clearCurrentTimer();
+    // 15-minute warning SMS if not completed
+    clearRunTimer();
     run.timer = setTimeout(async () => {
       try {
         if (state.currentRun && state.currentRun.runId === runId) {
           const allDone = state.currentRun.completed.every(Boolean);
           if (!allDone) {
-            state.currentRun.warned15 = true;
-            await sendSMS("T-Bot warning: 15 minutes passed and not all accounts are marked complete yet.");
+            const warn = await sendSMS("T-Bot warning: 15 minutes passed and not all accounts are marked complete yet.");
+            if (!warn.ok) console.log("Warning SMS not sent:", warn.error);
           }
         }
       } catch (e) {
-        console.log("15-min warning SMS failed:", e.message || String(e));
+        console.log("15-min warning SMS exception:", e.message || String(e));
       }
     }, 15 * 60 * 1000);
 
-    // Log the accounts we will do manually
-    for (const a of run.accounts) {
-      console.log("Would run for:", a.username);
-    }
+    // Log what it would do
+    for (const a of run.accounts) console.log("Would run for:", a.username);
 
-    // Show checklist page
     state.lastRun = nowLocalString();
-    res.status(200).send(renderChecklistPage(run));
+    return res.status(200).send(renderChecklistPage(run));
   } catch (e) {
     state.lastError = e.message || String(e);
     console.log("Run failed:", state.lastError);
     state.running = false;
-    res.status(500).send("Run failed.");
+    return res.status(500).send("Run failed.");
   }
 });
 
@@ -347,12 +347,8 @@ app.post("/complete", async (req, res) => {
     const runId = String(req.body.runId || "");
     const idx = Number(req.body.idx);
 
-    if (!state.currentRun || state.currentRun.runId !== runId) {
-      return res.status(400).send("Run not found or expired.");
-    }
-    if (!Number.isFinite(idx) || idx < 0 || idx >= state.currentRun.accounts.length) {
-      return res.status(400).send("Invalid account index.");
-    }
+    if (!state.currentRun || state.currentRun.runId !== runId) return res.status(400).send("Run not found or expired.");
+    if (!Number.isFinite(idx) || idx < 0 || idx >= state.currentRun.accounts.length) return res.status(400).send("Invalid account index.");
 
     state.currentRun.completed[idx] = true;
 
@@ -361,17 +357,19 @@ app.post("/complete", async (req, res) => {
       const finishedAt = nowLocalString();
       state.lastRun = finishedAt;
       state.running = false;
-      clearCurrentTimer();
+      clearRunTimer();
 
-      await sendSMS(`T-Bot completed at ${finishedAt}. All accounts marked complete.`);
+      const done = await sendSMS(`T-Bot completed at ${finishedAt}. All accounts marked complete.`);
+      if (!done.ok) console.log("Complete SMS not sent:", done.error);
+
       console.log("Bot completed");
     }
 
-    res.status(200).send(renderChecklistPage(state.currentRun));
+    return res.status(200).send(renderChecklistPage(state.currentRun));
   } catch (e) {
     state.lastError = e.message || String(e);
     console.log("Complete failed:", state.lastError);
-    res.status(500).send("Complete failed.");
+    return res.status(500).send("Complete failed.");
   }
 });
 
