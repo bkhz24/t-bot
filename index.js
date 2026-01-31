@@ -30,6 +30,9 @@ const LOGIN_URLS = [
 
 const API_HOSTS_TO_TEST = ["api.bgol.pro", "api.ddjea.com"];
 
+// Fixed filename so /last-shot works even if memory resets
+const LAST_SHOT_FILE = "/app/last-shot.png";
+
 function nowLocal() {
   return new Date().toLocaleString("en-US", { timeZoneName: "short" });
 }
@@ -178,6 +181,7 @@ app.get("/health", (req, res) => {
     smsConfigured: !!(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && TWILIO_FROM && TWILIO_TO),
     smsLibraryOk,
     smsLibraryError,
+    lastShotFileExists: fs.existsSync(LAST_SHOT_FILE),
   });
 });
 
@@ -203,9 +207,16 @@ app.get("/sms-test", async (req, res) => {
 
 app.get("/last-shot", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD to view.");
-  if (!lastShotPath || !fs.existsSync(lastShotPath)) return res.send("No screenshot captured yet.");
+
+  // Prefer the fixed file, fallback to lastShotPath
+  const file = fs.existsSync(LAST_SHOT_FILE)
+    ? LAST_SHOT_FILE
+    : (lastShotPath && fs.existsSync(lastShotPath) ? lastShotPath : null);
+
+  if (!file) return res.send("No screenshot captured yet.");
+
   res.setHeader("Content-Type", "image/png");
-  fs.createReadStream(lastShotPath).pipe(res);
+  fs.createReadStream(file).pipe(res);
 });
 
 app.get("/run", (req, res) => {
@@ -358,6 +369,9 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await sleep(1500);
 
+    // Always capture at least one shot so /last-shot is useful
+    await saveShot(page, "after-goto");
+
     if (!(await loginFormVisible(page))) {
       await saveShot(page, "login-form-not-visible");
       const u = page.url();
@@ -371,13 +385,17 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       throw new Error("Login failed (still appears logged out)");
     }
 
+    await saveShot(page, "after-login");
     await sleep(1200);
 
-    // This is your screenshot header logic
     await clickFuturesDropdownThenFutures(page);
+    await saveShot(page, "after-futures-click");
 
     await clickInvitedMe(page);
+    await saveShot(page, "after-invited-click");
+
     await enterOrderCodeAndConfirm(page, orderCode);
+    await saveShot(page, "after-confirm-click");
 
     const alreadyOk = await waitForAnyText(page, ["Already followed the order"], 15000);
     if (!alreadyOk) {
@@ -445,22 +463,27 @@ async function performLoginStrict(page, account, loginUrl) {
       }
 
       await sleep(3000);
+      await saveShot(page, `after-login-attempt-${attempt}`);
 
-      const loginStillVisible =
-        (await page.locator("text=Login").first().isVisible().catch(() => false)) ||
-        (await page.getByRole("link", { name: /login/i }).first().isVisible().catch(() => false));
+      // Real confirmation: top nav appears, or we see Account, or invited page artifacts
+      const loginLinkVisible =
+        (await page.getByRole("link", { name: /login/i }).first().isVisible().catch(() => false)) ||
+        (await page.locator("text=Login").first().isVisible().catch(() => false));
 
       const accountVisible =
         (await page.locator("text=Account").first().isVisible().catch(() => false)) ||
         (await page.getByRole("link", { name: /account/i }).first().isVisible().catch(() => false));
 
+      const navVisible =
+        (await page.locator("header, nav").first().isVisible().catch(() => false)) &&
+        ((await visibleText(page, "Futures")) || (await visibleText(page, "Markets")) || (await visibleText(page, "Assets")));
+
       const inApp =
-        (await visibleText(page, "invited me")) ||
         (await visibleText(page, "Invited me")) ||
         (await visibleText(page, "Position order")) ||
         (await visibleText(page, "Please enter the order code"));
 
-      if (!loginStillVisible && (accountVisible || inApp)) {
+      if (!loginLinkVisible && (accountVisible || navVisible || inApp)) {
         console.log("Login confirmed for", account.username, "on", loginUrl);
         return true;
       }
@@ -474,30 +497,15 @@ async function performLoginStrict(page, account, loginUrl) {
   return false;
 }
 
-// --------------------
-// Improved Futures click
-// --------------------
 async function clickFuturesDropdownThenFutures(page) {
-  // Wait for header/nav to exist
-  const header = page.locator("header, nav").first();
-  await header.waitFor({ timeout: 20000 }).catch(() => null);
+  // Wait for header/nav
+  await page.locator("header, nav").first().waitFor({ timeout: 20000 }).catch(() => null);
 
-  // Find the Futures label in the top nav/header area
-  const futuresInHeader = page
-    .locator("header, nav")
-    .locator("text=Futures")
-    .first();
-
-  // Sometimes the word exists but is not clickable, so also try role based targets
+  // Find Futures in header/nav
+  const futuresInHeader = page.locator("header, nav").locator("text=Futures").first();
   const futuresRoleLink = page.getByRole("link", { name: /^Futures$/i }).first();
   const futuresRoleButton = page.getByRole("button", { name: /^Futures$/i }).first();
 
-  // Caret next to Futures in many headers (down arrow)
-  const caretNearFutures = futuresInHeader.locator("xpath=..").locator("svg, i, span").filter({
-    hasText: "",
-  }).first();
-
-  // Step 1: make sure we can see Futures
   const futuresVisible =
     (await futuresInHeader.isVisible().catch(() => false)) ||
     (await futuresRoleLink.isVisible().catch(() => false)) ||
@@ -508,70 +516,78 @@ async function clickFuturesDropdownThenFutures(page) {
     throw new Error("Could not see Futures in the top nav");
   }
 
-  // Step 2: open dropdown
-  // Try hover first (many sites open menus on hover)
-  try {
-    if (await futuresInHeader.isVisible().catch(() => false)) {
-      await futuresInHeader.hover({ timeout: 5000 }).catch(() => null);
-      await sleep(600);
-    }
-  } catch {}
+  // Try hover, then click
+  if (await futuresInHeader.isVisible().catch(() => false)) {
+    await futuresInHeader.hover({ timeout: 5000 }).catch(() => null);
+    await sleep(500);
+  }
 
-  // Then click Futures text
-  let clickedSomething = false;
-
+  let clicked = false;
   if (await futuresRoleButton.isVisible().catch(() => false)) {
     await futuresRoleButton.click({ timeout: 8000 }).catch(() => null);
-    clickedSomething = true;
+    clicked = true;
   } else if (await futuresRoleLink.isVisible().catch(() => false)) {
     await futuresRoleLink.click({ timeout: 8000 }).catch(() => null);
-    clickedSomething = true;
+    clicked = true;
   } else if (await futuresInHeader.isVisible().catch(() => false)) {
     await futuresInHeader.click({ timeout: 8000 }).catch(() => null);
-    clickedSomething = true;
+    clicked = true;
   }
 
   await sleep(800);
+  await saveShot(page, "after-futures-open-attempt");
 
-  // If dropdown still not visible, try clicking the caret next to Futures
-  // This is common when the label is just a link and caret opens the menu
-  const dropdownCandidate = page.locator("text=Perpetual, text=Convert").first();
-  const dropdownVisible = await dropdownCandidate.isVisible().catch(() => false);
+  // Dropdown usually contains Perpetual and Convert
+  const menuHasPerpetual = await page.locator("text=Perpetual").first().isVisible().catch(() => false);
+  const menuHasConvert = await page.locator("text=Convert").first().isVisible().catch(() => false);
 
-  if (!dropdownVisible) {
-    try {
-      if (clickedSomething && (await caretNearFutures.isVisible().catch(() => false))) {
-        await caretNearFutures.click({ timeout: 8000 }).catch(() => null);
+  if (!menuHasPerpetual && !menuHasConvert) {
+    // Try clicking caret near Futures if the menu is controlled by caret
+    if (clicked && (await futuresInHeader.isVisible().catch(() => false))) {
+      const caret = futuresInHeader.locator("xpath=..").locator("svg, i").first();
+      if (await caret.isVisible().catch(() => false)) {
+        await caret.click({ timeout: 8000 }).catch(() => null);
         await sleep(800);
       }
-    } catch {}
+    }
   }
 
-  // Step 3: click Futures inside the dropdown
-  // The dropdown typically shows Futures, Perpetual, Convert
-  // We want the dropdown "Futures", not the header one.
-  const dropdownFutures = page
-    .locator("div, ul, menu")
-    .locator("text=Futures")
-    .nth(0);
+  await saveShot(page, "after-futures-caret-attempt");
 
-  // Better: choose the Futures that is NOT in header/nav by using a container that shows Perpetual/Convert
-  const menuContainer = page.locator("text=Perpetual").first().locator("xpath=ancestor-or-self::*[self::div or self::ul][1]");
-  const futuresInMenu = menuContainer.locator("text=Futures").first();
+  // Click the Futures option inside the dropdown
+  // We try the menu container that contains Perpetual or Convert
+  let menuContainer = null;
+  if (await page.locator("text=Perpetual").first().isVisible().catch(() => false)) {
+    menuContainer = page.locator("text=Perpetual").first().locator("xpath=ancestor-or-self::*[self::div or self::ul][1]");
+  } else if (await page.locator("text=Convert").first().isVisible().catch(() => false)) {
+    menuContainer = page.locator("text=Convert").first().locator("xpath=ancestor-or-self::*[self::div or self::ul][1]");
+  }
 
-  if (await futuresInMenu.isVisible().catch(() => false)) {
-    await futuresInMenu.click({ timeout: 8000 }).catch(() => null);
+  if (menuContainer) {
+    const futuresInMenu = menuContainer.locator("text=Futures").first();
+    if (await futuresInMenu.isVisible().catch(() => false)) {
+      await futuresInMenu.click({ timeout: 8000 }).catch(() => null);
+      await sleep(1200);
+      return;
+    }
+  }
+
+  // Fallback: click any visible Futures that is not in header
+  const anyFutures = page.locator("text=Futures");
+  const count = await anyFutures.count().catch(() => 0);
+  for (let i = 0; i < count; i++) {
+    const el = anyFutures.nth(i);
+    const visible = await el.isVisible().catch(() => false);
+    if (!visible) continue;
+
+    const inHeader = await el.locator("xpath=ancestor-or-self::header|ancestor-or-self::nav").count().catch(() => 0);
+    if (inHeader > 0) continue;
+
+    await el.click({ timeout: 8000 }).catch(() => null);
     await sleep(1200);
     return;
   }
 
-  if (await dropdownFutures.isVisible().catch(() => false)) {
-    await dropdownFutures.click({ timeout: 8000 }).catch(() => null);
-    await sleep(1200);
-    return;
-  }
-
-  // If still not found, screenshot for debugging
   await saveShot(page, "futures-dropdown-missing");
   throw new Error("Could not open Futures dropdown or click Futures inside it");
 }
@@ -597,7 +613,7 @@ async function clickInvitedMe(page) {
 
 async function enterOrderCodeAndConfirm(page, orderCode) {
   const codeBox = page
-    .locator('input[placeholder*="order code" i], input[placeholder*="Please enter the order code" i]')
+    .locator('input[placeholder*="Please enter the order code" i], input[placeholder*="order code" i]')
     .first();
 
   if (!(await codeBox.isVisible().catch(() => false))) {
@@ -652,10 +668,14 @@ async function waitForAnyText(page, texts, timeoutMs) {
 
 async function saveShot(page, tag) {
   try {
-    const file = `/tmp/${tag}-${Date.now()}.png`;
-    await page.screenshot({ path: file, fullPage: true });
-    lastShotPath = file;
-    console.log("Saved screenshot:", file);
+    const fileTmp = `/tmp/${tag}-${Date.now()}.png`;
+    await page.screenshot({ path: fileTmp, fullPage: true });
+
+    // Also write to a fixed file so /last-shot always has something
+    await page.screenshot({ path: LAST_SHOT_FILE, fullPage: true });
+
+    lastShotPath = fileTmp;
+    console.log("Saved screenshot:", fileTmp, "and updated", LAST_SHOT_FILE);
   } catch (e) {
     console.log("Screenshot failed:", e && e.message ? e.message : String(e));
   }
@@ -691,24 +711,6 @@ function renderRunReport(report) {
     <div><b>Started:</b> ${escapeHtml(report.started)}</div>
     <div><b>Code length:</b> ${report.codeLength}</div>
     <hr/>
-    <h3>Steps (your exact flow)</h3>
-    <ol>
-      <li>Open one of the login sites:
-        <ul>
-          ${LOGIN_URLS.slice(0, 3).map((u) => `<li>${escapeHtml(u)}</li>`).join("")}
-          <li>(Also tries /pc and /h5 automatically)</li>
-        </ul>
-      </li>
-      <li>Log in with that account username and password.</li>
-      <li>Click the down arrow next to <b>Futures</b> and click <b>Futures</b>.</li>
-      <li>Click <b>Invited me</b> at the bottom.</li>
-      <li>Paste the order code into the box that says <b>Please enter the order code</b>.</li>
-      <li>Click <b>Confirm</b>.</li>
-      <li>Confirm 1: pop up <b>Already followed the order</b>.</li>
-      <li>Click <b>Position order</b>.</li>
-      <li>Confirm 2: <b>Pending</b> in red.</li>
-    </ol>
-
     <h3>Accounts</h3>
     <table border="1" cellpadding="8" cellspacing="0">
       <thead>
