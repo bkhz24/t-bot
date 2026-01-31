@@ -2,7 +2,6 @@
 
 const express = require("express");
 const crypto = require("crypto");
-const path = require("path");
 const fs = require("fs");
 const { chromium } = require("playwright");
 
@@ -13,11 +12,13 @@ const PORT = process.env.PORT || 8080;
 
 const BOT_PASSWORD = process.env.BOT_PASSWORD || "";
 const ACCOUNTS_JSON = process.env.ACCOUNTS_JSON || "";
+
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_FROM = process.env.TWILIO_FROM || "";
 const TWILIO_TO = process.env.TWILIO_TO || "";
 
+// Prefer PC first, then H5
 const LOGIN_URLS = [
   "https://bgol.pro/pc/#/login",
   "https://bgol.pro/h5/#/login",
@@ -33,6 +34,13 @@ function nowLocal() {
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function isPcUrl(url) {
+  return url.includes("/pc/");
+}
+function isH5Url(url) {
+  return url.includes("/h5/");
 }
 
 function safeJsonParseAccounts() {
@@ -59,7 +67,7 @@ function safeJsonParseAccounts() {
 async function visibleText(page, text) {
   try {
     const loc = page.locator(`text=${text}`).first();
-    return await loc.isVisible({ timeout: 1000 });
+    return await loc.isVisible({ timeout: 1200 });
   } catch {
     return false;
   }
@@ -136,10 +144,11 @@ app.get("/", (req, res) => {
   res.send(`
     <h2>T-Bot</h2>
     <div>Running: <b>${isRunning ? "YES" : "NO"}</b></div>
-    <div>Last run: ${lastRunAt ? lastRunAt : "—"}</div>
+    <div>Last run: ${lastRunAt ? escapeHtml(lastRunAt) : "None"}</div>
+
     <div style="color:red; margin-top:10px;">
       ${pwMissing ? "BOT_PASSWORD not set<br/>" : ""}
-      ${accountsMissing ? (cfg.error || "ACCOUNTS_JSON not set") : ""}
+      ${accountsMissing ? escapeHtml(cfg.error || "ACCOUNTS_JSON not set") : ""}
       ${lastError ? `<br/>Last error: ${escapeHtml(lastError)}` : ""}
     </div>
 
@@ -168,7 +177,7 @@ app.get("/health", (req, res) => {
     running: isRunning,
     lastRun: lastRunAt,
     lastError: lastError,
-    loginUrls: LOGIN_URLS.slice(0, 3), // keep short
+    loginUrls: LOGIN_URLS.slice(0, 3),
     configOk: cfg.ok,
     configError: cfg.error,
     accountsCount: cfg.ok ? cfg.accounts.length : 0,
@@ -192,6 +201,10 @@ app.get("/last-shot", async (req, res) => {
   fs.createReadStream(lastShotPath).pipe(res);
 });
 
+app.get("/run", (req, res) => {
+  res.status(200).send("OK: /run route exists. Submit the form on / to POST to /run.");
+});
+
 app.get("/run/:id", (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD to view.");
   if (!runReport || req.params.id !== lastRunId) return res.status(404).send("Run not found.");
@@ -213,7 +226,6 @@ app.post("/run", async (req, res) => {
   if (!code) return res.status(400).send("No code provided.");
   if (isRunning) return res.send("Bot is already running. Please wait.");
 
-  // create run record
   isRunning = true;
   lastError = null;
   lastRunAt = nowLocal();
@@ -241,11 +253,9 @@ app.post("/run", async (req, res) => {
     status: "Running now. Refresh this page.",
   };
 
-  // respond immediately
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(renderRunReport(runReport));
 
-  // run async
   (async () => {
     try {
       console.log("Bot started");
@@ -306,205 +316,72 @@ async function runAccountAllSites(account, orderCode) {
 }
 
 async function runAccountOnSite(account, orderCode, loginUrl) {
-  // NOTE: Use the installed playwright browsers in the image.
   const browser = await chromium.launch({
     headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-    ],
+    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
   });
 
+  const isPc = isPcUrl(loginUrl);
+
   const context = await browser.newContext({
-    viewport: { width: 1280, height: 720 },
-    userAgent:
-      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    viewport: isPc ? { width: 1280, height: 720 } : { width: 390, height: 844 },
+    userAgent: isPc
+      ? "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+      : "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
     locale: "en-US",
   });
 
   const page = await context.newPage();
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
 
-  // Log hard failures (THIS IS THE IMPORTANT PART)
+  // Logging
   page.on("requestfailed", (req) => {
     const f = req.failure();
-    const errText = (f && f.errorText) ? f.errorText : "unknown";
+    const errText = f && f.errorText ? f.errorText : "unknown";
     console.log("REQUEST FAILED:", req.url(), "=>", errText);
   });
-
   page.on("console", (msg) => {
     if (msg.type() === "error") console.log("PAGE CONSOLE: error", msg.text());
   });
-
   page.on("pageerror", (err) => {
     console.log("PAGE ERROR:", err && err.message ? err.message : String(err));
   });
 
   try {
-    // Quick load check. If the page itself cannot load, fail fast.
     await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await sleep(1200);
 
-    // If the login form doesn’t appear, fail fast and screenshot.
-    const emailInput = page.locator('input[type="text"], input[type="email"]').first();
-    const passInput = page.locator('input[type="password"]').first();
-
-    const hasEmail = await emailInput.isVisible().catch(() => false);
-    const hasPass = await passInput.isVisible().catch(() => false);
-
-    if (!hasEmail || !hasPass) {
-      await saveShot(page, "login-form-missing");
-      throw new Error("Login form not visible (page may not have loaded fully)");
-    }
-
-    // Login attempts (retries)
-    let loggedIn = false;
-
-    for (let attempt = 1; attempt <= 12; attempt++) {
-      console.log("Login attempt", attempt, "for", account.username, "on", loginUrl);
-      try {
-        // reload each attempt to avoid partial state
-        await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-        await sleep(1500);
-
-        // Prefer the exact selectors matching your screenshot (Email + Password + Login button)
-        const userField = page.locator('input[type="email"], input[type="text"]').first();
-        const passField = page.locator('input[type="password"]').first();
-
-        await userField.waitFor({ timeout: 15000 });
-        await userField.click({ timeout: 5000 });
-        await userField.fill(account.username);
-        await sleep(400);
-
-        await passField.waitFor({ timeout: 15000 });
-        await passField.click({ timeout: 5000 });
-        await passField.fill(account.password);
-        await sleep(400);
-
-        // Click the Login button if present, otherwise press Enter
-        const loginBtn = page.getByRole("button", { name: /login/i }).first();
-        if (await loginBtn.isVisible().catch(() => false)) {
-          await loginBtn.click({ timeout: 10000 });
-        } else {
-          await passField.press("Enter");
-        }
-
-        await sleep(3500);
-
-        // Success checks: top nav items appear in your desktop view
-        const success =
-          (await visibleText(page, "Futures")) ||
-          (await visibleText(page, "Markets")) ||
-          (await visibleText(page, "Assets")) ||
-          (await visibleText(page, "Support center")) ||
-          (await visibleText(page, "Announcements"));
-
-        if (success) {
-          loggedIn = true;
-          console.log("Login succeeded for", account.username, "on", loginUrl);
-          break;
-        }
-
-        // If DNS is broken, don’t keep hammering. This is the key:
-        // When required resources can’t resolve, we should failover quickly.
-        // We detect this by checking if any request failed with ERR_NAME_NOT_RESOLVED.
-        // We can’t read that state directly here, but the requestfailed logs will show it.
-      } catch (e) {
-        console.log("Login attempt exception:", e && e.message ? e.message : String(e));
-      }
-
-      await sleep(1500);
-    }
-
+    // ---- LOGIN ----
+    const loggedIn = await performLogin(page, account, loginUrl);
     if (!loggedIn) {
       await saveShot(page, "login-failed");
-      throw new Error("Login failed");
+      throw new Error("Login failed (still on login page after attempts)");
     }
 
-    // ---- Your flow after login (desktop view) ----
-    // 1) Open Futures dropdown and select Futures
-    // (Sometimes it’s already on Futures; still safe)
-    const futuresMenu = page.locator("text=Futures").first();
-    if (await futuresMenu.isVisible().catch(() => false)) {
-      await futuresMenu.click().catch(() => null);
-      await sleep(800);
-      // click Futures option in dropdown if visible
-      const futuresOption = page.locator("text=Futures").nth(1);
-      if (await futuresOption.isVisible().catch(() => false)) {
-        await futuresOption.click().catch(() => null);
-      }
-    }
+    // ---- FLOW ----
+    // Your screenshots/steps are PC layout. If we are on h5 we still try, but PC is the best match.
     await sleep(1500);
+
+    // 1) Open Futures dropdown and select Futures
+    await clickFutures(page);
 
     // 2) Click "Invited me"
-    const invited = page.locator("text=invited me").first();
-    if (await invited.isVisible().catch(() => false)) {
-      await invited.click();
-    } else {
-      // sometimes tab capitalization
-      await page.locator("text=Invited me").first().click();
-    }
-    await sleep(1500);
+    await clickInvitedMe(page);
 
-    // 3) Enter code in the box "Please enter the order code"
-    const codeInput = page.locator('input[placeholder*="order code" i], input').filter({
-      hasText: "",
-    }).first();
+    // 3) Enter code "Please enter the order code"
+    await enterOrderCodeAndConfirm(page, orderCode);
 
-    // safer: look for placeholder
-    const codeBox = page.locator('input[placeholder*="Please enter the order code" i], input[placeholder*="order code" i]').first();
-    if (await codeBox.isVisible().catch(() => false)) {
-      await codeBox.click();
-      await codeBox.fill(orderCode);
-    } else {
-      await saveShot(page, "code-box-missing");
-      throw new Error("Order code input not found");
-    }
-    await sleep(600);
-
-    // 4) Click Confirm
-    const confirmBtn = page.getByRole("button", { name: /confirm/i }).first();
-    if (await confirmBtn.isVisible().catch(() => false)) {
-      await confirmBtn.click();
-    } else {
-      await saveShot(page, "confirm-missing");
-      throw new Error("Confirm button not found");
-    }
-    await sleep(1500);
-
-    // 5) Confirm pop-up: "Already followed the order"
-    // wait up to 10s
-    let gotAlready = false;
-    for (let i = 0; i < 10; i++) {
-      if (await visibleText(page, "Already followed the order")) {
-        gotAlready = true;
-        break;
-      }
-      await sleep(1000);
-    }
-    if (!gotAlready) {
+    // 4) Confirm pop-up: "Already followed the order"
+    const alreadyOk = await waitForAnyText(page, ["Already followed the order"], 12000);
+    if (!alreadyOk) {
       await saveShot(page, "no-already-popup");
       throw new Error('Did not see "Already followed the order" popup');
     }
 
-    // 6) Click Position order and confirm Pending appears
-    const positionOrder = page.locator("text=Position order").first();
-    if (await positionOrder.isVisible().catch(() => false)) {
-      await positionOrder.click();
-    }
-    await sleep(1200);
+    // 5) Click Position order and confirm Pending appears
+    await clickPositionOrder(page);
 
-    // Pending in red (just check text)
-    let pendingOk = false;
-    for (let i = 0; i < 8; i++) {
-      if (await visibleText(page, "Pending")) {
-        pendingOk = true;
-        break;
-      }
-      await sleep(800);
-    }
-
+    const pendingOk = await waitForAnyText(page, ["Pending"], 12000);
     if (!pendingOk) {
       await saveShot(page, "no-pending");
       throw new Error("Did not see Pending after submitting");
@@ -515,6 +392,187 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await context.close().catch(() => null);
     await browser.close().catch(() => null);
   }
+}
+
+async function performLogin(page, account, loginUrl) {
+  // More strict success detection:
+  // We ONLY accept login success if we see post-login UI markers.
+  const successMarkers = ["Futures", "Markets", "Assets", "Position order", "invited me", "Invited me"];
+
+  // Login form selectors
+  const userField = page
+    .locator(
+      'input[type="email"], input[type="text"], input[autocomplete="username"], input[placeholder*="email" i], input[placeholder*="account" i], input[placeholder*="user" i]'
+    )
+    .first();
+
+  const passField = page
+    .locator(
+      'input[type="password"], input[autocomplete="current-password"], input[placeholder*="password" i]'
+    )
+    .first();
+
+  for (let attempt = 1; attempt <= 12; attempt++) {
+    console.log("Login attempt", attempt, "for", account.username, "on", loginUrl);
+
+    try {
+      await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await sleep(1200);
+
+      // Make sure fields exist
+      await userField.waitFor({ timeout: 20000 });
+      await passField.waitFor({ timeout: 20000 });
+
+      // Fill
+      await userField.click({ timeout: 5000 });
+      await userField.fill("");
+      await userField.fill(account.username);
+      await sleep(300);
+
+      await passField.click({ timeout: 5000 });
+      await passField.fill("");
+      await passField.fill(account.password);
+      await sleep(300);
+
+      // Submit: click Login button if possible, else Enter
+      const loginBtn = page.getByRole("button", { name: /^login$/i }).first();
+      if (await loginBtn.isVisible().catch(() => false)) {
+        await Promise.allSettled([
+          loginBtn.click({ timeout: 15000 }),
+          page.waitForLoadState("domcontentloaded", { timeout: 15000 }),
+        ]);
+      } else {
+        await passField.press("Enter").catch(() => null);
+      }
+
+      // Give SPA time to transition
+      await sleep(2500);
+
+      // STRICT: require post-login markers
+      const ok = await waitForAnyText(page, successMarkers, 15000);
+      if (ok) {
+        console.log("Login confirmed for", account.username, "on", loginUrl);
+        return true;
+      }
+
+      // If there is an on-screen error message, log it
+      const maybeError =
+        (await visibleText(page, "Incorrect")) ||
+        (await visibleText(page, "invalid")) ||
+        (await visibleText(page, "failed")) ||
+        (await visibleText(page, "Error")) ||
+        (await visibleText(page, "account or password"));
+
+      if (maybeError) {
+        console.log("Login page shows an error message for", account.username);
+      }
+    } catch (e) {
+      console.log("Login attempt exception:", e && e.message ? e.message : String(e));
+    }
+
+    await sleep(1200);
+  }
+
+  return false;
+}
+
+async function clickFutures(page) {
+  // PC: top nav "Futures" with dropdown
+  // H5: sometimes "Futures" exists as a menu label
+  const futuresLabel = page.locator("text=Futures").first();
+  if (await futuresLabel.isVisible().catch(() => false)) {
+    await futuresLabel.click().catch(() => null);
+    await sleep(700);
+
+    // Often the dropdown includes another "Futures"
+    const futuresOption = page.locator("text=Futures").nth(1);
+    if (await futuresOption.isVisible().catch(() => false)) {
+      await futuresOption.click().catch(() => null);
+    }
+    await sleep(1200);
+    return;
+  }
+
+  // If Futures isn't visible, screenshot and fail
+  await saveShot(page, "futures-missing");
+  throw new Error("Could not find Futures menu after login");
+}
+
+async function clickInvitedMe(page) {
+  const invitedLower = page.locator("text=invited me").first();
+  const invitedCap = page.locator("text=Invited me").first();
+
+  if (await invitedLower.isVisible().catch(() => false)) {
+    await invitedLower.click();
+    await sleep(1200);
+    return;
+  }
+  if (await invitedCap.isVisible().catch(() => false)) {
+    await invitedCap.click();
+    await sleep(1200);
+    return;
+  }
+
+  await saveShot(page, "invited-missing");
+  throw new Error('Could not find "Invited me" tab');
+}
+
+async function enterOrderCodeAndConfirm(page, orderCode) {
+  // Find input by placeholder first
+  const codeBox = page
+    .locator('input[placeholder*="order code" i], input[placeholder*="Please enter the order code" i]')
+    .first();
+
+  const visible = await codeBox.isVisible().catch(() => false);
+  if (!visible) {
+    await saveShot(page, "code-box-missing");
+    throw new Error("Order code input not found");
+  }
+
+  await codeBox.click().catch(() => null);
+  await codeBox.fill("").catch(() => null);
+  await codeBox.fill(orderCode);
+  await sleep(400);
+
+  const confirmBtn = page.getByRole("button", { name: /confirm/i }).first();
+  if (await confirmBtn.isVisible().catch(() => false)) {
+    await confirmBtn.click().catch(() => null);
+    await sleep(1200);
+    return;
+  }
+
+  // Fallback if role button doesn't match
+  const confirmTextBtn = page.locator("text=Confirm").first();
+  if (await confirmTextBtn.isVisible().catch(() => false)) {
+    await confirmTextBtn.click().catch(() => null);
+    await sleep(1200);
+    return;
+  }
+
+  await saveShot(page, "confirm-missing");
+  throw new Error("Confirm button not found");
+}
+
+async function clickPositionOrder(page) {
+  const pos = page.locator("text=Position order").first();
+  if (await pos.isVisible().catch(() => false)) {
+    await pos.click().catch(() => null);
+    await sleep(1200);
+    return;
+  }
+  await saveShot(page, "position-order-missing");
+  throw new Error('Could not find "Position order" tab');
+}
+
+async function waitForAnyText(page, texts, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    for (const t of texts) {
+      if (await visibleText(page, t)) return true;
+    }
+    await sleep(500);
+  }
+  return false;
 }
 
 async function saveShot(page, tag) {
@@ -587,7 +645,7 @@ function renderRunReport(report) {
     <p><b>Status:</b> ${escapeHtml(report.status)}</p>
 
     <div>
-      <a href="/?p=${encodeURIComponent(BOT_PASSWORD)}">Back to home</a>
+      <a href="/">Back to home</a>
       | <a href="/health">Health</a>
       | <a href="/last-shot?p=${encodeURIComponent(BOT_PASSWORD)}">Last screenshot</a>
       | <a href="/run/${escapeHtml(report.id)}?p=${encodeURIComponent(BOT_PASSWORD)}">Permalink</a>
