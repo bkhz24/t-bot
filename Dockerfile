@@ -2,11 +2,11 @@ FROM mcr.microsoft.com/playwright:v1.58.1-jammy
 
 WORKDIR /app
 
-# Install dependencies
-COPY package*.json ./
-RUN npm ci --omit=dev
+# Install deps (works even if package-lock.json is missing)
+COPY package.json ./
+RUN npm install --omit=dev
 
-# Copy app code
+# Copy app
 COPY . .
 
 ENV NODE_ENV=production
