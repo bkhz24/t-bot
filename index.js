@@ -4,31 +4,48 @@ const express = require("express");
 const crypto = require("crypto");
 const fs = require("fs");
 const dns = require("dns").promises;
-const https = require("https");
-const { chromium } = require("playwright");
+
+let playwright;
+try {
+  playwright = require("playwright");
+} catch (e) {
+  // If this throws in logs: Cannot find module 'playwright'
+  // then Playwright is not installed as a dependency.
+  // Fix: add "playwright" to dependencies in package.json (not devDependencies) and redeploy.
+  throw e;
+}
+const { chromium } = playwright;
 
 // --------------------
 // Config
 // --------------------
 const PORT = process.env.PORT || 8080;
 
-// Trim BOT_PASSWORD so trailing spaces in Railway variables do not break auth.
-const BOT_PASSWORD = (process.env.BOT_PASSWORD || "").trim();
+const BOT_PASSWORD = process.env.BOT_PASSWORD || "";
 const ACCOUNTS_JSON = process.env.ACCOUNTS_JSON || "";
 
-// Twilio optional
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_FROM = process.env.TWILIO_FROM || "";
 const TWILIO_TO = process.env.TWILIO_TO || "";
 
-// OPTION A: remove bgol.* completely. Only keep domains that resolve in Railway.
-const LOGIN_URLS = [
-  "https://dsj89.com/pc/#/login",
-  "https://dsj89.com/h5/#/login",
-  "https://dsj72.com/pc/#/login",
-  "https://dsj72.com/h5/#/login",
+// Try both pc + h5 for each base domain
+const BASE_DOMAINS = [
+  "bgol.pro",
+  "dsj89.com",
+  "dsj72.com",
 ];
+
+function buildLoginUrls() {
+  const out = [];
+  for (const d of BASE_DOMAINS) {
+    out.push(`https://${d}/pc/#/login`);
+    out.push(`https://${d}/h5/#/login`);
+  }
+  return out;
+}
+
+const LOGIN_URLS = buildLoginUrls();
 
 function nowLocal() {
   return new Date().toLocaleString("en-US", { timeZoneName: "short" });
@@ -62,15 +79,20 @@ function safeJsonParseAccounts() {
 async function visibleText(page, text) {
   try {
     const loc = page.locator(`text=${text}`).first();
-    return await loc.isVisible({ timeout: 1000 });
+    return await loc.isVisible({ timeout: 1200 });
   } catch {
     return false;
   }
 }
 
 function authOk(req) {
-  const p = (req.query.p || "").toString().trim();
+  const p = (req.query.p || "").toString();
   return !!BOT_PASSWORD && p === BOT_PASSWORD;
+}
+
+function cleanBaseUrl(req) {
+  // Build a base URL that works behind Railway
+  return `${req.protocol}://${req.get("host")}`;
 }
 
 // --------------------
@@ -120,12 +142,12 @@ let isRunning = false;
 let lastRunAt = null;
 let lastError = null;
 
-let lastShotPath = null; // for /last-shot
+let lastShotPath = null;     // file on disk to serve
 let lastRunId = null;
 let runReport = null;
 
-// keep a stable copy for /last-shot (handy on Railway)
-const LAST_SHOT_STABLE = "/app/last-shot.png";
+// Keep a stable file path for /last-shot
+const LAST_SHOT_FILE = "/app/last-shot.png";
 
 // --------------------
 // Express app
@@ -136,17 +158,23 @@ app.use(express.urlencoded({ extended: true }));
 app.get("/", (req, res) => {
   const cfg = safeJsonParseAccounts();
   const pwMissing = !BOT_PASSWORD;
-  const accountsMissing = !cfg.ok;
+  const accountsBad = !cfg.ok;
+
+  const base = cleanBaseUrl(req);
+  const lastShotUrl = `${base}/last-shot?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}`;
+  const smsTestUrl = `${base}/sms-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}`;
+  const dnsTestUrl = `${base}/dns-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}`;
+  const netTestUrl = `${base}/net-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}`;
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`
     <h2>T-Bot</h2>
     <div>Running: <b>${isRunning ? "YES" : "NO"}</b></div>
-    <div>Last run: ${lastRunAt ? lastRunAt : "-"}</div>
+    <div>Last run: ${lastRunAt ? escapeHtml(lastRunAt) : "-"}</div>
 
     <div style="color:red; margin-top:10px;">
       ${pwMissing ? "BOT_PASSWORD not set<br/>" : ""}
-      ${accountsMissing ? (cfg.error || "ACCOUNTS_JSON not set") : ""}
+      ${accountsBad ? escapeHtml(cfg.error || "ACCOUNTS_JSON not set/invalid") : ""}
       ${lastError ? `<br/>Last error: ${escapeHtml(lastError)}` : ""}
     </div>
 
@@ -159,10 +187,11 @@ app.get("/", (req, res) => {
     </form>
 
     <div style="margin-top:12px;">
-      Health: <a href="/health">/health</a>
-      | Last screenshot: <a href="/last-shot?p=YOUR_BOT_PASSWORD">/last-shot</a>
-      | SMS test: <a href="/sms-test?p=YOUR_BOT_PASSWORD">/sms-test</a>
-      | DNS test: <a href="/dns-test?p=YOUR_BOT_PASSWORD">/dns-test</a>
+      <a href="/health">/health</a>
+      | <a href="${lastShotUrl}">Last screenshot</a>
+      | <a href="${smsTestUrl}">SMS test</a>
+      | <a href="${dnsTestUrl}">DNS test</a>
+      | <a href="${netTestUrl}">NET test</a>
     </div>
   `);
 });
@@ -176,7 +205,7 @@ app.get("/health", (req, res) => {
     running: isRunning,
     lastRun: lastRunAt,
     lastError: lastError,
-    loginUrls: LOGIN_URLS,
+    loginUrls: LOGIN_URLS.slice(0, 6),
     configOk: cfg.ok,
     configError: cfg.error,
     accountsCount: cfg.ok ? cfg.accounts.length : 0,
@@ -192,55 +221,74 @@ app.get("/sms-test", async (req, res) => {
   res.send("OK: SMS sent (or SMS not configured).");
 });
 
-app.get("/last-shot", async (req, res) => {
-  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD to view.");
-
-  // Prefer the stable path if present
-  const p = fs.existsSync(LAST_SHOT_STABLE) ? LAST_SHOT_STABLE : lastShotPath;
-
-  if (!p || !fs.existsSync(p)) return res.send("No screenshot captured yet.");
-
-  res.setHeader("Content-Type", "image/png");
-  fs.createReadStream(p).pipe(res);
-});
-
+// Quick DNS check for the domains and their api subdomains
 app.get("/dns-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD to view.");
 
-  const hosts = [
-    "dsj89.com",
-    "dsj72.com",
-    "api.ddjea.com",
-    "api.bgol.pro",
-  ];
+  const results = {};
+  const hosts = [];
+  for (const d of BASE_DOMAINS) {
+    hosts.push(d);
+    hosts.push(`api.${d}`);
+  }
+  // Also include api.ddjea.com since your console showed it
+  hosts.push("api.ddjea.com");
 
-  const out = {};
   for (const h of hosts) {
     try {
       const addrs = await dns.lookup(h, { all: true });
-      out[h] = { ok: true, addrs };
+      results[h] = { ok: true, addrs };
     } catch (e) {
-      out[h] = { ok: false, error: e.message || String(e) };
+      results[h] = { ok: false, error: e.code ? `${e.code} ${e.message}` : (e.message || String(e)) };
     }
   }
 
-  // quick fetch checks (optional)
-  await new Promise((resolve) => {
-    const req2 = https.get("https://api.ddjea.com/api/app/ping", { timeout: 8000 }, (r) => {
-      out["https://api.ddjea.com/api/app/ping"] = { ok: true, status: r.statusCode };
-      r.resume();
-      resolve();
-    });
-    req2.on("error", (e) => {
-      out["https://api.ddjea.com/api/app/ping"] = { ok: false, error: e.message || String(e) };
-      resolve();
-    });
-    req2.on("timeout", () => {
-      req2.destroy(new Error("timeout"));
-    });
-  });
+  res.json(results);
+});
+
+// Simple network fetch check (no browser) so you can see who is blocked
+app.get("/net-test", async (req, res) => {
+  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD to view.");
+
+  const tests = [];
+  for (const d of BASE_DOMAINS) {
+    tests.push(`https://${d}/`);
+    tests.push(`https://api.${d}/api/app/ping`);
+  }
+  tests.push("https://api.ddjea.com/api/app/ping");
+
+  const out = {};
+  for (const url of tests) {
+    try {
+      const r = await fetch(url, {
+        method: "GET",
+        redirect: "follow",
+        headers: { "User-Agent": "Mozilla/5.0" },
+      });
+      const text = await r.text();
+      out[url] = {
+        ok: r.ok,
+        status: r.status,
+        // keep short
+        bodyPreview: text.slice(0, 300),
+      };
+    } catch (e) {
+      out[url] = { ok: false, error: e.message || String(e) };
+    }
+  }
 
   res.json(out);
+});
+
+app.get("/last-shot", async (req, res) => {
+  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD to view.");
+
+  // serve stable file if present
+  const file = fs.existsSync(LAST_SHOT_FILE) ? LAST_SHOT_FILE : lastShotPath;
+  if (!file || !fs.existsSync(file)) return res.send("No screenshot captured yet.");
+
+  res.setHeader("Content-Type", "image/png");
+  fs.createReadStream(file).pipe(res);
 });
 
 app.get("/run/:id", (req, res) => {
@@ -248,11 +296,11 @@ app.get("/run/:id", (req, res) => {
   if (!runReport || req.params.id !== lastRunId) return res.status(404).send("Run not found.");
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(renderRunReport(runReport));
+  res.send(renderRunReport(runReport, req));
 });
 
 app.post("/run", async (req, res) => {
-  const p = (req.body.p || "").toString().trim();
+  const p = (req.body.p || "").toString();
   const code = (req.body.code || "").toString().trim();
 
   if (!BOT_PASSWORD) return res.status(500).send("BOT_PASSWORD not set in Railway variables.");
@@ -264,7 +312,6 @@ app.post("/run", async (req, res) => {
   if (!code) return res.status(400).send("No code provided.");
   if (isRunning) return res.send("Bot is already running. Please wait.");
 
-  // create run record
   isRunning = true;
   lastError = null;
   lastRunAt = nowLocal();
@@ -283,11 +330,9 @@ app.post("/run", async (req, res) => {
     status: "Running now. Refresh this page.",
   };
 
-  // respond immediately
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(renderRunReport(runReport));
+  res.send(renderRunReport(runReport, req));
 
-  // run async
   (async () => {
     try {
       console.log("Bot started");
@@ -313,7 +358,6 @@ app.post("/run", async (req, res) => {
 
       const anyFailed = runReport.accounts.some((a) => !a.completed);
       runReport.status = anyFailed ? "Finished with failures. See account errors." : "Completed successfully.";
-
       await sendSMS(anyFailed ? `T-Bot finished with failures at ${nowLocal()}` : `T-Bot completed at ${nowLocal()}`);
       console.log("Bot completed");
     } catch (e) {
@@ -348,64 +392,132 @@ async function runAccountAllSites(account, orderCode) {
   throw last || new Error("All sites failed");
 }
 
-function isMobileUrl(url) {
-  return url.includes("/h5/");
+function hostFromUrl(u) {
+  try {
+    return new URL(u).host;
+  } catch {
+    return "";
+  }
+}
+
+// Stricter: decide logged in only if login inputs gone AND url changed OR we see Account/Logout
+async function isReallyLoggedIn(page) {
+  const urlNow = page.url();
+  const stillOnLogin = urlNow.includes("/login") || urlNow.includes("#/login");
+
+  const loginInputsVisible = await page
+    .locator('input[type="password"], input[placeholder*="password" i]')
+    .first()
+    .isVisible()
+    .catch(() => false);
+
+  const hasAccount =
+    (await visibleText(page, "Account")) ||
+    (await visibleText(page, "Logout")) ||
+    (await visibleText(page, "Sign out"));
+
+  // Logged in if:
+  // - account/logout text is visible, OR
+  // - not on login and login inputs are not visible
+  if (hasAccount) return true;
+  if (!stillOnLogin && !loginInputsVisible) return true;
+
+  return false;
+}
+
+async function clickFuturesDropdown(page) {
+  // The "Futures" item is typically in the top nav with a down arrow.
+  // Try multiple strategies.
+
+  // 1) role=link or role=button
+  const futuresLink = page.getByRole("link", { name: /^Futures$/i }).first();
+  const futuresButton = page.getByRole("button", { name: /^Futures$/i }).first();
+
+  if (await futuresLink.isVisible().catch(() => false)) {
+    await futuresLink.click({ timeout: 8000 }).catch(() => null);
+    await sleep(600);
+  } else if (await futuresButton.isVisible().catch(() => false)) {
+    await futuresButton.click({ timeout: 8000 }).catch(() => null);
+    await sleep(600);
+  } else {
+    // 2) raw text locator
+    const futuresText = page.locator("text=Futures").first();
+    if (await futuresText.isVisible().catch(() => false)) {
+      await futuresText.click({ timeout: 8000 }).catch(() => null);
+      await sleep(600);
+    }
+  }
+
+  // After opening dropdown, click the Futures option inside the dropdown if it exists.
+  // Sometimes the dropdown includes "Futures" and subitems like "Perpetual", etc.
+  const futuresOption = page.locator("text=Futures").nth(1);
+  if (await futuresOption.isVisible().catch(() => false)) {
+    await futuresOption.click({ timeout: 8000 }).catch(() => null);
+    await sleep(800);
+    return true;
+  }
+
+  // Sometimes it is already on the Futures page. If we see invited me / position order area, also ok.
+  if ((await visibleText(page, "invited me")) || (await visibleText(page, "Invited me"))) return true;
+
+  return false;
 }
 
 async function runAccountOnSite(account, orderCode, loginUrl) {
-  const mobile = isMobileUrl(loginUrl);
+  const siteHost = hostFromUrl(loginUrl);
+
+  // Quick DNS check: if site host cannot resolve, skip immediately.
+  try {
+    await dns.lookup(siteHost);
+  } catch (e) {
+    throw new Error(`DNS failed for ${siteHost}: ${e.code || ""} ${e.message || String(e)}`.trim());
+  }
 
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
   });
 
+  // Desktop first. We only switch to mobile if desktop cannot progress.
   const context = await browser.newContext({
-    viewport: mobile ? { width: 390, height: 844 } : { width: 1280, height: 720 },
-    userAgent: mobile
-      ? "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-      : "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    viewport: { width: 1366, height: 768 },
+    userAgent:
+      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
     locale: "en-US",
   });
 
   const page = await context.newPage();
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
 
-  // Log failures
   page.on("requestfailed", (req) => {
     const f = req.failure();
     const errText = f && f.errorText ? f.errorText : "unknown";
     console.log("REQUEST FAILED:", req.url(), "=>", errText);
   });
+
   page.on("console", (msg) => {
     if (msg.type() === "error") console.log("PAGE CONSOLE: error", msg.text());
   });
+
   page.on("pageerror", (err) => {
     console.log("PAGE ERROR:", err && err.message ? err.message : String(err));
   });
 
   try {
     await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await sleep(1200);
+    await sleep(1000);
     await saveShot(page, "after-goto");
 
-    // Make sure login form exists
-    const userField = page
-      .locator('input[type="email"], input[type="text"], input[autocomplete="username"]')
-      .first();
-    const passField = page
-      .locator('input[type="password"], input[autocomplete="current-password"]')
-      .first();
+    // Identify login fields
+    const userField = page.locator(
+      'input[type="email"], input[type="text"], input[autocomplete="username"], input[placeholder*="email" i], input[placeholder*="account" i], input[placeholder*="user" i]'
+    ).first();
 
-    const hasUser = await userField.isVisible().catch(() => false);
-    const hasPass = await passField.isVisible().catch(() => false);
+    const passField = page.locator(
+      'input[type="password"], input[autocomplete="current-password"], input[placeholder*="password" i]'
+    ).first();
 
-    if (!hasUser || !hasPass) {
-      await saveShot(page, "login-form-missing");
-      throw new Error("Login form not visible");
-    }
-
-    // Login retries
+    // Retry login loop
     let loggedIn = false;
 
     for (let attempt = 1; attempt <= 12; attempt++) {
@@ -425,10 +537,9 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
         await passField.fill(account.password);
         await sleep(300);
 
-        // Click Login if available, else press Enter
         const loginBtn = page.getByRole("button", { name: /login/i }).first();
         if (await loginBtn.isVisible().catch(() => false)) {
-          await loginBtn.click({ timeout: 15000 });
+          await loginBtn.click({ timeout: 10000 });
         } else {
           await passField.press("Enter");
         }
@@ -436,28 +547,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
         await sleep(2500);
         await saveShot(page, `after-login-attempt-${attempt}`);
 
-        // Stronger success checks: we must NOT be on the login form anymore.
-        const passStillVisible = await page.locator('input[type="password"]').first().isVisible().catch(() => false);
-        const urlNow = page.url();
-        const stillOnLogin = urlNow.includes("/login") || urlNow.includes("#/login");
-
-        // Things that appear only when the app shell loads (your screenshots)
-        const sawTopNav =
-          (await visibleText(page, "Futures")) ||
-          (await visibleText(page, "Markets")) ||
-          (await visibleText(page, "Assets")) ||
-          (await visibleText(page, "Support center")) ||
-          (await visibleText(page, "Announcements"));
-
-        // If we still see the password input, we are not logged in, even if some text exists.
-        if (!passStillVisible && !stillOnLogin) {
-          loggedIn = true;
-          console.log("Login confirmed for", account.username, "on", loginUrl);
-          break;
-        }
-
-        // If nav is visible and password input is gone, also accept.
-        if (sawTopNav && !passStillVisible) {
+        if (await isReallyLoggedIn(page)) {
           loggedIn = true;
           console.log("Login confirmed for", account.username, "on", loginUrl);
           break;
@@ -466,7 +556,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
         console.log("Login attempt exception:", e && e.message ? e.message : String(e));
       }
 
-      await sleep(1000);
+      await sleep(1200);
     }
 
     if (!loggedIn) {
@@ -476,47 +566,24 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
     await saveShot(page, "after-login");
 
-    // --------------------
-    // Post-login flow (best-effort)
-    // --------------------
-
-    // 1) Click Futures (top nav) then select Futures from dropdown
-    // Use a resilient locator: any element containing Futures near the top.
-    const futuresTop = page.locator("text=Futures").first();
-
-    // Wait a bit for the header to render
-    let futuresVisible = false;
-    for (let i = 0; i < 10; i++) {
-      futuresVisible = await futuresTop.isVisible().catch(() => false);
-      if (futuresVisible) break;
-      await sleep(600);
-    }
-
-    if (!futuresVisible) {
+    // Now we must find and click Futures dropdown, then Futures again.
+    const futuresOk = await clickFuturesDropdown(page);
+    if (!futuresOk) {
       await saveShot(page, "futures-not-visible");
       throw new Error("Could not see Futures in the top nav");
     }
 
-    await futuresTop.click().catch(() => null);
-    await sleep(800);
-
-    // The dropdown often has a second Futures entry
-    const futuresOption = page.locator("text=Futures").nth(1);
-    if (await futuresOption.isVisible().catch(() => false)) {
-      await futuresOption.click().catch(() => null);
-    }
-
     await sleep(1500);
-    await saveShot(page, "after-futures-click");
+    await saveShot(page, "after-futures");
 
-    // 2) Click Invited me tab (bottom tabs in your screenshots)
+    // Click "Invited me" tab
     const invited = page.locator("text=Invited me").first();
-    const invitedLower = page.locator("text=invited me").first();
+    const invited2 = page.locator("text=invited me").first();
 
     if (await invited.isVisible().catch(() => false)) {
-      await invited.click();
-    } else if (await invitedLower.isVisible().catch(() => false)) {
-      await invitedLower.click();
+      await invited.click({ timeout: 8000 }).catch(() => null);
+    } else if (await invited2.isVisible().catch(() => false)) {
+      await invited2.click({ timeout: 8000 }).catch(() => null);
     } else {
       await saveShot(page, "invited-missing");
       throw new Error("Could not find Invited me tab");
@@ -525,7 +592,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await sleep(1200);
     await saveShot(page, "after-invited");
 
-    // 3) Enter order code
+    // Code input
     const codeBox = page
       .locator('input[placeholder*="order code" i], input[placeholder*="Please enter the order code" i]')
       .first();
@@ -535,29 +602,28 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       throw new Error("Order code input not found");
     }
 
-    await codeBox.click().catch(() => null);
+    await codeBox.click({ timeout: 8000 }).catch(() => null);
     await codeBox.fill(orderCode);
-    await sleep(300);
+    await sleep(400);
 
-    // 4) Click Confirm
     const confirmBtn = page.getByRole("button", { name: /confirm/i }).first();
     if (!(await confirmBtn.isVisible().catch(() => false))) {
       await saveShot(page, "confirm-missing");
       throw new Error("Confirm button not found");
     }
 
-    await confirmBtn.click().catch(() => null);
-    await sleep(1200);
+    await confirmBtn.click({ timeout: 8000 }).catch(() => null);
+    await sleep(1500);
     await saveShot(page, "after-confirm");
 
-    // 5) Popup: Already followed the order
+    // Wait for "Already followed the order"
     let gotAlready = false;
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 12; i++) {
       if (await visibleText(page, "Already followed the order")) {
         gotAlready = true;
         break;
       }
-      await sleep(700);
+      await sleep(800);
     }
 
     if (!gotAlready) {
@@ -565,13 +631,16 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       throw new Error('Did not see "Already followed the order" popup');
     }
 
-    // 6) Position order + Pending
+    // Position order tab and Pending
     const positionOrder = page.locator("text=Position order").first();
     if (await positionOrder.isVisible().catch(() => false)) {
-      await positionOrder.click().catch(() => null);
+      await positionOrder.click({ timeout: 8000 }).catch(() => null);
+    } else {
+      await saveShot(page, "position-order-missing");
+      throw new Error("Position order tab not found");
     }
+
     await sleep(1200);
-    await saveShot(page, "after-position-order");
 
     let pendingOk = false;
     for (let i = 0; i < 10; i++) {
@@ -594,20 +663,20 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
   }
 }
 
+// Save a screenshot and also copy to a stable last-shot file for easy viewing
 async function saveShot(page, tag) {
   try {
     const file = `/tmp/${tag}-${Date.now()}.png`;
     await page.screenshot({ path: file, fullPage: true });
     lastShotPath = file;
 
-    // also copy to stable path for easier viewing
+    // Keep stable path too
     try {
-      fs.copyFileSync(file, LAST_SHOT_STABLE);
+      fs.copyFileSync(file, LAST_SHOT_FILE);
+      console.log("Saved screenshot:", file, "and updated", LAST_SHOT_FILE);
     } catch {
-      // ignore
+      console.log("Saved screenshot:", file);
     }
-
-    console.log("Saved screenshot:", file, "and updated", LAST_SHOT_STABLE);
   } catch (e) {
     console.log("Screenshot failed:", e && e.message ? e.message : String(e));
   }
@@ -622,7 +691,11 @@ function escapeHtml(s) {
     .replaceAll("'", "&#039;");
 }
 
-function renderRunReport(report) {
+function renderRunReport(report, req) {
+  const base = cleanBaseUrl(req);
+  const lastShotUrl = `${base}/last-shot?p=${encodeURIComponent(BOT_PASSWORD)}&t=${Date.now()}`;
+  const permalinkUrl = `${base}/run/${encodeURIComponent(report.id)}?p=${encodeURIComponent(BOT_PASSWORD)}`;
+
   const rows = report.accounts
     .map((a, idx) => {
       return `
@@ -643,21 +716,18 @@ function renderRunReport(report) {
     <div><b>Started:</b> ${escapeHtml(report.started)}</div>
     <div><b>Code length:</b> ${report.codeLength}</div>
     <hr/>
+
     <h3>Steps (your exact flow)</h3>
     <ol>
-      <li>Open one of the login sites:
-        <ul>
-          ${LOGIN_URLS.map((u) => `<li>${escapeHtml(u)}</li>`).join("")}
-        </ul>
-      </li>
-      <li>Log in with that account username and password.</li>
-      <li>Click the down arrow next to <b>Futures</b> and click <b>Futures</b>.</li>
-      <li>Click <b>Invited me</b> at the bottom.</li>
-      <li>Paste the order code into the box that says <b>Please enter the order code</b>.</li>
-      <li>Click <b>Confirm</b>.</li>
-      <li>Confirm 1: pop up <b>Already followed the order</b>.</li>
-      <li>Click <b>Position order</b>.</li>
-      <li>Confirm 2: <b>Pending</b> in red.</li>
+      <li>Open one of the login sites</li>
+      <li>Log in with that account username and password</li>
+      <li>Click the down arrow next to <b>Futures</b> and click <b>Futures</b></li>
+      <li>Click <b>Invited me</b> at the bottom</li>
+      <li>Paste the order code into the box that says <b>Please enter the order code</b></li>
+      <li>Click <b>Confirm</b></li>
+      <li>Confirm 1: pop up <b>Already followed the order</b></li>
+      <li>Click <b>Position order</b></li>
+      <li>Confirm 2: <b>Pending</b> in red</li>
     </ol>
 
     <h3>Accounts</h3>
@@ -673,8 +743,8 @@ function renderRunReport(report) {
     <div>
       <a href="/">Back to home</a>
       | <a href="/health">Health</a>
-      | <a href="/last-shot?p=YOUR_BOT_PASSWORD">Last screenshot</a>
-      | <a href="/run/${escapeHtml(report.id)}?p=YOUR_BOT_PASSWORD">Permalink</a>
+      | <a href="${lastShotUrl}">Last screenshot</a>
+      | <a href="${permalinkUrl}">Permalink</a>
     </div>
   `;
 }
