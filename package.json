@@ -1,17 +1,15 @@
 {
   "name": "t-bot",
   "version": "1.0.0",
-  "description": "Playwright bot + simple web form",
+  "private": true,
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "playwright": "1.44.0",
-    "twilio": "^4.23.0"
-  },
-  "engines": {
-    "node": "20.x"
+    "playwright": "^1.49.1",
+    "twilio": "^5.3.6"
   }
 }
