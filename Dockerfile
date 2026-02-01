@@ -1,13 +1,15 @@
-FROM mcr.microsoft.com/playwright:v1.44.0-jammy
+FROM mcr.microsoft.com/playwright:v1.58.1-jammy
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install --omit=dev
+# Install dependencies
+COPY package*.json ./
+RUN npm ci --omit=dev
 
+# Copy app code
 COPY . .
 
 ENV NODE_ENV=production
-ENV PORT=8080
+EXPOSE 8080
 
 CMD ["node", "index.js"]
