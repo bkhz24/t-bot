@@ -2,6 +2,7 @@
   "name": "t-bot",
   "version": "1.0.0",
   "private": true,
+  "main": "index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node index.js"
@@ -9,6 +10,6 @@
   "dependencies": {
     "express": "^4.19.2",
     "playwright": "1.58.1",
-    "twilio": "^4.22.0"
+    "twilio": "^5.3.4"
   }
 }
