@@ -56,6 +56,24 @@ function escapeHtml(s) {
     .replaceAll("'", "&#039;");
 }
 
+// Fix 1 helper: normalize URL for /run?url=
+// Allows "bgol.pro/pc/#/login" (adds https://)
+function normalizeTargetUrl(raw) {
+  if (!raw) return null;
+  let s = String(raw).trim();
+  if (!s) return null;
+
+  if (!s.startsWith("http://") && !s.startsWith("https://")) {
+    s = "https://" + s;
+  }
+
+  try {
+    return new URL(s).toString();
+  } catch {
+    return null;
+  }
+}
+
 function authOk(req) {
   const p = (req.query.p || "").toString();
   return !!BOT_PASSWORD && p === BOT_PASSWORD;
@@ -197,6 +215,16 @@ app.get("/", (req, res) => {
       | DNS test: <a href="/dns-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/dns-test</a>
       | Net test: <a href="/net-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/net-test</a>
       | SMS test: <a href="/sms-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/sms-test</a>
+      <div style="margin-top:10px; font-size: 13px;">
+        Run from URL:
+        <code>/run?p=YOUR_PASSWORD&code=123456789</code>
+        <br/>
+        One site:
+        <code>/run?p=YOUR_PASSWORD&code=123456789&url=https://bgol.pro/pc/#/login</code>
+        <br/>
+        Also works without https:
+        <code>/run?p=YOUR_PASSWORD&code=123456789&url=bgol.pro/pc/#/login</code>
+      </div>
     </div>
   `);
 });
@@ -301,17 +329,26 @@ app.get("/net-test", async (req, res) => {
   res.json(results);
 });
 
-app.post("/run", async (req, res) => {
-  const p = (req.body.p || "").toString();
-  const code = (req.body.code || "").toString().trim();
+// --------------------
+// Fix 1: GET /run
+// Supports:
+// /run?p=PASS&code=123456789
+// /run?p=PASS&code=123456789&url=https://bgol.pro/pc/#/login
+// /run?p=PASS&code=123456789&url=bgol.pro/pc/#/login
+// --------------------
+app.get("/run", async (req, res) => {
+  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
-  if (!BOT_PASSWORD) return res.status(500).send("BOT_PASSWORD not set in Railway variables.");
-  if (p !== BOT_PASSWORD) return res.status(401).send("Wrong password.");
+  const code = (req.query.code || "").toString().trim();
+  if (!code) return res.status(400).send("Missing code. Use ?code=123456789");
 
   const cfg = safeJsonParseAccounts();
   if (!cfg.ok) return res.status(500).send(cfg.error || "ACCOUNTS_JSON not set/invalid.");
 
-  if (!code) return res.status(400).send("No code provided.");
+  const rawUrl = (req.query.url || "").toString().trim();
+  const normalizedUrl = rawUrl ? normalizeTargetUrl(rawUrl) : null;
+  if (rawUrl && !normalizedUrl) return res.status(400).send("Invalid URL. It must include https://");
+
   if (isRunning) return res.send("Bot is already running. Please wait.");
 
   isRunning = true;
@@ -323,6 +360,7 @@ app.post("/run", async (req, res) => {
     id: lastRunId,
     started: lastRunAt,
     codeLength: code.length,
+    normalizedUrl: normalizedUrl || null,
     accounts: cfg.accounts.map((a) => ({
       username: a.username,
       completed: false,
@@ -343,13 +381,21 @@ app.post("/run", async (req, res) => {
       console.log("Run ID:", lastRunId);
       console.log("Accounts loaded:", cfg.accounts.length);
       console.log("Code received length:", code.length);
+      if (normalizedUrl) console.log("Normalized URL:", normalizedUrl);
 
       await sendSMS(`T-Bot started at ${lastRunAt}`);
 
       for (let i = 0; i < cfg.accounts.length; i++) {
         const account = cfg.accounts[i];
         try {
-          const used = await runAccountAllSites(account, code);
+          let used;
+          if (normalizedUrl) {
+            await runAccountOnSite(account, code, normalizedUrl);
+            used = normalizedUrl;
+          } else {
+            used = await runAccountAllSites(account, code);
+          }
+
           runReport.accounts[i].completed = true;
           runReport.accounts[i].siteUsed = used;
           runReport.accounts[i].error = null;
@@ -376,6 +422,27 @@ app.post("/run", async (req, res) => {
       isRunning = false;
     }
   })();
+});
+
+// Keep your existing POST /run, but redirect into GET /run so behavior is identical
+app.post("/run", async (req, res) => {
+  const p = (req.body.p || "").toString();
+  const code = (req.body.code || "").toString().trim();
+
+  if (!BOT_PASSWORD) return res.status(500).send("BOT_PASSWORD not set in Railway variables.");
+  if (p !== BOT_PASSWORD) return res.status(401).send("Wrong password.");
+
+  if (!code) return res.status(400).send("No code provided.");
+
+  const q = new URLSearchParams();
+  q.set("p", p);
+  q.set("code", code);
+
+  // optional url support if you ever add it to the form later
+  const formUrl = (req.body.url || "").toString().trim();
+  if (formUrl) q.set("url", formUrl);
+
+  return res.redirect(`/run?${q.toString()}`);
 });
 
 // --------------------
@@ -557,12 +624,43 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await sleep(1500);
     await saveShot(page, "after-confirm");
 
-    // Look for popup text
-    const already = page.locator("text=/Already followed the order/i").first();
-    const gotAlready = await already.isVisible().catch(() => false);
-    if (!gotAlready) {
-      await saveShot(page, "no-already-popup");
-      throw new Error('Did not see "Already followed the order" popup');
+    // --------------------
+    // Fix 2: Detect result popup correctly
+    // --------------------
+    const successPopup = page.locator("text=/Already followed the order/i").first();
+
+    const paramIncorrect = page.locator("text=/parameter (is )?incorrect/i").first();
+    const invalidParam = page.locator("text=/invalid parameter/i").first();
+    const codeError = page.locator("text=/code.*(incorrect|error|invalid)/i").first();
+
+    let outcome = null;
+
+    for (let i = 0; i < 10; i++) {
+      if (await successPopup.isVisible().catch(() => false)) {
+        outcome = "success";
+        break;
+      }
+      if (await paramIncorrect.isVisible().catch(() => false)) {
+        outcome = "param_incorrect";
+        break;
+      }
+      if (await invalidParam.isVisible().catch(() => false)) {
+        outcome = "invalid_param";
+        break;
+      }
+      if (await codeError.isVisible().catch(() => false)) {
+        outcome = "code_error";
+        break;
+      }
+      await sleep(300);
+    }
+
+    if (outcome !== "success") {
+      await saveShot(page, "confirm-result-not-success");
+      if (outcome === "param_incorrect") throw new Error("Site rejected code: parameter incorrect");
+      if (outcome === "invalid_param") throw new Error("Site rejected code: invalid parameter");
+      if (outcome === "code_error") throw new Error("Site rejected code: code invalid/incorrect");
+      throw new Error("No success or known error popup after confirm");
     }
 
     // Click Position order then check Pending
@@ -611,6 +709,7 @@ function renderRunReport(report) {
     .join("");
 
   const refresh = report.status.includes("Running") ? `<meta http-equiv="refresh" content="3">` : "";
+  const norm = report.normalizedUrl ? `<div><b>Normalized URL:</b> ${escapeHtml(report.normalizedUrl)}</div>` : "";
 
   return `
     ${refresh}
@@ -618,6 +717,7 @@ function renderRunReport(report) {
     <div><b>Run ID:</b> ${escapeHtml(report.id)}</div>
     <div><b>Started:</b> ${escapeHtml(report.started)}</div>
     <div><b>Code length:</b> ${report.codeLength}</div>
+    ${norm}
     <hr/>
     <h3>Accounts</h3>
     <table border="1" cellpadding="8" cellspacing="0">
