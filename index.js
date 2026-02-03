@@ -25,7 +25,7 @@ const LOGIN_URLS = [
   "https://dsj72.com/h5/#/login"
 ];
 
-// After login, go straight to the Futures trading page (this avoids flaky top-nav clicking)
+// After login, go straight to the Futures trading page (avoids flaky top-nav clicking)
 function futuresUrlFromLoginUrl(loginUrl) {
   // loginUrl like https://bgol.pro/pc/#/login -> https://bgol.pro/pc/#/contractTransaction
   try {
@@ -56,24 +56,6 @@ function escapeHtml(s) {
     .replaceAll("'", "&#039;");
 }
 
-// Fix 1 helper: normalize URL for /run?url=
-// Allows "bgol.pro/pc/#/login" (adds https://)
-function normalizeTargetUrl(raw) {
-  if (!raw) return null;
-  let s = String(raw).trim();
-  if (!s) return null;
-
-  if (!s.startsWith("http://") && !s.startsWith("https://")) {
-    s = "https://" + s;
-  }
-
-  try {
-    return new URL(s).toString();
-  } catch {
-    return null;
-  }
-}
-
 function authOk(req) {
   const p = (req.query.p || "").toString();
   return !!BOT_PASSWORD && p === BOT_PASSWORD;
@@ -97,6 +79,24 @@ function safeJsonParseAccounts() {
     return { ok: true, accounts: cleaned, error: null };
   } catch (e) {
     return { ok: false, accounts: [], error: `ACCOUNTS_JSON invalid JSON: ${e.message}` };
+  }
+}
+
+// Fix 1 helper: normalize url passed to /run?url=...
+function normalizeTargetUrl(raw) {
+  if (!raw) return null;
+  let s = String(raw).trim();
+  if (!s) return null;
+
+  // allow: "bgol.pro/pc/#/login"
+  if (!s.startsWith("http://") && !s.startsWith("https://")) {
+    s = "https://" + s;
+  }
+
+  try {
+    return new URL(s).toString();
+  } catch {
+    return null;
   }
 }
 
@@ -147,13 +147,12 @@ let isRunning = false;
 let lastRunAt = null;
 let lastError = null;
 
-let lastShotPath = null; // most recent saved shot
+let lastShotPath = null;
 let lastRunId = null;
 let runReport = null;
 
 function writePlaceholderLastShot() {
   try {
-    // Always ensure /app/last-shot.png exists so /last-shot never 404s with "No screenshot"
     const placeholder = Buffer.from(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axl1mQAAAAASUVORK5CYII=",
       "base64"
@@ -168,7 +167,6 @@ async function saveShot(page, tag) {
     await page.screenshot({ path: file, fullPage: true });
     lastShotPath = file;
 
-    // Copy to /app so the route can always serve a stable file path
     try {
       fs.copyFileSync(file, "/app/last-shot.png");
     } catch {}
@@ -206,7 +204,7 @@ app.get("/", (req, res) => {
       <br/><br/>
       <input name="code" placeholder="Paste order code" required />
       <br/><br/>
-      <button type="submit">Run Bot</button>
+      <button type="submit">Run Bot (POST)</button>
     </form>
 
     <div style="margin-top:12px;">
@@ -215,16 +213,12 @@ app.get("/", (req, res) => {
       | DNS test: <a href="/dns-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/dns-test</a>
       | Net test: <a href="/net-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/net-test</a>
       | SMS test: <a href="/sms-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/sms-test</a>
-      <div style="margin-top:10px; font-size: 13px;">
-        Run from URL:
-        <code>/run?p=YOUR_PASSWORD&code=123456789</code>
-        <br/>
-        One site:
-        <code>/run?p=YOUR_PASSWORD&code=123456789&url=https://bgol.pro/pc/#/login</code>
-        <br/>
-        Also works without https:
-        <code>/run?p=YOUR_PASSWORD&code=123456789&url=bgol.pro/pc/#/login</code>
-      </div>
+    </div>
+
+    <div style="margin-top:12px;">
+      Run via URL (GET):
+      <div><code>/run?p=YOUR_PASSWORD&amp;code=123456789</code></div>
+      <div><code>/run?p=YOUR_PASSWORD&amp;code=123456789&amp;url=bgol.pro/pc/#/login</code></div>
     </div>
   `);
 });
@@ -255,7 +249,6 @@ app.get("/sms-test", async (req, res) => {
 app.get("/last-shot", (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
-  // Prefer the stable file in /app, fallback to lastShotPath
   const stable = "/app/last-shot.png";
   if (fs.existsSync(stable)) {
     res.setHeader("Content-Type", "image/png");
@@ -277,7 +270,94 @@ app.get("/run/:id", (req, res) => {
   res.send(renderRunReport(runReport));
 });
 
-// Simple network tests to help debug DNS and upstream blocking
+// Fix 1: GET /run so you can run from the URL
+app.get("/run", async (req, res) => {
+  // Supports:
+  // /run?p=YOURPASS&code=123456789
+  // /run?p=YOURPASS&code=123456789&url=https://bgol.pro/pc/#/login
+  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
+
+  const code = (req.query.code || "").toString().trim();
+  if (!code) return res.status(400).send("Missing code. Use ?code=123456789");
+
+  const cfg = safeJsonParseAccounts();
+  if (!cfg.ok) return res.status(500).send(cfg.error || "ACCOUNTS_JSON not set/invalid.");
+
+  const normalized = normalizeTargetUrl(req.query.url || "");
+  if (req.query.url && !normalized) return res.status(400).send("Invalid URL. It must include https://");
+
+  if (isRunning) return res.send("Bot is already running.");
+
+  isRunning = true;
+  lastError = null;
+  lastRunAt = nowLocal();
+  lastRunId = crypto.randomBytes(6).toString("hex");
+
+  runReport = {
+    id: lastRunId,
+    started: lastRunAt,
+    codeLength: code.length,
+    normalizedUrl: normalized || null,
+    accounts: cfg.accounts.map((a) => ({
+      username: a.username,
+      completed: false,
+      siteUsed: null,
+      error: null
+    })),
+    status: "Running now. Refresh this page."
+  };
+
+  writePlaceholderLastShot();
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(renderRunReport(runReport));
+
+  (async () => {
+    try {
+      console.log("Bot started");
+      console.log("Run ID:", lastRunId);
+      console.log("Accounts loaded:", cfg.accounts.length);
+      console.log("Code received length:", code.length);
+      if (normalized) console.log("Normalized URL:", normalized);
+
+      await sendSMS(`T-Bot started at ${lastRunAt}`);
+
+      for (let i = 0; i < cfg.accounts.length; i++) {
+        const account = cfg.accounts[i];
+        try {
+          const used = normalized
+            ? (await runAccountOnSite(account, code, normalized), normalized)
+            : await runAccountAllSites(account, code);
+
+          runReport.accounts[i].completed = true;
+          runReport.accounts[i].siteUsed = used;
+          runReport.accounts[i].error = null;
+        } catch (e) {
+          const msg = e && e.message ? e.message : String(e);
+          runReport.accounts[i].completed = false;
+          runReport.accounts[i].error = msg;
+          lastError = `Account failed ${account.username}: ${msg}`;
+        }
+      }
+
+      const anyFailed = runReport.accounts.some((a) => !a.completed);
+      runReport.status = anyFailed ? "Finished with failures. See account errors." : "Completed successfully.";
+
+      await sendSMS(anyFailed ? `T-Bot finished with failures at ${nowLocal()}` : `T-Bot completed at ${nowLocal()}`);
+      console.log("Bot completed");
+    } catch (e) {
+      const msg = e && e.message ? e.message : String(e);
+      lastError = msg;
+      runReport.status = "Run failed: " + msg;
+      await sendSMS(`T-Bot failed at ${nowLocal()}: ${msg}`);
+      console.log("Run failed:", msg);
+    } finally {
+      isRunning = false;
+    }
+  })();
+});
+
+// Simple network tests
 app.get("/dns-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
@@ -329,26 +409,17 @@ app.get("/net-test", async (req, res) => {
   res.json(results);
 });
 
-// --------------------
-// Fix 1: GET /run
-// Supports:
-// /run?p=PASS&code=123456789
-// /run?p=PASS&code=123456789&url=https://bgol.pro/pc/#/login
-// /run?p=PASS&code=123456789&url=bgol.pro/pc/#/login
-// --------------------
-app.get("/run", async (req, res) => {
-  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
+app.post("/run", async (req, res) => {
+  const p = (req.body.p || "").toString();
+  const code = (req.body.code || "").toString().trim();
 
-  const code = (req.query.code || "").toString().trim();
-  if (!code) return res.status(400).send("Missing code. Use ?code=123456789");
+  if (!BOT_PASSWORD) return res.status(500).send("BOT_PASSWORD not set in Railway variables.");
+  if (p !== BOT_PASSWORD) return res.status(401).send("Wrong password.");
 
   const cfg = safeJsonParseAccounts();
   if (!cfg.ok) return res.status(500).send(cfg.error || "ACCOUNTS_JSON not set/invalid.");
 
-  const rawUrl = (req.query.url || "").toString().trim();
-  const normalizedUrl = rawUrl ? normalizeTargetUrl(rawUrl) : null;
-  if (rawUrl && !normalizedUrl) return res.status(400).send("Invalid URL. It must include https://");
-
+  if (!code) return res.status(400).send("No code provided.");
   if (isRunning) return res.send("Bot is already running. Please wait.");
 
   isRunning = true;
@@ -360,7 +431,7 @@ app.get("/run", async (req, res) => {
     id: lastRunId,
     started: lastRunAt,
     codeLength: code.length,
-    normalizedUrl: normalizedUrl || null,
+    normalizedUrl: null,
     accounts: cfg.accounts.map((a) => ({
       username: a.username,
       completed: false,
@@ -381,21 +452,13 @@ app.get("/run", async (req, res) => {
       console.log("Run ID:", lastRunId);
       console.log("Accounts loaded:", cfg.accounts.length);
       console.log("Code received length:", code.length);
-      if (normalizedUrl) console.log("Normalized URL:", normalizedUrl);
 
       await sendSMS(`T-Bot started at ${lastRunAt}`);
 
       for (let i = 0; i < cfg.accounts.length; i++) {
         const account = cfg.accounts[i];
         try {
-          let used;
-          if (normalizedUrl) {
-            await runAccountOnSite(account, code, normalizedUrl);
-            used = normalizedUrl;
-          } else {
-            used = await runAccountAllSites(account, code);
-          }
-
+          const used = await runAccountAllSites(account, code);
           runReport.accounts[i].completed = true;
           runReport.accounts[i].siteUsed = used;
           runReport.accounts[i].error = null;
@@ -422,27 +485,6 @@ app.get("/run", async (req, res) => {
       isRunning = false;
     }
   })();
-});
-
-// Keep your existing POST /run, but redirect into GET /run so behavior is identical
-app.post("/run", async (req, res) => {
-  const p = (req.body.p || "").toString();
-  const code = (req.body.code || "").toString().trim();
-
-  if (!BOT_PASSWORD) return res.status(500).send("BOT_PASSWORD not set in Railway variables.");
-  if (p !== BOT_PASSWORD) return res.status(401).send("Wrong password.");
-
-  if (!code) return res.status(400).send("No code provided.");
-
-  const q = new URLSearchParams();
-  q.set("p", p);
-  q.set("code", code);
-
-  // optional url support if you ever add it to the form later
-  const formUrl = (req.body.url || "").toString().trim();
-  if (formUrl) q.set("url", formUrl);
-
-  return res.redirect(`/run?${q.toString()}`);
 });
 
 // --------------------
@@ -484,7 +526,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
   page.on("requestfailed", (req) => {
     const f = req.failure();
     const errText = (f && f.errorText) ? f.errorText : "unknown";
-    // Keep these logs short but useful
     if (req.url().includes("/api/")) console.log("REQUEST FAILED:", req.url(), "=>", errText);
   });
 
@@ -535,7 +576,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       await sleep(1800);
       await saveShot(page, `after-login-attempt-${attempt}`);
 
-      // Hard fail if wrong password text shows up
       const wrongPw =
         (await page.locator("text=Wrong password").first().isVisible().catch(() => false)) ||
         (await page.locator("text=wrong password").first().isVisible().catch(() => false));
@@ -543,7 +583,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
         throw new Error("Wrong password reported by site");
       }
 
-      // If we can see Futures in the top nav, we are in
       const futuresTop = await page.locator("text=Futures").first().isVisible().catch(() => false);
       if (futuresTop) {
         loggedIn = true;
@@ -551,15 +590,12 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
         break;
       }
 
-      // Some flows land you on a logged-in page without Futures immediately visible
-      // Try going directly to the Futures page and see if it loads as logged-in.
       const fu = futuresUrlFromLoginUrl(loginUrl);
       if (fu) {
         await page.goto(fu, { waitUntil: "domcontentloaded", timeout: 60000 });
         await sleep(1500);
         await saveShot(page, "after-futures-direct");
 
-        // If the bottom tabs exist, we are in the Futures view
         const hasPositionOrder = await page.locator("text=Position order").first().isVisible().catch(() => false);
         const hasInvitedTab = await page.locator("text=/invited me/i").first().isVisible().catch(() => false);
 
@@ -580,7 +616,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
     await saveShot(page, "after-login");
 
-    // Always go to Futures trading page directly now
     const futuresUrl = futuresUrlFromLoginUrl(loginUrl);
     if (!futuresUrl) throw new Error("Could not build Futures URL from login URL");
 
@@ -588,7 +623,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await sleep(1500);
     await saveShot(page, "after-futures");
 
-    // Click "invited me" tab in the bottom-left tab row
     const invited = page.locator("text=/invited me/i").first();
     const invitedVisible = await invited.isVisible().catch(() => false);
     if (!invitedVisible) {
@@ -601,7 +635,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await sleep(1200);
     await saveShot(page, "after-invited");
 
-    // Enter code
     const codeBox = page.locator('input[placeholder*="order code" i], input[placeholder*="Please enter" i]').first();
     if (!(await codeBox.isVisible().catch(() => false))) {
       await saveShot(page, "code-box-missing");
@@ -613,7 +646,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await sleep(600);
     await saveShot(page, "after-code");
 
-    // Confirm
     const confirmBtn = page.getByRole("button", { name: /confirm/i }).first();
     if (!(await confirmBtn.isVisible().catch(() => false))) {
       await saveShot(page, "confirm-missing");
@@ -624,9 +656,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await sleep(1500);
     await saveShot(page, "after-confirm");
 
-    // --------------------
-    // Fix 2: Detect result popup correctly
-    // --------------------
+    // Fix 2: detect result messages (not just "Already followed the order")
     const successPopup = page.locator("text=/Already followed the order/i").first();
 
     const paramIncorrect = page.locator("text=/parameter (is )?incorrect/i").first();
@@ -634,7 +664,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     const codeError = page.locator("text=/code.*(incorrect|error|invalid)/i").first();
 
     let outcome = null;
-
     for (let i = 0; i < 10; i++) {
       if (await successPopup.isVisible().catch(() => false)) {
         outcome = "success";
@@ -663,7 +692,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       throw new Error("No success or known error popup after confirm");
     }
 
-    // Click Position order then check Pending
     const positionOrder = page.locator("text=/Position order/i").first();
     if (await positionOrder.isVisible().catch(() => false)) {
       await positionOrder.click().catch(() => null);
@@ -709,7 +737,9 @@ function renderRunReport(report) {
     .join("");
 
   const refresh = report.status.includes("Running") ? `<meta http-equiv="refresh" content="3">` : "";
-  const norm = report.normalizedUrl ? `<div><b>Normalized URL:</b> ${escapeHtml(report.normalizedUrl)}</div>` : "";
+  const normalizedLine = report.normalizedUrl
+    ? `<div><b>Normalized URL:</b> ${escapeHtml(report.normalizedUrl)}</div>`
+    : "";
 
   return `
     ${refresh}
@@ -717,7 +747,7 @@ function renderRunReport(report) {
     <div><b>Run ID:</b> ${escapeHtml(report.id)}</div>
     <div><b>Started:</b> ${escapeHtml(report.started)}</div>
     <div><b>Code length:</b> ${report.codeLength}</div>
-    ${norm}
+    ${normalizedLine}
     <hr/>
     <h3>Accounts</h3>
     <table border="1" cellpadding="8" cellspacing="0">
@@ -730,7 +760,7 @@ function renderRunReport(report) {
     <p><b>Status:</b> ${escapeHtml(report.status)}</p>
 
     <div>
-      <a href="/?p=${encodeURIComponent(BOT_PASSWORD)}">Back to home</a>
+      <a href="/">Back to home</a>
       | <a href="/health">Health</a>
       | <a href="/last-shot?p=${encodeURIComponent(BOT_PASSWORD)}">Last screenshot</a>
       | <a href="/dns-test?p=${encodeURIComponent(BOT_PASSWORD)}">DNS test</a>
