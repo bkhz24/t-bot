@@ -16,16 +16,14 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_FROM = process.env.TWILIO_FROM || "";
 const TWILIO_TO = process.env.TWILIO_TO || "";
 
+// PC only
 const LOGIN_URLS = [
   "https://bgol.pro/pc/#/login",
   "https://dsj89.com/pc/#/login",
-  "https://dsj72.com/pc/#/login",
-  "https://bgol.pro/h5/#/login",
-  "https://dsj89.com/h5/#/login",
-  "https://dsj72.com/h5/#/login"
+  "https://dsj72.com/pc/#/login"
 ];
 
-// After login, go straight to the Futures trading page (avoids flaky top-nav clicking)
+// After login, go straight to the Futures trading page (this avoids flaky top-nav clicking)
 function futuresUrlFromLoginUrl(loginUrl) {
   // loginUrl like https://bgol.pro/pc/#/login -> https://bgol.pro/pc/#/contractTransaction
   try {
@@ -82,13 +80,12 @@ function safeJsonParseAccounts() {
   }
 }
 
-// Fix 1 helper: normalize url passed to /run?url=...
+// Fix 1 helper: normalize user-provided target URL
 function normalizeTargetUrl(raw) {
   if (!raw) return null;
   let s = String(raw).trim();
-  if (!s) return null;
 
-  // allow: "bgol.pro/pc/#/login"
+  // allow user to paste "bgol.pro/pc/#/login"
   if (!s.startsWith("http://") && !s.startsWith("https://")) {
     s = "https://" + s;
   }
@@ -147,12 +144,13 @@ let isRunning = false;
 let lastRunAt = null;
 let lastError = null;
 
-let lastShotPath = null;
+let lastShotPath = null; // most recent saved shot
 let lastRunId = null;
 let runReport = null;
 
 function writePlaceholderLastShot() {
   try {
+    // Always ensure /app/last-shot.png exists so /last-shot never 404s with "No screenshot"
     const placeholder = Buffer.from(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axl1mQAAAAASUVORK5CYII=",
       "base64"
@@ -167,6 +165,7 @@ async function saveShot(page, tag) {
     await page.screenshot({ path: file, fullPage: true });
     lastShotPath = file;
 
+    // Copy to /app so the route can always serve a stable file path
     try {
       fs.copyFileSync(file, "/app/last-shot.png");
     } catch {}
@@ -204,7 +203,7 @@ app.get("/", (req, res) => {
       <br/><br/>
       <input name="code" placeholder="Paste order code" required />
       <br/><br/>
-      <button type="submit">Run Bot (POST)</button>
+      <button type="submit">Run Bot</button>
     </form>
 
     <div style="margin-top:12px;">
@@ -216,9 +215,9 @@ app.get("/", (req, res) => {
     </div>
 
     <div style="margin-top:12px;">
-      Run via URL (GET):
-      <div><code>/run?p=YOUR_PASSWORD&amp;code=123456789</code></div>
-      <div><code>/run?p=YOUR_PASSWORD&amp;code=123456789&amp;url=bgol.pro/pc/#/login</code></div>
+      Run via URL (GET): <code>/run?p=YOURPASS&code=123456789</code>
+      <br/>
+      Run one site: <code>/run?p=YOURPASS&code=123456789&url=https://bgol.pro/pc/#/login</code>
     </div>
   `);
 });
@@ -249,6 +248,7 @@ app.get("/sms-test", async (req, res) => {
 app.get("/last-shot", (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
+  // Prefer the stable file in /app, fallback to lastShotPath
   const stable = "/app/last-shot.png";
   if (fs.existsSync(stable)) {
     res.setHeader("Content-Type", "image/png");
@@ -270,7 +270,7 @@ app.get("/run/:id", (req, res) => {
   res.send(renderRunReport(runReport));
 });
 
-// Fix 1: GET /run so you can run from the URL
+// Fix 1: GET /run route so you can run from the URL bar
 app.get("/run", async (req, res) => {
   // Supports:
   // /run?p=YOURPASS&code=123456789
@@ -283,6 +283,7 @@ app.get("/run", async (req, res) => {
   const cfg = safeJsonParseAccounts();
   if (!cfg.ok) return res.status(500).send(cfg.error || "ACCOUNTS_JSON not set/invalid.");
 
+  // Optional target url to test one site first
   const normalized = normalizeTargetUrl(req.query.url || "");
   if (req.query.url && !normalized) return res.status(400).send("Invalid URL. It must include https://");
 
@@ -357,7 +358,7 @@ app.get("/run", async (req, res) => {
   })();
 });
 
-// Simple network tests
+// Simple network tests to help debug DNS and upstream blocking
 app.get("/dns-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
@@ -653,17 +654,17 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     }
 
     await confirmBtn.click({ timeout: 10000 });
-    await sleep(1500);
+    await sleep(800);
     await saveShot(page, "after-confirm");
 
-    // Fix 2: detect result messages (not just "Already followed the order")
+    // Fix 2: Look for result popup text (site may return different messages)
     const successPopup = page.locator("text=/Already followed the order/i").first();
-
     const paramIncorrect = page.locator("text=/parameter (is )?incorrect/i").first();
     const invalidParam = page.locator("text=/invalid parameter/i").first();
     const codeError = page.locator("text=/code.*(incorrect|error|invalid)/i").first();
 
     let outcome = null;
+
     for (let i = 0; i < 10; i++) {
       if (await successPopup.isVisible().catch(() => false)) {
         outcome = "success";
@@ -692,6 +693,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       throw new Error("No success or known error popup after confirm");
     }
 
+    // Click Position order then check Pending
     const positionOrder = page.locator("text=/Position order/i").first();
     if (await positionOrder.isVisible().catch(() => false)) {
       await positionOrder.click().catch(() => null);
@@ -737,7 +739,8 @@ function renderRunReport(report) {
     .join("");
 
   const refresh = report.status.includes("Running") ? `<meta http-equiv="refresh" content="3">` : "";
-  const normalizedLine = report.normalizedUrl
+
+  const urlLine = report.normalizedUrl
     ? `<div><b>Normalized URL:</b> ${escapeHtml(report.normalizedUrl)}</div>`
     : "";
 
@@ -747,7 +750,7 @@ function renderRunReport(report) {
     <div><b>Run ID:</b> ${escapeHtml(report.id)}</div>
     <div><b>Started:</b> ${escapeHtml(report.started)}</div>
     <div><b>Code length:</b> ${report.codeLength}</div>
-    ${normalizedLine}
+    ${urlLine}
     <hr/>
     <h3>Accounts</h3>
     <table border="1" cellpadding="8" cellspacing="0">
@@ -760,7 +763,7 @@ function renderRunReport(report) {
     <p><b>Status:</b> ${escapeHtml(report.status)}</p>
 
     <div>
-      <a href="/">Back to home</a>
+      <a href="/?p=${encodeURIComponent(BOT_PASSWORD)}">Back to home</a>
       | <a href="/health">Health</a>
       | <a href="/last-shot?p=${encodeURIComponent(BOT_PASSWORD)}">Last screenshot</a>
       | <a href="/dns-test?p=${encodeURIComponent(BOT_PASSWORD)}">DNS test</a>
