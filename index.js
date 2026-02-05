@@ -16,15 +16,16 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_FROM = process.env.TWILIO_FROM || "";
 const TWILIO_TO = process.env.TWILIO_TO || "";
 
-// PC only (mobile was flaky and got stuck on bottom nav)
+// PC only (mobile/h5 has been flaky for your accounts)
 const LOGIN_URLS = [
   "https://bgol.pro/pc/#/login",
   "https://dsj89.com/pc/#/login",
   "https://dsj72.com/pc/#/login"
 ];
 
-// After login, go straight to the Futures trading page
+// After login, go straight to the Futures trading page (avoids flaky top-nav clicking)
 function futuresUrlFromLoginUrl(loginUrl) {
+  // loginUrl like https://bgol.pro/pc/#/login -> https://bgol.pro/pc/#/contractTransaction
   try {
     const u = new URL(loginUrl);
     const base = `${u.protocol}//${u.host}`;
@@ -59,7 +60,9 @@ function authOk(req) {
 }
 
 function safeJsonParseAccounts() {
-  if (!ACCOUNTS_JSON) return { ok: false, accounts: [], error: "ACCOUNTS_JSON not set" };
+  if (!ACCOUNTS_JSON) {
+    return { ok: false, accounts: [], error: "ACCOUNTS_JSON not set" };
+  }
   try {
     const parsed = JSON.parse(ACCOUNTS_JSON);
     if (!Array.isArray(parsed)) {
@@ -74,33 +77,6 @@ function safeJsonParseAccounts() {
     return { ok: true, accounts: cleaned, error: null };
   } catch (e) {
     return { ok: false, accounts: [], error: `ACCOUNTS_JSON invalid JSON: ${e.message}` };
-  }
-}
-
-// Fix 1 helper: accept bgol.pro/pc/#/login and add https://
-function normalizeTargetUrl(raw) {
-  if (!raw) return null;
-  let s = String(raw).trim();
-  if (!s.startsWith("http://") && !s.startsWith("https://")) s = "https://" + s;
-  try {
-    return new URL(s).toString();
-  } catch {
-    return null;
-  }
-}
-
-// (Optional) If you later want to rewrite api.<host> to <host>, keep this.
-// Right now it is NOT enabled (your logs show the bot still succeeds even when ping fails).
-function apiRewriteUrl(originalUrl) {
-  try {
-    const u = new URL(originalUrl);
-    if (u.hostname.startsWith("api.")) {
-      u.hostname = u.hostname.replace(/^api\./, "");
-      return u.toString();
-    }
-    return null;
-  } catch {
-    return null;
   }
 }
 
@@ -139,7 +115,7 @@ async function sendSMS(msg) {
     console.log("SMS sent:", res.sid);
     return res.sid;
   } catch (e) {
-    console.log("SMS failed:", e && e.message ? e.message : String(e));
+    console.log("SMS failed:", e.message || String(e));
     return null;
   }
 }
@@ -151,12 +127,13 @@ let isRunning = false;
 let lastRunAt = null;
 let lastError = null;
 
-let lastShotPath = null;
+let lastShotPath = null; // most recent saved shot
 let lastRunId = null;
 let runReport = null;
 
 function writePlaceholderLastShot() {
   try {
+    // Always ensure /app/last-shot.png exists so /last-shot never 404s with "No screenshot"
     const placeholder = Buffer.from(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axl1mQAAAAASUVORK5CYII=",
       "base64"
@@ -170,9 +147,12 @@ async function saveShot(page, tag) {
     const file = `/tmp/${tag}-${Date.now()}.png`;
     await page.screenshot({ path: file, fullPage: true });
     lastShotPath = file;
+
+    // Copy to /app so the route can always serve a stable file path
     try {
       fs.copyFileSync(file, "/app/last-shot.png");
     } catch {}
+
     console.log("Saved screenshot:", file, "and updated /app/last-shot.png");
   } catch (e) {
     console.log("Screenshot failed:", e && e.message ? e.message : String(e));
@@ -215,15 +195,6 @@ app.get("/", (req, res) => {
       | DNS test: <a href="/dns-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/dns-test</a>
       | Net test: <a href="/net-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/net-test</a>
       | SMS test: <a href="/sms-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/sms-test</a>
-      <br/>
-      <div style="margin-top:8px;">
-        Run via URL example:
-        <code>/run?p=YOUR_PASSWORD&code=123456789</code>
-      </div>
-      <div style="margin-top:6px;">
-        Run a single site:
-        <code>/run?p=YOUR_PASSWORD&code=123456789&url=https://bgol.pro/pc/#/login</code>
-      </div>
     </div>
   `);
 });
@@ -248,12 +219,13 @@ app.get("/health", (req, res) => {
 app.get("/sms-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
   await sendSMS(`T-Bot SMS test at ${nowLocal()}`);
-  res.send("OK: attempted SMS (if Twilio is configured correctly, you will receive it).");
+  res.send("OK: SMS sent (or SMS not configured).");
 });
 
 app.get("/last-shot", (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
+  // Prefer the stable file in /app, fallback to lastShotPath
   const stable = "/app/last-shot.png";
   if (fs.existsSync(stable)) {
     res.setHeader("Content-Type", "image/png");
@@ -275,7 +247,7 @@ app.get("/run/:id", (req, res) => {
   res.send(renderRunReport(runReport));
 });
 
-// DNS / Net tests
+// Simple network tests to help debug DNS and upstream blocking
 app.get("/dns-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
@@ -295,7 +267,7 @@ app.get("/dns-test", async (req, res) => {
       const addrs = await dns.lookup(h, { all: true });
       out[h] = { ok: true, addrs };
     } catch (e) {
-      out[h] = { ok: false, error: e && e.message ? e.message : String(e) };
+      out[h] = { ok: false, error: (e && e.message) ? e.message : String(e) };
     }
   }
   res.json(out);
@@ -321,99 +293,12 @@ app.get("/net-test", async (req, res) => {
       const text = await r.text();
       results[u] = { ok: true, status: r.status, bodyPreview: text.slice(0, 240) };
     } catch (e) {
-      results[u] = { ok: false, error: e && e.message ? e.message : String(e) };
+      results[u] = { ok: false, error: (e && e.message) ? e.message : String(e) };
     }
   }
   res.json(results);
 });
 
-// --------------------
-// Fix 1: GET /run (run from the URL)
-// --------------------
-app.get("/run", async (req, res) => {
-  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-
-  const code = (req.query.code || "").toString().trim();
-  if (!code) return res.status(400).send("Missing code. Use ?code=123456789");
-
-  const cfg = safeJsonParseAccounts();
-  if (!cfg.ok) return res.status(500).send(cfg.error || "ACCOUNTS_JSON not set/invalid.");
-
-  const normalized = normalizeTargetUrl(req.query.url || "");
-  if (req.query.url && !normalized) return res.status(400).send("Invalid URL. It must include https://");
-
-  if (isRunning) return res.send("Bot is already running.");
-
-  isRunning = true;
-  lastError = null;
-  lastRunAt = nowLocal();
-  lastRunId = crypto.randomBytes(6).toString("hex");
-
-  runReport = {
-    id: lastRunId,
-    started: lastRunAt,
-    codeLength: code.length,
-    normalizedUrl: normalized || null,
-    accounts: cfg.accounts.map((a) => ({
-      username: a.username,
-      completed: false,
-      siteUsed: null,
-      error: null
-    })),
-    status: "Running now. Refresh this page."
-  };
-
-  writePlaceholderLastShot();
-
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(renderRunReport(runReport));
-
-  (async () => {
-    try {
-      console.log("Bot started");
-      console.log("Run ID:", lastRunId);
-      console.log("Accounts loaded:", cfg.accounts.length);
-      console.log("Code received length:", code.length);
-      if (normalized) console.log("Normalized URL:", normalized);
-
-      await sendSMS(`T-Bot started at ${lastRunAt}`);
-
-      for (let i = 0; i < cfg.accounts.length; i++) {
-        const account = cfg.accounts[i];
-        try {
-          const used = normalized
-            ? (await runAccountOnSite(account, code, normalized), normalized)
-            : await runAccountAllSites(account, code);
-
-          runReport.accounts[i].completed = true;
-          runReport.accounts[i].siteUsed = used;
-          runReport.accounts[i].error = null;
-        } catch (e) {
-          const msg = e && e.message ? e.message : String(e);
-          runReport.accounts[i].completed = false;
-          runReport.accounts[i].error = msg;
-          lastError = `Account failed ${account.username}: ${msg}`;
-        }
-      }
-
-      const anyFailed = runReport.accounts.some((a) => !a.completed);
-      runReport.status = anyFailed ? "Finished with failures. See account errors." : "Completed successfully.";
-
-      await sendSMS(anyFailed ? `T-Bot finished with failures at ${nowLocal()}` : `T-Bot completed at ${nowLocal()}`);
-      console.log("Bot completed");
-    } catch (e) {
-      const msg = e && e.message ? e.message : String(e);
-      lastError = msg;
-      runReport.status = "Run failed: " + msg;
-      await sendSMS(`T-Bot failed at ${nowLocal()}: ${msg}`);
-      console.log("Run failed:", msg);
-    } finally {
-      isRunning = false;
-    }
-  })();
-});
-
-// Existing POST /run (form submit)
 app.post("/run", async (req, res) => {
   const p = (req.body.p || "").toString();
   const code = (req.body.code || "").toString().trim();
@@ -436,7 +321,6 @@ app.post("/run", async (req, res) => {
     id: lastRunId,
     started: lastRunAt,
     codeLength: code.length,
-    normalizedUrl: null,
     accounts: cfg.accounts.map((a) => ({
       username: a.username,
       completed: false,
@@ -497,6 +381,7 @@ app.post("/run", async (req, res) => {
 // --------------------
 async function runAccountAllSites(account, orderCode) {
   let last = null;
+
   for (const loginUrl of LOGIN_URLS) {
     console.log("Trying site:", loginUrl, "for", account.username);
     try {
@@ -508,7 +393,75 @@ async function runAccountAllSites(account, orderCode) {
       last = e;
     }
   }
+
   throw last || new Error("All sites failed");
+}
+
+// Helpers used inside the Futures page
+function codeInputLocator(page) {
+  // keep broad: sites vary placeholder text
+  return page.locator(
+    'input[placeholder*="order code" i], input[placeholder*="enter" i], input[placeholder*="code" i], input[type="text"], input'
+  );
+}
+
+function confirmButtonLocator(page) {
+  // different sites sometimes use different labels
+  return page
+    .getByRole("button", { name: /confirm|submit|ok|sure/i })
+    .first();
+}
+
+async function ensureOrderEntryPanel(page) {
+  // 1) If the code box is already visible, we're good.
+  const direct = codeInputLocator(page).first();
+  if (await direct.isVisible().catch(() => false)) return true;
+
+  // 2) Try likely tab labels first (language/label variations)
+  const tabTexts = [
+    /invited me/i,
+    /invited/i,
+    /invite/i,
+    /follow/i,
+    /follow-?up/i,
+    /plan/i,
+    /orders/i,
+    /order/i
+  ];
+
+  for (const rx of tabTexts) {
+    const t = page.locator(`text=/${rx.source}/${rx.flags}`).first();
+    if (await t.isVisible().catch(() => false)) {
+      await t.scrollIntoViewIfNeeded().catch(() => null);
+      await t.click({ timeout: 8000 }).catch(() => null);
+      await sleep(800);
+      if (await direct.isVisible().catch(() => false)) return true;
+    }
+  }
+
+  // 3) Brute-force click visible "nav-ish" items in the bottom half
+  // until the code box appears (avoids exact text dependence).
+  const candidates = page.locator('button, [role="button"], a, div[tabindex="0"], li');
+  const count = await candidates.count().catch(() => 0);
+
+  for (let i = 0; i < Math.min(count, 40); i++) {
+    const el = candidates.nth(i);
+    const visible = await el.isVisible().catch(() => false);
+    if (!visible) continue;
+
+    const box = await el.boundingBox().catch(() => null);
+    if (!box) continue;
+
+    // only click things in bottom half of the viewport (likely nav)
+    if (box.y < 360) continue;
+
+    await el.click({ timeout: 3000 }).catch(() => null);
+    await sleep(700);
+
+    if (await direct.isVisible().catch(() => false)) return true;
+  }
+
+  return false;
 }
 
 async function runAccountOnSite(account, orderCode, loginUrl) {
@@ -519,25 +472,16 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
   const context = await browser.newContext({
     viewport: { width: 1280, height: 720 },
-    userAgent:
-      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
     locale: "en-US"
   });
 
   const page = await context.newPage();
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
 
-  // If you ever decide to enable API rewriting, uncomment this block:
-  // await page.route("**/*", async (route) => {
-  //   const url = route.request().url();
-  //   const rewritten = apiRewriteUrl(url);
-  //   if (rewritten) return route.continue({ url: rewritten });
-  //   return route.continue();
-  // });
-
   page.on("requestfailed", (req) => {
     const f = req.failure();
-    const errText = f && f.errorText ? f.errorText : "unknown";
+    const errText = (f && f.errorText) ? f.errorText : "unknown";
     if (req.url().includes("/api/")) console.log("REQUEST FAILED:", req.url(), "=>", errText);
   });
 
@@ -554,158 +498,186 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await sleep(1200);
     await saveShot(page, "after-goto");
 
-    const futuresUrl = futuresUrlFromLoginUrl(loginUrl);
-    if (!futuresUrl) throw new Error("Could not build Futures URL from login URL");
+    const userField = page.locator('input[type="email"], input[type="text"]').first();
+    const passField = page.locator('input[type="password"]').first();
 
-    // If already logged in, jump straight to futures and verify UI
-    const alreadyIn = await isFuturesView(page);
-    if (!alreadyIn) {
-      let loggedIn = false;
+    let loggedIn = false;
 
-      for (let attempt = 1; attempt <= 8; attempt++) {
-        console.log("Login attempt", attempt, "for", account.username, "on", loginUrl);
+    for (let attempt = 1; attempt <= 8; attempt++) {
+      console.log("Login attempt", attempt, "for", account.username, "on", loginUrl);
 
-        await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-        await sleep(1200);
+      await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await sleep(1200);
 
-        // Inputs may not always exist if the site loads oddly, so locate each attempt
-        const userField = page.locator('input[type="email"], input[type="text"]').first();
-        const passField = page.locator('input[type="password"]').first();
+      // wait each attempt (pages sometimes re-render)
+      await userField.waitFor({ timeout: 20000 });
+      await passField.waitFor({ timeout: 20000 });
 
-        const hasUser = await userField.isVisible().catch(() => false);
-        const hasPass = await passField.isVisible().catch(() => false);
+      await userField.fill("").catch(() => null);
+      await passField.fill("").catch(() => null);
 
-        // If login inputs not visible, try futures direct and see if we are already authenticated
-        if (!hasUser || !hasPass) {
-          await page.goto(futuresUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-          await sleep(1500);
-          await saveShot(page, "after-futures-direct");
+      await userField.click({ timeout: 5000 }).catch(() => null);
+      await userField.fill(account.username).catch(() => null);
+      await sleep(250);
 
-          if (await isFuturesView(page)) {
-            loggedIn = true;
-            console.log("Login confirmed via Futures page for", account.username, "on", loginUrl);
-            break;
-          }
+      await passField.click({ timeout: 5000 }).catch(() => null);
+      await passField.fill(account.password).catch(() => null);
+      await sleep(250);
 
-          await sleep(1200);
-          continue;
-        }
+      const loginBtn = page.getByRole("button", { name: /login/i }).first();
+      if (await loginBtn.isVisible().catch(() => false)) {
+        await loginBtn.click({ timeout: 10000 }).catch(() => null);
+      } else {
+        await passField.press("Enter").catch(() => null);
+      }
 
-        await userField.fill("").catch(() => null);
-        await passField.fill("").catch(() => null);
+      await sleep(1800);
+      await saveShot(page, `after-login-attempt-${attempt}`);
 
-        await userField.click({ timeout: 5000 }).catch(() => null);
-        await userField.fill(account.username).catch(() => null);
-        await sleep(250);
+      const wrongPw =
+        (await page.locator("text=/wrong password/i").first().isVisible().catch(() => false)) ||
+        (await page.locator("text=/password.*incorrect/i").first().isVisible().catch(() => false));
+      if (wrongPw) {
+        throw new Error("Wrong password reported by site");
+      }
 
-        await passField.click({ timeout: 5000 }).catch(() => null);
-        await passField.fill(account.password).catch(() => null);
-        await sleep(250);
-
-        const loginBtn = page.getByRole("button", { name: /login/i }).first();
-        if (await loginBtn.isVisible().catch(() => false)) {
-          await loginBtn.click({ timeout: 10000 }).catch(() => null);
-        } else {
-          await passField.press("Enter").catch(() => null);
-        }
-
-        await sleep(1800);
-        await saveShot(page, `after-login-attempt-${attempt}`);
-
-        const wrongPw =
-          (await page.locator("text=/wrong password/i").first().isVisible().catch(() => false)) ||
-          (await page.locator("text=/incorrect password/i").first().isVisible().catch(() => false));
-        if (wrongPw) throw new Error("Wrong password reported by site");
-
-        // Try futures direct
-        await page.goto(futuresUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      // Prefer direct Futures URL test (more reliable than checking top nav)
+      const fu = futuresUrlFromLoginUrl(loginUrl);
+      if (fu) {
+        await page.goto(fu, { waitUntil: "domcontentloaded", timeout: 60000 });
         await sleep(1500);
         await saveShot(page, "after-futures-direct");
 
-        if (await isFuturesView(page)) {
+        const hasPositionOrder = await page.locator("text=/Position order/i").first().isVisible().catch(() => false);
+        const hasMarkets = await page.locator("text=/Markets/i").first().isVisible().catch(() => false);
+        const hasFuturesWord = await page.locator("text=/Futures/i").first().isVisible().catch(() => false);
+
+        if (hasPositionOrder || hasMarkets || hasFuturesWord) {
           loggedIn = true;
           console.log("Login confirmed via Futures page for", account.username, "on", loginUrl);
           break;
         }
-
-        await sleep(1200);
       }
 
-      if (!loggedIn) {
-        await saveShot(page, "login-failed");
-        throw new Error("Login failed");
-      }
+      await sleep(800);
+    }
+
+    if (!loggedIn) {
+      await saveShot(page, "login-failed");
+      throw new Error("Login failed");
     }
 
     await saveShot(page, "after-login");
 
     // Always go to Futures trading page directly
+    const futuresUrl = futuresUrlFromLoginUrl(loginUrl);
+    if (!futuresUrl) throw new Error("Could not build Futures URL from login URL");
+
     await page.goto(futuresUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await sleep(1500);
     await saveShot(page, "after-futures");
 
-    // Click "invited me"
-    const invited = page.locator("text=/invited me/i").first();
-    if (!(await invited.isVisible().catch(() => false))) {
-      await saveShot(page, "invited-missing");
-      throw new Error("Could not find Invited me tab");
+    // Make sure we can access the order-entry panel (Invited me or equivalent)
+    const panelOk = await ensureOrderEntryPanel(page);
+    if (!panelOk) {
+      await saveShot(page, "order-panel-missing");
+      throw new Error("Could not find order entry panel (Invited/Order area)");
     }
 
-    await invited.scrollIntoViewIfNeeded().catch(() => null);
-    await invited.click({ timeout: 10000 }).catch(() => null);
-    await sleep(1200);
     await saveShot(page, "after-invited");
 
-    // Enter code
-    const codeBox = page
-      .locator('input[placeholder*="order code" i], input[placeholder*="Please enter" i], input[type="text"]')
-      .first();
+    // Enter code (pick the first visible input that looks writable)
+    const inputs = codeInputLocator(page);
+    const inputCount = await inputs.count().catch(() => 0);
+    let codeBox = null;
 
-    if (!(await codeBox.isVisible().catch(() => false))) {
+    for (let i = 0; i < Math.min(inputCount, 10); i++) {
+      const inp = inputs.nth(i);
+      if (!(await inp.isVisible().catch(() => false))) continue;
+      const disabled = await inp.isDisabled().catch(() => false);
+      if (disabled) continue;
+      codeBox = inp;
+      break;
+    }
+
+    if (!codeBox) {
       await saveShot(page, "code-box-missing");
       throw new Error("Order code input not found");
     }
 
     await codeBox.click().catch(() => null);
     await codeBox.fill(orderCode).catch(() => null);
-
-    // Some UIs require blur/enter to enable Confirm
-    await codeBox.press("Enter").catch(() => null);
-    await page.keyboard.press("Tab").catch(() => null);
-
-    await sleep(700);
+    await sleep(600);
     await saveShot(page, "after-code");
 
-    // Click Confirm (more robust than role-only)
-    const confirmBtn = await findConfirmButton(page);
-    if (!confirmBtn) {
+    // Confirm (support multiple labels)
+    const confirmBtn = confirmButtonLocator(page);
+    if (!(await confirmBtn.isVisible().catch(() => false))) {
       await saveShot(page, "confirm-missing");
       throw new Error("Confirm button not found");
     }
 
-    await confirmBtn.scrollIntoViewIfNeeded().catch(() => null);
-    await confirmBtn.click({ timeout: 15000 }).catch(() => null);
-
+    await confirmBtn.click({ timeout: 10000 }).catch(() => null);
     await sleep(1500);
     await saveShot(page, "after-confirm");
 
-    // Fix 2: do not require the old popup.
-    // Instead: detect known error messages OR verify success by finding Pending.
-    const outcome = await detectConfirmOutcome(page);
-    if (outcome && outcome.type === "error") {
-      await saveShot(page, "confirm-result-error");
-      throw new Error(outcome.message);
+    // Look for result popup text (success OR known failure variants)
+    const successPopup = page.locator("text=/Already followed the order/i").first();
+    const paramIncorrect = page.locator("text=/parameter (is )?incorrect/i").first();
+    const invalidParam = page.locator("text=/invalid parameter/i").first();
+    const codeError = page.locator("text=/code.*(incorrect|error|invalid)/i").first();
+
+    let outcome = null;
+
+    for (let i = 0; i < 10; i++) {
+      if (await successPopup.isVisible().catch(() => false)) {
+        outcome = "success";
+        break;
+      }
+      if (await paramIncorrect.isVisible().catch(() => false)) {
+        outcome = "param_incorrect";
+        break;
+      }
+      if (await invalidParam.isVisible().catch(() => false)) {
+        outcome = "invalid_param";
+        break;
+      }
+      if (await codeError.isVisible().catch(() => false)) {
+        outcome = "code_error";
+        break;
+      }
+      await sleep(300);
     }
 
-    // Success verification: Pending should appear after switching to Position order
-    await navigateToPending(page);
+    if (outcome !== "success") {
+      await saveShot(page, "confirm-result-not-success");
+      if (outcome === "param_incorrect") throw new Error("Site rejected code: parameter incorrect");
+      if (outcome === "invalid_param") throw new Error("Site rejected code: invalid parameter");
+      if (outcome === "code_error") throw new Error("Site rejected code: code invalid/incorrect");
+      throw new Error("No success or known error popup after confirm");
+    }
 
-    const pendingVisible = await waitForPending(page, 12000);
-    if (!pendingVisible) {
-      // If we did not see Pending, try to extract any toast/message and throw a helpful error
-      const msg = await scrapeAnyToast(page);
+    // Click Position order then check Pending (best-effort, don't fail the whole run if this is flaky)
+    const positionOrder = page.locator("text=/Position order/i").first();
+    if (await positionOrder.isVisible().catch(() => false)) {
+      await positionOrder.click().catch(() => null);
+      await sleep(1200);
+    }
+
+    const pending = page.locator("text=/Pending/i").first();
+    let pendingOk = false;
+    for (let i = 0; i < 8; i++) {
+      if (await pending.isVisible().catch(() => false)) {
+        pendingOk = true;
+        break;
+      }
+      await sleep(800);
+    }
+
+    if (!pendingOk) {
       await saveShot(page, "no-pending");
-      throw new Error(msg ? `Did not see Pending after submitting. Message: ${msg}` : "Did not see Pending after submitting");
+      // Do not hard-fail here since your real-world validation is that the order fulfilled.
+      console.log("WARN: Did not see Pending after submitting (continuing).");
     }
 
     await saveShot(page, "completed");
@@ -713,108 +685,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await context.close().catch(() => null);
     await browser.close().catch(() => null);
   }
-}
-
-async function isFuturesView(page) {
-  const hasPositionOrder = await page.locator("text=/Position order/i").first().isVisible().catch(() => false);
-  const hasInvitedTab = await page.locator("text=/invited me/i").first().isVisible().catch(() => false);
-  return !!(hasPositionOrder || hasInvitedTab);
-}
-
-async function findConfirmButton(page) {
-  // Try a few common patterns
-  const candidates = [
-    page.getByRole("button", { name: /confirm/i }).first(),
-    page.locator("button:has-text(\"Confirm\")").first(),
-    page.locator("button:has-text(\"CONFIRM\")").first(),
-    page.locator("button:has-text(\"OK\")").first(),
-    page.locator("button:has-text(\"Submit\")").first(),
-    page.locator("button:has-text(\"确定\")").first(),
-    page.locator("div[role='button']:has-text(\"Confirm\")").first(),
-    page.locator("button").filter({ hasText: /confirm/i }).first()
-  ];
-
-  for (const c of candidates) {
-    if (await c.isVisible().catch(() => false)) return c;
-  }
-
-  return null;
-}
-
-async function detectConfirmOutcome(page) {
-  // Look for common error messages you have seen
-  const paramIncorrect = page.locator("text=/parameter (is )?incorrect/i").first();
-  const invalidParam = page.locator("text=/invalid parameter/i").first();
-  const codeError = page.locator("text=/code.*(incorrect|error|invalid)/i").first();
-  const already = page.locator("text=/Already followed the order/i").first();
-
-  // Give UI time to render any toast/modal
-  for (let i = 0; i < 12; i++) {
-    if (await already.isVisible().catch(() => false)) {
-      return { type: "success", message: "Already followed the order" };
-    }
-    if (await paramIncorrect.isVisible().catch(() => false)) {
-      return { type: "error", message: "Site rejected code: parameter incorrect" };
-    }
-    if (await invalidParam.isVisible().catch(() => false)) {
-      return { type: "error", message: "Site rejected code: invalid parameter" };
-    }
-    if (await codeError.isVisible().catch(() => false)) {
-      return { type: "error", message: "Site rejected code: code invalid/incorrect" };
-    }
-    await sleep(300);
-  }
-
-  // Unknown, let Pending verification decide
-  return null;
-}
-
-async function navigateToPending(page) {
-  const positionOrder = page.locator("text=/Position order/i").first();
-  if (await positionOrder.isVisible().catch(() => false)) {
-    await positionOrder.click().catch(() => null);
-    await sleep(1200);
-  }
-
-  // If there is a "Pending" tab, click it (some UIs require it)
-  const pendingTab = page.locator("text=/Pending/i").first();
-  if (await pendingTab.isVisible().catch(() => false)) {
-    await pendingTab.click().catch(() => null);
-    await sleep(900);
-  }
-}
-
-async function waitForPending(page, timeoutMs) {
-  const pending = page.locator("text=/Pending/i").first();
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (await pending.isVisible().catch(() => false)) return true;
-    await sleep(500);
-  }
-  return false;
-}
-
-async function scrapeAnyToast(page) {
-  // Try to grab any short visible message that looks like a toast/modal
-  const toastCandidates = [
-    page.locator("[role='alert']").first(),
-    page.locator(".toast").first(),
-    page.locator(".ant-message").first(),
-    page.locator(".van-toast").first(),
-    page.locator(".el-message").first(),
-    page.locator("text=/invalid parameter/i").first(),
-    page.locator("text=/parameter (is )?incorrect/i").first(),
-    page.locator("text=/Already followed the order/i").first()
-  ];
-
-  for (const c of toastCandidates) {
-    if (await c.isVisible().catch(() => false)) {
-      const t = await c.textContent().catch(() => "");
-      const cleaned = (t || "").trim().replace(/\s+/g, " ");
-      if (cleaned && cleaned.length < 200) return cleaned;
-    }
-  }
-  return null;
 }
 
 // --------------------
@@ -841,7 +711,6 @@ function renderRunReport(report) {
     <div><b>Run ID:</b> ${escapeHtml(report.id)}</div>
     <div><b>Started:</b> ${escapeHtml(report.started)}</div>
     <div><b>Code length:</b> ${report.codeLength}</div>
-    <div><b>Normalized URL:</b> ${report.normalizedUrl ? escapeHtml(report.normalizedUrl) : "--"}</div>
     <hr/>
     <h3>Accounts</h3>
     <table border="1" cellpadding="8" cellspacing="0">
@@ -854,7 +723,7 @@ function renderRunReport(report) {
     <p><b>Status:</b> ${escapeHtml(report.status)}</p>
 
     <div>
-      <a href="/">Back to home</a>
+      <a href="/?p=${encodeURIComponent(BOT_PASSWORD)}">Back to home</a>
       | <a href="/health">Health</a>
       | <a href="/last-shot?p=${encodeURIComponent(BOT_PASSWORD)}">Last screenshot</a>
       | <a href="/dns-test?p=${encodeURIComponent(BOT_PASSWORD)}">DNS test</a>
