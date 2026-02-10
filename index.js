@@ -5,9 +5,10 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const dns = require("dns").promises;
-const net = require("net");
-const tls = require("tls");
 const { chromium } = require("playwright");
+
+// SendGrid Web API (HTTPS)
+const sgMail = require("@sendgrid/mail");
 
 const PORT = process.env.PORT || 8080;
 
@@ -24,20 +25,32 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_FROM = process.env.TWILIO_FROM || "";
 const TWILIO_TO = process.env.TWILIO_TO || "";
 
-// Email config (SendGrid SMTP)
+// Email config
 function envTruthy(v) {
   const s = (v || "").toString().trim().toLowerCase();
   return s === "1" || s === "true" || s === "yes" || s === "on";
 }
 
 const EMAIL_ENABLED = envTruthy(process.env.EMAIL_ENABLED || "1");
-const EMAIL_SMTP_HOST = process.env.EMAIL_SMTP_HOST || ""; // SendGrid: smtp.sendgrid.net
-const EMAIL_SMTP_PORT = Number(process.env.EMAIL_SMTP_PORT || "587"); // 587 or 2525 recommended
-const EMAIL_SMTP_SECURE = envTruthy(process.env.EMAIL_SMTP_SECURE || "false"); // true for 465
-const EMAIL_SMTP_USER = process.env.EMAIL_SMTP_USER || ""; // SendGrid: "apikey"
-const EMAIL_SMTP_PASS = process.env.EMAIL_SMTP_PASS || ""; // SendGrid API key
+
+// Choose provider:
+// - sendgrid (recommended): HTTPS API, works on Railway
+// - smtp (kept only for completeness, but likely blocked on Railway)
+const EMAIL_PROVIDER = (process.env.EMAIL_PROVIDER || "sendgrid").toString().trim().toLowerCase();
+
 const EMAIL_FROM = process.env.EMAIL_FROM || "";
-const EMAIL_TO = process.env.EMAIL_TO || ""; // can be comma-separated
+const EMAIL_TO = process.env.EMAIL_TO || "";
+const EMAIL_SUBJECT_PREFIX = (process.env.EMAIL_SUBJECT_PREFIX || "T-Bot").toString();
+
+// SendGrid API
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || "";
+
+// SMTP (optional fallback if your host allows SMTP)
+const EMAIL_SMTP_HOST = process.env.EMAIL_SMTP_HOST || "";
+const EMAIL_SMTP_PORT = Number(process.env.EMAIL_SMTP_PORT || "587");
+const EMAIL_SMTP_SECURE = envTruthy(process.env.EMAIL_SMTP_SECURE || "false"); // true for 465
+const EMAIL_SMTP_USER = process.env.EMAIL_SMTP_USER || "";
+const EMAIL_SMTP_PASS = process.env.EMAIL_SMTP_PASS || "";
 
 // Neutral debug capture
 const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE || "0");
@@ -121,179 +134,78 @@ function safeJsonParseAccounts() {
 }
 
 // --------------------
-// Email helper (SendGrid SMTP) with hard timeouts
+// Email helper
 // --------------------
 function emailConfigured() {
+  if (!EMAIL_ENABLED) return false;
+  if (!EMAIL_FROM || !EMAIL_TO) return false;
+
+  if (EMAIL_PROVIDER === "sendgrid") {
+    return !!SENDGRID_API_KEY;
+  }
+
+  // smtp fallback
   return !!(
-    EMAIL_ENABLED &&
     EMAIL_SMTP_HOST &&
     EMAIL_SMTP_PORT &&
     EMAIL_SMTP_USER &&
-    EMAIL_SMTP_PASS &&
-    EMAIL_FROM &&
-    EMAIL_TO
+    EMAIL_SMTP_PASS
   );
 }
 
-function parseEmailToList(raw) {
-  return String(raw || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
+async function sendEmail(subject, text) {
+  if (!EMAIL_ENABLED) return { ok: false, skipped: true, error: "EMAIL_ENABLED is off" };
+  if (!EMAIL_FROM || !EMAIL_TO) return { ok: false, skipped: false, error: "EMAIL_FROM or EMAIL_TO missing" };
 
-let emailInitTried = false;
-let emailInitError = null;
-let emailTransport = null;
+  const fullSubject = `${EMAIL_SUBJECT_PREFIX} | ${subject}`;
 
-function getEmailTransport() {
-  if (!emailConfigured()) return null;
-  if (emailTransport) return emailTransport;
-  if (emailInitTried) return null;
+  if (EMAIL_PROVIDER === "sendgrid") {
+    if (!SENDGRID_API_KEY) return { ok: false, skipped: false, error: "SENDGRID_API_KEY missing" };
 
-  emailInitTried = true;
+    try {
+      sgMail.setApiKey(SENDGRID_API_KEY);
+
+      await sgMail.send({
+        to: EMAIL_TO,
+        from: EMAIL_FROM,
+        subject: fullSubject,
+        text
+      });
+
+      console.log("Email sent via SendGrid API:", fullSubject);
+      return { ok: true, skipped: false };
+    } catch (e) {
+      const msg = (e && e.message) ? e.message : String(e);
+      console.log("Email failed (SendGrid API):", msg, "|", fullSubject);
+      return { ok: false, skipped: false, error: msg };
+    }
+  }
+
+  // SMTP fallback (likely blocked on Railway)
   try {
+    // Lazy require so you can keep this file working even if you remove nodemailer later
     const nodemailer = require("nodemailer");
-
-    emailTransport = nodemailer.createTransport({
+    const t = nodemailer.createTransport({
       host: EMAIL_SMTP_HOST,
       port: EMAIL_SMTP_PORT,
       secure: EMAIL_SMTP_SECURE,
-      auth: { user: EMAIL_SMTP_USER, pass: EMAIL_SMTP_PASS },
-
-      // Prevent long hangs on Railway
-      connectionTimeout: 12_000,
-      greetingTimeout: 12_000,
-      socketTimeout: 18_000,
-
-      // Helps with some TLS setups
-      tls: {
-        servername: EMAIL_SMTP_HOST
-      }
+      auth: { user: EMAIL_SMTP_USER, pass: EMAIL_SMTP_PASS }
     });
 
-    return emailTransport;
+    await t.sendMail({
+      from: EMAIL_FROM,
+      to: EMAIL_TO,
+      subject: fullSubject,
+      text
+    });
+
+    console.log("Email sent via SMTP:", fullSubject);
+    return { ok: true, skipped: false };
   } catch (e) {
-    emailInitError = e && e.message ? e.message : String(e);
-    emailTransport = null;
-    return null;
-  }
-}
-
-async function sendEmail(subject, text) {
-  if (!emailConfigured()) {
-    console.log("Email not configured, skipping send.");
-    return { ok: false, skipped: true, error: "Email not configured" };
-  }
-
-  const t = getEmailTransport();
-  if (!t) {
-    const err = emailInitError || "Email transport init failed";
-    console.log("Email init failed:", err);
-    return { ok: false, skipped: false, error: err };
-  }
-
-  const toList = parseEmailToList(EMAIL_TO);
-  const payload = { from: EMAIL_FROM, to: toList, subject, text };
-
-  const hardTimeoutMs = 18_000;
-
-  try {
-    const info = await Promise.race([
-      t.sendMail(payload),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("Email send timed out")), hardTimeoutMs))
-    ]);
-
-    const messageId = info && info.messageId ? info.messageId : "(no messageId)";
-    console.log("Email sent:", messageId, "|", subject);
-    return { ok: true, skipped: false, error: null, messageId };
-  } catch (e) {
-    const msg = e && e.message ? e.message : String(e);
-    console.log("Email failed:", msg, "|", subject);
+    const msg = (e && e.message) ? e.message : String(e);
+    console.log("Email failed (SMTP):", msg, "|", fullSubject);
     return { ok: false, skipped: false, error: msg };
   }
-}
-
-// Raw SMTP connectivity test (no credentials, just networking)
-async function smtpConnectivityTest() {
-  const host = EMAIL_SMTP_HOST;
-  const port = EMAIL_SMTP_PORT;
-  const secure = EMAIL_SMTP_SECURE;
-
-  const result = {
-    host,
-    port,
-    secure,
-    dns: null,
-    tcpConnect: null,
-    tlsHandshake: null
-  };
-
-  // DNS
-  try {
-    const addrs = await dns.lookup(host, { all: true });
-    result.dns = { ok: true, addrs };
-  } catch (e) {
-    result.dns = { ok: false, error: e && e.message ? e.message : String(e) };
-    return result;
-  }
-
-  // TCP connect
-  result.tcpConnect = await new Promise((resolve) => {
-    const socket = net.createConnection({ host, port });
-    const timer = setTimeout(() => {
-      socket.destroy();
-      resolve({ ok: false, error: "TCP connect timeout" });
-    }, 8000);
-
-    socket.on("connect", () => {
-      clearTimeout(timer);
-      socket.end();
-      resolve({ ok: true });
-    });
-
-    socket.on("error", (err) => {
-      clearTimeout(timer);
-      resolve({ ok: false, error: err && err.message ? err.message : String(err) });
-    });
-  });
-
-  if (!result.tcpConnect.ok) return result;
-
-  // TLS handshake check if secure=true (465)
-  if (secure) {
-    result.tlsHandshake = await new Promise((resolve) => {
-      const socket = tls.connect(
-        {
-          host,
-          port,
-          servername: host
-        },
-        () => {
-          socket.end();
-          resolve({ ok: true, authorized: socket.authorized, authorizationError: socket.authorizationError || null });
-        }
-      );
-
-      const timer = setTimeout(() => {
-        socket.destroy();
-        resolve({ ok: false, error: "TLS handshake timeout" });
-      }, 8000);
-
-      socket.on("error", (err) => {
-        clearTimeout(timer);
-        resolve({ ok: false, error: err && err.message ? err.message : String(err) });
-      });
-
-      socket.on("secureConnect", () => {
-        clearTimeout(timer);
-      });
-    });
-  } else {
-    result.tlsHandshake = { ok: true, skipped: true, reason: "secure=false (STARTTLS ports like 587/2525)" };
-  }
-
-  return result;
 }
 
 // --------------------
@@ -406,18 +318,16 @@ async function dumpDebugState(page, tag, extra = {}) {
     } catch {}
 
     try {
-      const ls = await page
-        .evaluate(() => {
-          const out = {};
-          try {
-            for (let i = 0; i < localStorage.length; i++) {
-              const k = localStorage.key(i);
-              out[k] = localStorage.getItem(k);
-            }
-          } catch {}
-          return out;
-        })
-        .catch(() => ({}));
+      const ls = await page.evaluate(() => {
+        const out = {};
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            out[k] = localStorage.getItem(k);
+          }
+        } catch {}
+        return out;
+      }).catch(() => ({}));
       fs.writeFileSync(`${base}.localstorage.json`, JSON.stringify(ls, null, 2));
     } catch {}
 
@@ -467,6 +377,7 @@ app.get("/", (req, res) => {
     <div>Debug capture: <b>${DEBUG_CAPTURE ? "ON" : "OFF"}</b></div>
     <div>LOGIN_URLS: <code>${escapeHtml(LOGIN_URLS.join(", "))}</code></div>
     <div>Email configured: <b>${emailConfigured() ? "YES" : "NO"}</b></div>
+    <div>Email provider: <b>${escapeHtml(EMAIL_PROVIDER)}</b></div>
 
     <div style="color:red; margin-top:10px;">
       ${pwMissing ? "BOT_PASSWORD or RUN_PASSWORD not set<br/>" : ""}
@@ -489,7 +400,6 @@ app.get("/", (req, res) => {
       | DNS test: <a href="/dns-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/dns-test</a>
       | Net test: <a href="/net-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/net-test</a>
       | Email test: <a href="/email-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/email-test</a>
-      | SMTP test: <a href="/smtp-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/smtp-test</a>
     </div>
   `);
 });
@@ -510,9 +420,7 @@ app.get("/health", (req, res) => {
     smsLibraryOk,
     smsLibraryError,
     emailConfigured: emailConfigured(),
-    emailHost: EMAIL_SMTP_HOST,
-    emailPort: EMAIL_SMTP_PORT,
-    emailSecure: EMAIL_SMTP_SECURE,
+    emailProvider: EMAIL_PROVIDER,
     debugCapture: DEBUG_CAPTURE,
     lastDebugDir,
     loginUrls: LOGIN_URLS
@@ -523,19 +431,12 @@ app.get("/email-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
   const result = await sendEmail(
-    "T-Bot email test",
-    `Email test sent at ${nowLocal()}\n\nIf you received this, SendGrid SMTP is set up correctly.`
+    "email test",
+    `Email test sent at ${nowLocal()}\n\nIf you received this, email is set up correctly.\nProvider: ${EMAIL_PROVIDER}\n`
   );
 
-  res.json({ ok: true, emailConfigured: emailConfigured(), result });
-});
-
-app.get("/smtp-test", async (req, res) => {
-  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-  if (!EMAIL_SMTP_HOST || !EMAIL_SMTP_PORT) return res.status(400).json({ ok: false, error: "EMAIL_SMTP_HOST/PORT not set" });
-
-  const result = await smtpConnectivityTest();
-  res.json({ ok: true, result });
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.send(JSON.stringify({ ok: true, attempted: true, result }, null, 2));
 });
 
 app.get("/last-shot", (req, res) => {
@@ -598,11 +499,7 @@ app.get("/dns-test", async (req, res) => {
     "bgol.pro",
     "dsj89.com",
     "dsj72.com",
-    "smtp.sendgrid.net",
-    "api.bgol.pro",
-    "api.dsj89.com",
-    "api.dsj72.com",
-    "api.ddjea.com"
+    "smtp.sendgrid.net"
   ];
 
   const out = {};
@@ -611,7 +508,7 @@ app.get("/dns-test", async (req, res) => {
       const addrs = await dns.lookup(h, { all: true });
       out[h] = { ok: true, addrs };
     } catch (e) {
-      out[h] = { ok: false, error: e && e.message ? e.message : String(e) };
+      out[h] = { ok: false, error: (e && e.message) ? e.message : String(e) };
     }
   }
   res.json(out);
@@ -620,16 +517,25 @@ app.get("/dns-test", async (req, res) => {
 app.get("/net-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
-  const urls = ["https://bgol.pro/", "https://dsj89.com/", "https://dsj72.com/"];
+  const urls = [
+    "https://bgol.pro/",
+    "https://dsj89.com/",
+    "https://dsj72.com/",
+    "https://api.sendgrid.com/v3/user/profile"
+  ];
 
   const results = {};
   for (const u of urls) {
     try {
-      const r = await fetch(u, { method: "GET" });
+      const headers = {};
+      if (u.includes("api.sendgrid.com") && SENDGRID_API_KEY) {
+        headers["Authorization"] = `Bearer ${SENDGRID_API_KEY}`;
+      }
+      const r = await fetch(u, { method: "GET", headers });
       const text = await r.text();
       results[u] = { ok: true, status: r.status, bodyPreview: text.slice(0, 240) };
     } catch (e) {
-      results[u] = { ok: false, error: e && e.message ? e.message : String(e) };
+      results[u] = { ok: false, error: (e && e.message) ? e.message : String(e) };
     }
   }
   res.json(results);
@@ -667,7 +573,7 @@ app.post("/run", async (req, res) => {
 
   (async () => {
     const startedAt = nowLocal();
-    const subjectPrefix = `T-Bot Run ${lastRunId}`;
+    const runLabel = `Run ${lastRunId}`;
 
     try {
       console.log("Bot started");
@@ -676,13 +582,13 @@ app.post("/run", async (req, res) => {
       console.log("Code received length:", code.length);
       console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
       console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
+      console.log("Email provider:", EMAIL_PROVIDER);
       console.log("Email configured:", emailConfigured());
-      console.log("Email host/port/secure:", EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, EMAIL_SMTP_SECURE);
 
       console.log("About to send START email...");
       const startEmailRes = await sendEmail(
-        `${subjectPrefix} started`,
-        `T-Bot started at ${startedAt}\nRun ID: ${lastRunId}\nAccounts: ${cfg.accounts.length}\nDebug capture: ${DEBUG_CAPTURE ? "ON" : "OFF"}`
+        `${runLabel} started`,
+        `T-Bot started at ${startedAt}\nRun ID: ${lastRunId}\nAccounts: ${cfg.accounts.length}\nDebug capture: ${DEBUG_CAPTURE ? "ON" : "OFF"}\nProvider: ${EMAIL_PROVIDER}\n`
       );
       console.log("START email result:", startEmailRes);
 
@@ -713,7 +619,7 @@ app.post("/run", async (req, res) => {
 
       console.log("About to send FINISH email...");
       const finishEmailRes = await sendEmail(
-        `${subjectPrefix} ${anyFailed ? "finished with failures" : "completed"}`,
+        `${runLabel} ${anyFailed ? "finished with failures" : "completed"}`,
         `T-Bot finished at ${finishedAt}\nRun ID: ${lastRunId}\n\nResults:\n${summaryLines.join("\n")}\n`
       );
       console.log("FINISH email result:", finishEmailRes);
@@ -726,10 +632,9 @@ app.post("/run", async (req, res) => {
       lastError = msg;
 
       const failedAt = nowLocal();
-
       console.log("About to send FAILED email...");
       const failEmailRes = await sendEmail(
-        `${subjectPrefix} FAILED`,
+        `Run ${lastRunId} FAILED`,
         `T-Bot failed at ${failedAt}\nRun ID: ${lastRunId}\nError: ${msg}\n`
       );
       console.log("FAILED email result:", failEmailRes);
@@ -743,7 +648,7 @@ app.post("/run", async (req, res) => {
 });
 
 // --------------------
-// Playwright core (unchanged behavior)
+// Playwright core
 // --------------------
 async function runAccountAllSites(account, orderCode) {
   let last = null;
@@ -770,8 +675,9 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
   });
 
-  const harPath =
-    DEBUG_CAPTURE && lastDebugDir ? path.join(lastDebugDir, `har-${sanitize(account.username)}-${Date.now()}.har`) : null;
+  const harPath = DEBUG_CAPTURE && lastDebugDir
+    ? path.join(lastDebugDir, `har-${sanitize(account.username)}-${Date.now()}.har`)
+    : null;
 
   const context = await browser.newContext({
     viewport: { width: 1280, height: 720 },
@@ -784,7 +690,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
   page.on("requestfailed", (req) => {
     const f = req.failure();
-    const errText = f && f.errorText ? f.errorText : "unknown";
+    const errText = (f && f.errorText) ? f.errorText : "unknown";
     if (req.url().includes("/api/")) console.log("REQUEST FAILED:", req.url(), "=>", errText);
   });
 
@@ -797,22 +703,22 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
   });
 
   try {
-    await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await sleep(1200);
     await dumpDebugState(page, "after-goto", { loginUrl, username: account.username });
 
     const userField = page.locator('input[type="email"], input[type="text"]').first();
     const passField = page.locator('input[type="password"]').first();
 
-    await userField.waitFor({ timeout: 20_000 });
-    await passField.waitFor({ timeout: 20_000 });
+    await userField.waitFor({ timeout: 20000 });
+    await passField.waitFor({ timeout: 20000 });
 
     let loggedIn = false;
 
     for (let attempt = 1; attempt <= 6; attempt++) {
       console.log("Login attempt", attempt, "for", account.username, "on", loginUrl);
 
-      await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
       await sleep(1200);
 
       await userField.fill("");
@@ -828,7 +734,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
       const loginBtn = page.getByRole("button", { name: /login/i }).first();
       if (await loginBtn.isVisible().catch(() => false)) {
-        await loginBtn.click({ timeout: 10_000 });
+        await loginBtn.click({ timeout: 10000 });
       } else {
         await passField.press("Enter");
       }
@@ -838,7 +744,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
       const fu = futuresUrlFromLoginUrl(loginUrl);
       if (fu) {
-        await page.goto(fu, { waitUntil: "domcontentloaded", timeout: 60_000 });
+        await page.goto(fu, { waitUntil: "domcontentloaded", timeout: 60000 });
         await sleep(1500);
         await dumpDebugState(page, "after-futures-direct", { futuresUrl: fu });
 
@@ -863,7 +769,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     const futuresUrl = futuresUrlFromLoginUrl(loginUrl);
     if (!futuresUrl) throw new Error("Could not build Futures URL from login URL");
 
-    await page.goto(futuresUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.goto(futuresUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await sleep(1500);
     await dumpDebugState(page, "after-futures", { futuresUrl });
 
@@ -873,7 +779,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       throw new Error("Could not find Invited me tab");
     }
 
-    await invited.click({ timeout: 10_000 }).catch(() => null);
+    await invited.click({ timeout: 10000 }).catch(() => null);
     await sleep(1200);
     await dumpDebugState(page, "after-invited", {});
 
@@ -894,7 +800,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       throw new Error("Confirm button not found");
     }
 
-    await confirmBtn.click({ timeout: 10_000 });
+    await confirmBtn.click({ timeout: 10000 });
     await sleep(1500);
     await dumpDebugState(page, "after-confirm", {});
   } finally {
@@ -909,6 +815,6 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
   console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
   console.log("Email configured:", emailConfigured());
-  console.log("Email host/port/secure:", EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, EMAIL_SMTP_SECURE);
+  console.log("Email provider:", EMAIL_PROVIDER);
   writePlaceholderLastShot();
 });
