@@ -7,28 +7,45 @@ const path = require("path");
 const dns = require("dns").promises;
 const { chromium } = require("playwright");
 
+// Email (SMTP)
+const nodemailer = require("nodemailer");
+
 const PORT = process.env.PORT || 8080;
 
-// Support both names since your Railway has RUN_PASSWORD shown
+// Support both BOT_PASSWORD and RUN_PASSWORD
 const BOT_PASSWORD = process.env.BOT_PASSWORD || process.env.RUN_PASSWORD || "";
 const ACCOUNTS_JSON = process.env.ACCOUNTS_JSON || "";
 
 // Optional: LOGIN_URLS override from Railway (comma-separated)
 const LOGIN_URLS_ENV = process.env.LOGIN_URLS || "";
 
-// Twilio (optional)
+// Twilio (optional, can be left blank)
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_FROM = process.env.TWILIO_FROM || "";
 const TWILIO_TO = process.env.TWILIO_TO || "";
 
-// DEBUG_CAPTURE: accept 1/true/yes/on
+// Email config (SendGrid SMTP)
 function envTruthy(v) {
   const s = (v || "").toString().trim().toLowerCase();
   return s === "1" || s === "true" || s === "yes" || s === "on";
 }
-const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE);
 
+const EMAIL_ENABLED = envTruthy(process.env.EMAIL_ENABLED || "1");
+const EMAIL_SMTP_HOST = process.env.EMAIL_SMTP_HOST || "";
+const EMAIL_SMTP_PORT = Number(process.env.EMAIL_SMTP_PORT || "587");
+const EMAIL_SMTP_SECURE = envTruthy(process.env.EMAIL_SMTP_SECURE || "false"); // true for 465
+const EMAIL_SMTP_USER = process.env.EMAIL_SMTP_USER || "";
+const EMAIL_SMTP_PASS = process.env.EMAIL_SMTP_PASS || "";
+const EMAIL_FROM = process.env.EMAIL_FROM || "";
+const EMAIL_TO = process.env.EMAIL_TO || "";
+
+// Neutral debug capture
+const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE || "0");
+
+// --------------------
+// Login URLs
+// --------------------
 function parseLoginUrls() {
   const fallback = [
     "https://bgol.pro/pc/#/login",
@@ -49,7 +66,6 @@ function parseLoginUrls() {
 
 const LOGIN_URLS = parseLoginUrls();
 
-// After login, go straight to the Futures trading page
 function futuresUrlFromLoginUrl(loginUrl) {
   try {
     const u = new URL(loginUrl);
@@ -106,6 +122,61 @@ function safeJsonParseAccounts() {
 }
 
 // --------------------
+// Email helper
+// --------------------
+function emailConfigured() {
+  return !!(
+    EMAIL_ENABLED &&
+    EMAIL_SMTP_HOST &&
+    EMAIL_SMTP_PORT &&
+    EMAIL_SMTP_USER &&
+    EMAIL_SMTP_PASS &&
+    EMAIL_FROM &&
+    EMAIL_TO
+  );
+}
+
+let emailTransport = null;
+function getEmailTransport() {
+  if (!emailConfigured()) return null;
+  if (emailTransport) return emailTransport;
+
+  emailTransport = nodemailer.createTransport({
+    host: EMAIL_SMTP_HOST,
+    port: EMAIL_SMTP_PORT,
+    secure: EMAIL_SMTP_SECURE,
+    auth: {
+      user: EMAIL_SMTP_USER,
+      pass: EMAIL_SMTP_PASS
+    }
+  });
+
+  return emailTransport;
+}
+
+async function sendEmail(subject, text) {
+  const t = getEmailTransport();
+  if (!t) {
+    console.log("Email not configured, skipping send.");
+    return null;
+  }
+
+  try {
+    const info = await t.sendMail({
+      from: EMAIL_FROM,
+      to: EMAIL_TO,
+      subject,
+      text
+    });
+    console.log("Email sent:", info && info.messageId ? info.messageId : "(no messageId)");
+    return info && info.messageId ? info.messageId : "sent";
+  } catch (e) {
+    console.log("Email failed:", e.message || String(e));
+    return null;
+  }
+}
+
+// --------------------
 // Twilio helper (optional)
 // --------------------
 let twilioClient = null;
@@ -154,7 +225,6 @@ let lastError = null;
 
 let lastShotPath = null;
 let lastRunId = null;
-let runReport = null;
 let lastDebugDir = null;
 
 function ensureDir(dir) {
@@ -274,6 +344,7 @@ app.get("/", (req, res) => {
     <div>Last run: ${lastRunAt ? escapeHtml(lastRunAt) : "-"}</div>
     <div>Debug capture: <b>${DEBUG_CAPTURE ? "ON" : "OFF"}</b></div>
     <div>LOGIN_URLS: <code>${escapeHtml(LOGIN_URLS.join(", "))}</code></div>
+    <div>Email configured: <b>${emailConfigured() ? "YES" : "NO"}</b></div>
 
     <div style="color:red; margin-top:10px;">
       ${pwMissing ? "BOT_PASSWORD or RUN_PASSWORD not set<br/>" : ""}
@@ -295,7 +366,7 @@ app.get("/", (req, res) => {
       | Debug: <a href="/debug?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/debug</a>
       | DNS test: <a href="/dns-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/dns-test</a>
       | Net test: <a href="/net-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/net-test</a>
-      | SMS test: <a href="/sms-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/sms-test</a>
+      | Email test: <a href="/email-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/email-test</a>
     </div>
   `);
 });
@@ -303,6 +374,7 @@ app.get("/", (req, res) => {
 app.get("/health", (req, res) => {
   const cfg = safeJsonParseAccounts();
   initTwilioOnce();
+
   res.json({
     ok: true,
     running: isRunning,
@@ -314,16 +386,20 @@ app.get("/health", (req, res) => {
     smsConfigured: !!(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && TWILIO_FROM && TWILIO_TO),
     smsLibraryOk,
     smsLibraryError,
+    emailConfigured: emailConfigured(),
     debugCapture: DEBUG_CAPTURE,
     lastDebugDir,
     loginUrls: LOGIN_URLS
   });
 });
 
-app.get("/sms-test", async (req, res) => {
+app.get("/email-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-  await sendSMS(`T-Bot SMS test at ${nowLocal()}`);
-  res.send("OK: SMS sent (or SMS not configured).");
+  await sendEmail(
+    "T-Bot email test",
+    `Email test sent at ${nowLocal()}\n\nIf you received this, SendGrid SMTP is set up correctly.`
+  );
+  res.send("OK: Email attempted (or email not configured).");
 });
 
 app.get("/last-shot", (req, res) => {
@@ -410,11 +486,7 @@ app.get("/net-test", async (req, res) => {
   const urls = [
     "https://bgol.pro/",
     "https://dsj89.com/",
-    "https://dsj72.com/",
-    "https://api.bgol.pro/api/app/ping",
-    "https://api.dsj89.com/api/app/ping",
-    "https://api.dsj72.com/api/app/ping",
-    "https://api.ddjea.com/api/app/ping"
+    "https://dsj72.com/"
   ];
 
   const results = {};
@@ -458,9 +530,12 @@ app.post("/run", async (req, res) => {
   writePlaceholderLastShot();
 
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  res.send("Run started. Check logs and /debug if enabled.");
+  res.send("Run started. Check logs, /health, and /debug if enabled.");
 
   (async () => {
+    const startedAt = nowLocal();
+    const subjectPrefix = `T-Bot Run ${lastRunId}`;
+
     try {
       console.log("Bot started");
       console.log("Run ID:", lastRunId);
@@ -468,21 +543,57 @@ app.post("/run", async (req, res) => {
       console.log("Code received length:", code.length);
       console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
       console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
+      console.log("Email configured:", emailConfigured());
 
-      await sendSMS(`T-Bot started at ${lastRunAt}`);
+      await sendEmail(
+        `${subjectPrefix} started`,
+        `T-Bot started at ${startedAt}\nRun ID: ${lastRunId}\nAccounts: ${cfg.accounts.length}\nDebug capture: ${DEBUG_CAPTURE ? "ON" : "OFF"}`
+      );
+
+      await sendSMS(`T-Bot started at ${startedAt}`);
+
+      const results = [];
 
       for (const account of cfg.accounts) {
         console.log("----");
         console.log("Account:", account.username);
-        await runAccountAllSites(account, code);
+        try {
+          const used = await runAccountAllSites(account, code);
+          results.push({ username: account.username, ok: true, site: used });
+        } catch (e) {
+          const msg = e && e.message ? e.message : String(e);
+          results.push({ username: account.username, ok: false, error: msg });
+          lastError = `Account failed ${account.username}: ${msg}`;
+        }
       }
 
-      await sendSMS(`T-Bot completed at ${nowLocal()}`);
+      const finishedAt = nowLocal();
+      const anyFailed = results.some((r) => !r.ok);
+
+      const summaryLines = results.map((r) => {
+        if (r.ok) return `OK: ${r.username} (${r.site})`;
+        return `FAIL: ${r.username} (${r.error})`;
+      });
+
+      await sendEmail(
+        `${subjectPrefix} ${anyFailed ? "finished with failures" : "completed"}`,
+        `T-Bot finished at ${finishedAt}\nRun ID: ${lastRunId}\n\nResults:\n${summaryLines.join("\n")}\n`
+      );
+
+      await sendSMS(anyFailed ? `T-Bot finished with failures at ${finishedAt}` : `T-Bot completed at ${finishedAt}`);
+
       console.log("Bot completed");
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
       lastError = msg;
-      await sendSMS(`T-Bot failed at ${nowLocal()}: ${msg}`);
+
+      const failedAt = nowLocal();
+      await sendEmail(
+        `${subjectPrefix} FAILED`,
+        `T-Bot failed at ${failedAt}\nRun ID: ${lastRunId}\nError: ${msg}\n`
+      );
+
+      await sendSMS(`T-Bot failed at ${failedAt}: ${msg}`);
       console.log("Run failed:", msg);
     } finally {
       isRunning = false;
@@ -546,7 +657,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
   });
 
   try {
-    console.log("Step: goto login");
     await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await sleep(1200);
     await dumpDebugState(page, "after-goto", { loginUrl, username: account.username });
@@ -559,7 +669,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
     let loggedIn = false;
 
-    for (let attempt = 1; attempt <= 8; attempt++) {
+    for (let attempt = 1; attempt <= 6; attempt++) {
       console.log("Login attempt", attempt, "for", account.username, "on", loginUrl);
 
       await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
@@ -588,7 +698,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
       const fu = futuresUrlFromLoginUrl(loginUrl);
       if (fu) {
-        console.log("Step: goto futures", fu);
         await page.goto(fu, { waitUntil: "domcontentloaded", timeout: 60000 });
         await sleep(1500);
         await dumpDebugState(page, "after-futures-direct", { futuresUrl: fu });
@@ -614,32 +723,22 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     const futuresUrl = futuresUrlFromLoginUrl(loginUrl);
     if (!futuresUrl) throw new Error("Could not build Futures URL from login URL");
 
-    console.log("Step: futures page load");
     await page.goto(futuresUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await sleep(1500);
     await dumpDebugState(page, "after-futures", { futuresUrl });
 
-    console.log("Step: find invited tab");
     const invited = page.locator("text=/invited me/i").first();
-    const invitedVisible = await invited.isVisible().catch(() => false);
-    console.log("Invited visible:", invitedVisible);
-
-    if (!invitedVisible) {
+    if (!(await invited.isVisible().catch(() => false))) {
       await dumpDebugState(page, "invited-missing", {});
       throw new Error("Could not find Invited me tab");
     }
 
-    await invited.scrollIntoViewIfNeeded().catch(() => null);
     await invited.click({ timeout: 10000 }).catch(() => null);
     await sleep(1200);
     await dumpDebugState(page, "after-invited", {});
 
-    console.log("Step: find code input");
     const codeBox = page.locator('input[placeholder*="order code" i], input[placeholder*="Please enter" i]').first();
-    const codeVisible = await codeBox.isVisible().catch(() => false);
-    console.log("Code input visible:", codeVisible);
-
-    if (!codeVisible) {
+    if (!(await codeBox.isVisible().catch(() => false))) {
       await dumpDebugState(page, "code-box-missing", {});
       throw new Error("Order code input not found");
     }
@@ -649,12 +748,8 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await sleep(600);
     await dumpDebugState(page, "after-code", { codeLength: String(orderCode || "").length });
 
-    console.log("Step: find confirm button");
     const confirmBtn = page.getByRole("button", { name: /confirm/i }).first();
-    const confirmVisible = await confirmBtn.isVisible().catch(() => false);
-    console.log("Confirm visible:", confirmVisible);
-
-    if (!confirmVisible) {
+    if (!(await confirmBtn.isVisible().catch(() => false))) {
       await dumpDebugState(page, "confirm-missing", {});
       throw new Error("Confirm button not found");
     }
@@ -662,7 +757,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await confirmBtn.click({ timeout: 10000 });
     await sleep(1500);
     await dumpDebugState(page, "after-confirm", {});
-    console.log("Step: confirm clicked");
   } finally {
     await context.close().catch(() => null);
     await browser.close().catch(() => null);
@@ -674,6 +768,6 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("Listening on", PORT);
   console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
   console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
+  console.log("Email configured:", emailConfigured());
   writePlaceholderLastShot();
 });
-
