@@ -9,24 +9,45 @@ const { chromium } = require("playwright");
 
 const PORT = process.env.PORT || 8080;
 
-const BOT_PASSWORD = process.env.BOT_PASSWORD || "";
+// Support both names since your Railway has RUN_PASSWORD shown
+const BOT_PASSWORD = process.env.BOT_PASSWORD || process.env.RUN_PASSWORD || "";
 const ACCOUNTS_JSON = process.env.ACCOUNTS_JSON || "";
 
+// Optional: LOGIN_URLS override from Railway (comma-separated)
+const LOGIN_URLS_ENV = process.env.LOGIN_URLS || "";
+
+// Twilio (optional)
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_FROM = process.env.TWILIO_FROM || "";
 const TWILIO_TO = process.env.TWILIO_TO || "";
 
-// Neutral debug capture (no bypasses, just recording)
-// Set DEBUG_CAPTURE=1 in Railway Variables to enable.
-const DEBUG_CAPTURE = (process.env.DEBUG_CAPTURE || "").toString() === "1";
+// DEBUG_CAPTURE: accept 1/true/yes/on
+function envTruthy(v) {
+  const s = (v || "").toString().trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes" || s === "on";
+}
+const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE);
 
-// Keep PC only as you had it when it was working better.
-const LOGIN_URLS = [
-  "https://bgol.pro/pc/#/login",
-  "https://dsj89.com/pc/#/login",
-  "https://dsj72.com/pc/#/login"
-];
+function parseLoginUrls() {
+  const fallback = [
+    "https://bgol.pro/pc/#/login",
+    "https://dsj89.com/pc/#/login",
+    "https://dsj72.com/pc/#/login"
+  ];
+
+  const raw = (LOGIN_URLS_ENV || "").trim();
+  if (!raw) return fallback;
+
+  const list = raw
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  return list.length ? list : fallback;
+}
+
+const LOGIN_URLS = parseLoginUrls();
 
 // After login, go straight to the Futures trading page
 function futuresUrlFromLoginUrl(loginUrl) {
@@ -85,7 +106,7 @@ function safeJsonParseAccounts() {
 }
 
 // --------------------
-// Twilio helper
+// Twilio helper (optional)
 // --------------------
 let twilioClient = null;
 let smsLibraryOk = false;
@@ -134,8 +155,6 @@ let lastError = null;
 let lastShotPath = null;
 let lastRunId = null;
 let runReport = null;
-
-// Debug artifacts: keep the latest run folder path
 let lastDebugDir = null;
 
 function ensureDir(dir) {
@@ -172,7 +191,6 @@ async function saveShot(page, tag) {
   }
 }
 
-// Neutral debug state capture
 async function dumpDebugState(page, tag, extra = {}) {
   if (!DEBUG_CAPTURE) return;
 
@@ -183,24 +201,20 @@ async function dumpDebugState(page, tag, extra = {}) {
     const stamp = Date.now();
     const base = path.join(lastDebugDir, `${tag}-${stamp}`);
 
-    // URL
     try {
       fs.writeFileSync(`${base}.url.txt`, String(page.url() || ""));
     } catch {}
 
-    // HTML content
     try {
       const html = await page.content().catch(() => "");
       fs.writeFileSync(`${base}.html`, html || "");
     } catch {}
 
-    // Title
     try {
       const title = await page.title().catch(() => "");
       fs.writeFileSync(`${base}.title.txt`, title || "");
     } catch {}
 
-    // LocalStorage snapshot
     try {
       const ls = await page.evaluate(() => {
         const out = {};
@@ -215,16 +229,31 @@ async function dumpDebugState(page, tag, extra = {}) {
       fs.writeFileSync(`${base}.localstorage.json`, JSON.stringify(ls, null, 2));
     } catch {}
 
-    // Extra JSON
     try {
       fs.writeFileSync(`${base}.extra.json`, JSON.stringify(extra, null, 2));
     } catch {}
 
-    // Screenshot
     await saveShot(page, tag);
   } catch (e) {
     console.log("dumpDebugState failed:", e && e.message ? e.message : String(e));
   }
+}
+
+function safeListDir(dir) {
+  try {
+    return fs.readdirSync(dir).filter((x) => !x.includes(".."));
+  } catch {
+    return [];
+  }
+}
+
+function sanitize(s) {
+  return String(s || "")
+    .replaceAll("@", "_at_")
+    .replaceAll(".", "_")
+    .replaceAll("/", "_")
+    .replaceAll("\\", "_")
+    .slice(0, 80);
 }
 
 // --------------------
@@ -244,9 +273,10 @@ app.get("/", (req, res) => {
     <div>Running: <b>${isRunning ? "YES" : "NO"}</b></div>
     <div>Last run: ${lastRunAt ? escapeHtml(lastRunAt) : "-"}</div>
     <div>Debug capture: <b>${DEBUG_CAPTURE ? "ON" : "OFF"}</b></div>
+    <div>LOGIN_URLS: <code>${escapeHtml(LOGIN_URLS.join(", "))}</code></div>
 
     <div style="color:red; margin-top:10px;">
-      ${pwMissing ? "BOT_PASSWORD not set<br/>" : ""}
+      ${pwMissing ? "BOT_PASSWORD or RUN_PASSWORD not set<br/>" : ""}
       ${accountsMissing ? escapeHtml(cfg.error || "ACCOUNTS_JSON not set") : ""}
       ${lastError ? `<br/>Last error: ${escapeHtml(lastError)}` : ""}
     </div>
@@ -285,7 +315,8 @@ app.get("/health", (req, res) => {
     smsLibraryOk,
     smsLibraryError,
     debugCapture: DEBUG_CAPTURE,
-    lastDebugDir
+    lastDebugDir,
+    loginUrls: LOGIN_URLS
   });
 });
 
@@ -317,7 +348,7 @@ app.get("/debug", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
 
   if (!lastDebugDir) {
-    res.send(`<h3>Debug</h3><div>No debug run directory yet.</div>`);
+    res.send(`<h3>Debug</h3><div>No debug run directory yet. Set DEBUG_CAPTURE=1 and run once.</div>`);
     return;
   }
 
@@ -330,19 +361,10 @@ app.get("/debug", (req, res) => {
     <h3>Debug</h3>
     <div>Debug capture is <b>${DEBUG_CAPTURE ? "ON" : "OFF"}</b></div>
     <div>Last debug dir: <code>${escapeHtml(lastDebugDir)}</code></div>
-    <div style="margin-top:10px;"><a href="/debug/download?p=${encodeURIComponent(BOT_PASSWORD)}">Download file list</a></div>
     <hr/>
     <ul>${links}</ul>
   `);
 });
-
-function safeListDir(dir) {
-  try {
-    return fs.readdirSync(dir).filter((x) => !x.includes(".."));
-  } catch {
-    return [];
-  }
-}
 
 app.get("/debug/files", (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
@@ -357,27 +379,6 @@ app.get("/debug/files", (req, res) => {
   fs.createReadStream(full).pipe(res);
 });
 
-app.get("/debug/download", (req, res) => {
-  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-  if (!lastDebugDir) return res.status(404).send("No debug dir.");
-
-  const files = safeListDir(lastDebugDir);
-  res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  res.send(
-    `Last debug dir: ${lastDebugDir}\n\nFiles:\n` +
-      files.map((x) => `- ${x}`).join("\n") +
-      `\n\nTip: open /debug to click files individually.\n`
-  );
-});
-
-app.get("/run/:id", (req, res) => {
-  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-  if (!runReport || req.params.id !== lastRunId) return res.status(404).send("Run not found.");
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(renderRunReport(runReport));
-});
-
-// Network tests
 app.get("/dns-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
@@ -433,7 +434,7 @@ app.post("/run", async (req, res) => {
   const p = (req.body.p || "").toString();
   const code = (req.body.code || "").toString().trim();
 
-  if (!BOT_PASSWORD) return res.status(500).send("BOT_PASSWORD not set in Railway variables.");
+  if (!BOT_PASSWORD) return res.status(500).send("BOT_PASSWORD or RUN_PASSWORD not set in Railway variables.");
   if (p !== BOT_PASSWORD) return res.status(401).send("Wrong password.");
 
   const cfg = safeJsonParseAccounts();
@@ -447,7 +448,6 @@ app.post("/run", async (req, res) => {
   lastRunAt = nowLocal();
   lastRunId = crypto.randomBytes(6).toString("hex");
 
-  // Create a fresh debug dir per run
   if (DEBUG_CAPTURE) {
     lastDebugDir = `/tmp/debug-${lastRunId}`;
     ensureDir(lastDebugDir);
@@ -455,23 +455,10 @@ app.post("/run", async (req, res) => {
     lastDebugDir = null;
   }
 
-  runReport = {
-    id: lastRunId,
-    started: lastRunAt,
-    codeLength: code.length,
-    accounts: cfg.accounts.map((a) => ({
-      username: a.username,
-      completed: false,
-      siteUsed: null,
-      error: null
-    })),
-    status: "Running now. Refresh this page."
-  };
-
   writePlaceholderLastShot();
 
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(renderRunReport(runReport));
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.send("Run started. Check logs and /debug if enabled.");
 
   (async () => {
     try {
@@ -479,33 +466,22 @@ app.post("/run", async (req, res) => {
       console.log("Run ID:", lastRunId);
       console.log("Accounts loaded:", cfg.accounts.length);
       console.log("Code received length:", code.length);
+      console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
+      console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
 
       await sendSMS(`T-Bot started at ${lastRunAt}`);
 
-      for (let i = 0; i < cfg.accounts.length; i++) {
-        const account = cfg.accounts[i];
-        try {
-          const used = await runAccountAllSites(account, code);
-          runReport.accounts[i].completed = true;
-          runReport.accounts[i].siteUsed = used;
-          runReport.accounts[i].error = null;
-        } catch (e) {
-          const msg = e && e.message ? e.message : String(e);
-          runReport.accounts[i].completed = false;
-          runReport.accounts[i].error = msg;
-          lastError = `Account failed ${account.username}: ${msg}`;
-        }
+      for (const account of cfg.accounts) {
+        console.log("----");
+        console.log("Account:", account.username);
+        await runAccountAllSites(account, code);
       }
 
-      const anyFailed = runReport.accounts.some((a) => !a.completed);
-      runReport.status = anyFailed ? "Finished with failures. See account errors." : "Completed successfully.";
-
-      await sendSMS(anyFailed ? `T-Bot finished with failures at ${nowLocal()}` : `T-Bot completed at ${nowLocal()}`);
+      await sendSMS(`T-Bot completed at ${nowLocal()}`);
       console.log("Bot completed");
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
       lastError = msg;
-      runReport.status = "Run failed: " + msg;
       await sendSMS(`T-Bot failed at ${nowLocal()}: ${msg}`);
       console.log("Run failed:", msg);
     } finally {
@@ -524,6 +500,7 @@ async function runAccountAllSites(account, orderCode) {
     console.log("Trying site:", loginUrl, "for", account.username);
     try {
       await runAccountOnSite(account, orderCode, loginUrl);
+      console.log("SUCCESS:", account.username, "on", loginUrl);
       return loginUrl;
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
@@ -541,14 +518,12 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
   });
 
-  // HAR recording (neutral observation)
   const harPath = DEBUG_CAPTURE && lastDebugDir
     ? path.join(lastDebugDir, `har-${sanitize(account.username)}-${Date.now()}.har`)
     : null;
 
   const context = await browser.newContext({
     viewport: { width: 1280, height: 720 },
-    userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
     locale: "en-US",
     recordHar: harPath ? { path: harPath, content: "embed" } : undefined
   });
@@ -571,12 +546,14 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
   });
 
   try {
+    console.log("Step: goto login");
     await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await sleep(1200);
     await dumpDebugState(page, "after-goto", { loginUrl, username: account.username });
 
     const userField = page.locator('input[type="email"], input[type="text"]').first();
     const passField = page.locator('input[type="password"]').first();
+
     await userField.waitFor({ timeout: 20000 });
     await passField.waitFor({ timeout: 20000 });
 
@@ -609,30 +586,24 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       await sleep(1800);
       await dumpDebugState(page, `after-login-attempt-${attempt}`, { attempt });
 
-      const wrongPw =
-        (await page.locator("text=Wrong password").first().isVisible().catch(() => false)) ||
-        (await page.locator("text=wrong password").first().isVisible().catch(() => false));
-      if (wrongPw) {
-        throw new Error("Wrong password reported by site");
-      }
-
       const fu = futuresUrlFromLoginUrl(loginUrl);
       if (fu) {
+        console.log("Step: goto futures", fu);
         await page.goto(fu, { waitUntil: "domcontentloaded", timeout: 60000 });
         await sleep(1500);
         await dumpDebugState(page, "after-futures-direct", { futuresUrl: fu });
 
-        const hasPositionOrder = await page.locator("text=Position order").first().isVisible().catch(() => false);
         const hasInvitedTab = await page.locator("text=/invited me/i").first().isVisible().catch(() => false);
+        const hasPositionOrder = await page.locator("text=Position order").first().isVisible().catch(() => false);
 
-        if (hasPositionOrder || hasInvitedTab) {
+        if (hasInvitedTab || hasPositionOrder) {
           loggedIn = true;
           console.log("Login confirmed via Futures page for", account.username, "on", loginUrl);
           break;
         }
       }
 
-      await sleep(1200);
+      await sleep(800);
     }
 
     if (!loggedIn) {
@@ -640,20 +611,19 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       throw new Error("Login failed");
     }
 
-    await dumpDebugState(page, "after-login", { loginUrl });
-
     const futuresUrl = futuresUrlFromLoginUrl(loginUrl);
     if (!futuresUrl) throw new Error("Could not build Futures URL from login URL");
 
+    console.log("Step: futures page load");
     await page.goto(futuresUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await sleep(1500);
     await dumpDebugState(page, "after-futures", { futuresUrl });
 
-    // This section intentionally stays the same as your current behavior.
-    // Instrumentation helps you see why elements are missing.
-
+    console.log("Step: find invited tab");
     const invited = page.locator("text=/invited me/i").first();
     const invitedVisible = await invited.isVisible().catch(() => false);
+    console.log("Invited visible:", invitedVisible);
+
     if (!invitedVisible) {
       await dumpDebugState(page, "invited-missing", {});
       throw new Error("Could not find Invited me tab");
@@ -664,8 +634,12 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await sleep(1200);
     await dumpDebugState(page, "after-invited", {});
 
+    console.log("Step: find code input");
     const codeBox = page.locator('input[placeholder*="order code" i], input[placeholder*="Please enter" i]').first();
-    if (!(await codeBox.isVisible().catch(() => false))) {
+    const codeVisible = await codeBox.isVisible().catch(() => false);
+    console.log("Code input visible:", codeVisible);
+
+    if (!codeVisible) {
       await dumpDebugState(page, "code-box-missing", {});
       throw new Error("Order code input not found");
     }
@@ -675,8 +649,12 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await sleep(600);
     await dumpDebugState(page, "after-code", { codeLength: String(orderCode || "").length });
 
+    console.log("Step: find confirm button");
     const confirmBtn = page.getByRole("button", { name: /confirm/i }).first();
-    if (!(await confirmBtn.isVisible().catch(() => false))) {
+    const confirmVisible = await confirmBtn.isVisible().catch(() => false);
+    console.log("Confirm visible:", confirmVisible);
+
+    if (!confirmVisible) {
       await dumpDebugState(page, "confirm-missing", {});
       throw new Error("Confirm button not found");
     }
@@ -684,76 +662,18 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await confirmBtn.click({ timeout: 10000 });
     await sleep(1500);
     await dumpDebugState(page, "after-confirm", {});
-
-    // Do not assume a specific popup.
-    // We only record state for you to inspect in debug outputs.
-    // Success/failure validation should be based on what you observe in the UI.
-    await dumpDebugState(page, "post-confirm-state", {});
+    console.log("Step: confirm clicked");
   } finally {
     await context.close().catch(() => null);
     await browser.close().catch(() => null);
   }
 }
 
-function sanitize(s) {
-  return String(s || "")
-    .replaceAll("@", "_at_")
-    .replaceAll(".", "_")
-    .replaceAll("/", "_")
-    .replaceAll("\\", "_")
-    .slice(0, 80);
-}
-
-// --------------------
-// Run report UI
-// --------------------
-function renderRunReport(report) {
-  const rows = report.accounts
-    .map((a, idx) => `
-      <tr>
-        <td>${idx + 1}</td>
-        <td>${escapeHtml(a.username)}</td>
-        <td>${a.completed ? "YES" : "NO"}</td>
-        <td>${a.siteUsed ? escapeHtml(a.siteUsed) : "--"}</td>
-        <td>${a.error ? `<span style="color:red">${escapeHtml(a.error)}</span>` : "--"}</td>
-      </tr>
-    `)
-    .join("");
-
-  const refresh = report.status.includes("Running") ? `<meta http-equiv="refresh" content="3">` : "";
-
-  return `
-    ${refresh}
-    <h2>Run Started</h2>
-    <div><b>Run ID:</b> ${escapeHtml(report.id)}</div>
-    <div><b>Started:</b> ${escapeHtml(report.started)}</div>
-    <div><b>Code length:</b> ${report.codeLength}</div>
-    <div><b>Debug capture:</b> ${DEBUG_CAPTURE ? "ON" : "OFF"}</div>
-    <hr/>
-    <h3>Accounts</h3>
-    <table border="1" cellpadding="8" cellspacing="0">
-      <thead>
-        <tr><th>#</th><th>Username</th><th>Completed</th><th>Site used</th><th>Error</th></tr>
-      </thead>
-      <tbody>${rows}</tbody>
-    </table>
-
-    <p><b>Status:</b> ${escapeHtml(report.status)}</p>
-
-    <div>
-      <a href="/?p=${encodeURIComponent(BOT_PASSWORD)}">Back to home</a>
-      | <a href="/health">Health</a>
-      | <a href="/last-shot?p=${encodeURIComponent(BOT_PASSWORD)}">Last screenshot</a>
-      | <a href="/debug?p=${encodeURIComponent(BOT_PASSWORD)}">Debug</a>
-      | <a href="/dns-test?p=${encodeURIComponent(BOT_PASSWORD)}">DNS test</a>
-      | <a href="/net-test?p=${encodeURIComponent(BOT_PASSWORD)}">Net test</a>
-      | <a href="/run/${escapeHtml(report.id)}?p=${encodeURIComponent(BOT_PASSWORD)}">Permalink</a>
-    </div>
-  `;
-}
-
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Starting Container");
   console.log("Listening on", PORT);
+  console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
+  console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
   writePlaceholderLastShot();
 });
+
