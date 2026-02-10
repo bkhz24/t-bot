@@ -5,6 +5,8 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const dns = require("dns").promises;
+const net = require("net");
+const tls = require("tls");
 const { chromium } = require("playwright");
 
 const PORT = process.env.PORT || 8080;
@@ -29,7 +31,7 @@ function envTruthy(v) {
 }
 
 const EMAIL_ENABLED = envTruthy(process.env.EMAIL_ENABLED || "1");
-const EMAIL_SMTP_HOST = process.env.EMAIL_SMTP_HOST || ""; // e.g. smtp.sendgrid.net
+const EMAIL_SMTP_HOST = process.env.EMAIL_SMTP_HOST || ""; // SendGrid: smtp.sendgrid.net
 const EMAIL_SMTP_PORT = Number(process.env.EMAIL_SMTP_PORT || "587"); // 587 or 2525 recommended
 const EMAIL_SMTP_SECURE = envTruthy(process.env.EMAIL_SMTP_SECURE || "false"); // true for 465
 const EMAIL_SMTP_USER = process.env.EMAIL_SMTP_USER || ""; // SendGrid: "apikey"
@@ -119,7 +121,7 @@ function safeJsonParseAccounts() {
 }
 
 // --------------------
-// Email helper (SendGrid SMTP) with hard timeouts (prevents hangs)
+// Email helper (SendGrid SMTP) with hard timeouts
 // --------------------
 function emailConfigured() {
   return !!(
@@ -160,9 +162,14 @@ function getEmailTransport() {
       auth: { user: EMAIL_SMTP_USER, pass: EMAIL_SMTP_PASS },
 
       // Prevent long hangs on Railway
-      connectionTimeout: 10_000,
-      greetingTimeout: 10_000,
-      socketTimeout: 15_000
+      connectionTimeout: 12_000,
+      greetingTimeout: 12_000,
+      socketTimeout: 18_000,
+
+      // Helps with some TLS setups
+      tls: {
+        servername: EMAIL_SMTP_HOST
+      }
     });
 
     return emailTransport;
@@ -189,7 +196,7 @@ async function sendEmail(subject, text) {
   const toList = parseEmailToList(EMAIL_TO);
   const payload = { from: EMAIL_FROM, to: toList, subject, text };
 
-  const hardTimeoutMs = 15_000;
+  const hardTimeoutMs = 18_000;
 
   try {
     const info = await Promise.race([
@@ -207,6 +214,88 @@ async function sendEmail(subject, text) {
   }
 }
 
+// Raw SMTP connectivity test (no credentials, just networking)
+async function smtpConnectivityTest() {
+  const host = EMAIL_SMTP_HOST;
+  const port = EMAIL_SMTP_PORT;
+  const secure = EMAIL_SMTP_SECURE;
+
+  const result = {
+    host,
+    port,
+    secure,
+    dns: null,
+    tcpConnect: null,
+    tlsHandshake: null
+  };
+
+  // DNS
+  try {
+    const addrs = await dns.lookup(host, { all: true });
+    result.dns = { ok: true, addrs };
+  } catch (e) {
+    result.dns = { ok: false, error: e && e.message ? e.message : String(e) };
+    return result;
+  }
+
+  // TCP connect
+  result.tcpConnect = await new Promise((resolve) => {
+    const socket = net.createConnection({ host, port });
+    const timer = setTimeout(() => {
+      socket.destroy();
+      resolve({ ok: false, error: "TCP connect timeout" });
+    }, 8000);
+
+    socket.on("connect", () => {
+      clearTimeout(timer);
+      socket.end();
+      resolve({ ok: true });
+    });
+
+    socket.on("error", (err) => {
+      clearTimeout(timer);
+      resolve({ ok: false, error: err && err.message ? err.message : String(err) });
+    });
+  });
+
+  if (!result.tcpConnect.ok) return result;
+
+  // TLS handshake check if secure=true (465)
+  if (secure) {
+    result.tlsHandshake = await new Promise((resolve) => {
+      const socket = tls.connect(
+        {
+          host,
+          port,
+          servername: host
+        },
+        () => {
+          socket.end();
+          resolve({ ok: true, authorized: socket.authorized, authorizationError: socket.authorizationError || null });
+        }
+      );
+
+      const timer = setTimeout(() => {
+        socket.destroy();
+        resolve({ ok: false, error: "TLS handshake timeout" });
+      }, 8000);
+
+      socket.on("error", (err) => {
+        clearTimeout(timer);
+        resolve({ ok: false, error: err && err.message ? err.message : String(err) });
+      });
+
+      socket.on("secureConnect", () => {
+        clearTimeout(timer);
+      });
+    });
+  } else {
+    result.tlsHandshake = { ok: true, skipped: true, reason: "secure=false (STARTTLS ports like 587/2525)" };
+  }
+
+  return result;
+}
+
 // --------------------
 // Twilio helper (optional)
 // --------------------
@@ -217,7 +306,7 @@ let smsLibraryError = null;
 function initTwilioOnce() {
   if (twilioClient || smsLibraryOk || smsLibraryError) return;
   try {
-    const twilio = requiresrequire("twilio");
+    const twilio = require("twilio");
     smsLibraryOk = true;
     if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
       twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
@@ -400,6 +489,7 @@ app.get("/", (req, res) => {
       | DNS test: <a href="/dns-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/dns-test</a>
       | Net test: <a href="/net-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/net-test</a>
       | Email test: <a href="/email-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/email-test</a>
+      | SMTP test: <a href="/smtp-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/smtp-test</a>
     </div>
   `);
 });
@@ -420,6 +510,9 @@ app.get("/health", (req, res) => {
     smsLibraryOk,
     smsLibraryError,
     emailConfigured: emailConfigured(),
+    emailHost: EMAIL_SMTP_HOST,
+    emailPort: EMAIL_SMTP_PORT,
+    emailSecure: EMAIL_SMTP_SECURE,
     debugCapture: DEBUG_CAPTURE,
     lastDebugDir,
     loginUrls: LOGIN_URLS
@@ -435,6 +528,14 @@ app.get("/email-test", async (req, res) => {
   );
 
   res.json({ ok: true, emailConfigured: emailConfigured(), result });
+});
+
+app.get("/smtp-test", async (req, res) => {
+  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
+  if (!EMAIL_SMTP_HOST || !EMAIL_SMTP_PORT) return res.status(400).json({ ok: false, error: "EMAIL_SMTP_HOST/PORT not set" });
+
+  const result = await smtpConnectivityTest();
+  res.json({ ok: true, result });
 });
 
 app.get("/last-shot", (req, res) => {
@@ -497,6 +598,7 @@ app.get("/dns-test", async (req, res) => {
     "bgol.pro",
     "dsj89.com",
     "dsj72.com",
+    "smtp.sendgrid.net",
     "api.bgol.pro",
     "api.dsj89.com",
     "api.dsj72.com",
@@ -575,6 +677,7 @@ app.post("/run", async (req, res) => {
       console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
       console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
       console.log("Email configured:", emailConfigured());
+      console.log("Email host/port/secure:", EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, EMAIL_SMTP_SECURE);
 
       console.log("About to send START email...");
       const startEmailRes = await sendEmail(
@@ -640,7 +743,7 @@ app.post("/run", async (req, res) => {
 });
 
 // --------------------
-// Playwright core
+// Playwright core (unchanged behavior)
 // --------------------
 async function runAccountAllSites(account, orderCode) {
   let last = null;
@@ -806,5 +909,6 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
   console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
   console.log("Email configured:", emailConfigured());
+  console.log("Email host/port/secure:", EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, EMAIL_SMTP_SECURE);
   writePlaceholderLastShot();
 });
