@@ -7,9 +7,6 @@ const path = require("path");
 const dns = require("dns").promises;
 const { chromium } = require("playwright");
 
-// Email (SMTP)
-const nodemailer = require("nodemailer");
-
 const PORT = process.env.PORT || 8080;
 
 // Support both BOT_PASSWORD and RUN_PASSWORD
@@ -32,13 +29,13 @@ function envTruthy(v) {
 }
 
 const EMAIL_ENABLED = envTruthy(process.env.EMAIL_ENABLED || "1");
-const EMAIL_SMTP_HOST = process.env.EMAIL_SMTP_HOST || "";
-const EMAIL_SMTP_PORT = Number(process.env.EMAIL_SMTP_PORT || "587");
+const EMAIL_SMTP_HOST = process.env.EMAIL_SMTP_HOST || ""; // e.g. smtp.sendgrid.net
+const EMAIL_SMTP_PORT = Number(process.env.EMAIL_SMTP_PORT || "587"); // 587 or 2525 recommended
 const EMAIL_SMTP_SECURE = envTruthy(process.env.EMAIL_SMTP_SECURE || "false"); // true for 465
-const EMAIL_SMTP_USER = process.env.EMAIL_SMTP_USER || "";
-const EMAIL_SMTP_PASS = process.env.EMAIL_SMTP_PASS || "";
+const EMAIL_SMTP_USER = process.env.EMAIL_SMTP_USER || ""; // SendGrid: "apikey"
+const EMAIL_SMTP_PASS = process.env.EMAIL_SMTP_PASS || ""; // SendGrid API key
 const EMAIL_FROM = process.env.EMAIL_FROM || "";
-const EMAIL_TO = process.env.EMAIL_TO || "";
+const EMAIL_TO = process.env.EMAIL_TO || ""; // can be comma-separated
 
 // Neutral debug capture
 const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE || "0");
@@ -122,7 +119,7 @@ function safeJsonParseAccounts() {
 }
 
 // --------------------
-// Email helper
+// Email helper (SendGrid SMTP) with hard timeouts (prevents hangs)
 // --------------------
 function emailConfigured() {
   return !!(
@@ -136,43 +133,77 @@ function emailConfigured() {
   );
 }
 
+function parseEmailToList(raw) {
+  return String(raw || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+let emailInitTried = false;
+let emailInitError = null;
 let emailTransport = null;
+
 function getEmailTransport() {
   if (!emailConfigured()) return null;
   if (emailTransport) return emailTransport;
+  if (emailInitTried) return null;
 
-  emailTransport = nodemailer.createTransport({
-    host: EMAIL_SMTP_HOST,
-    port: EMAIL_SMTP_PORT,
-    secure: EMAIL_SMTP_SECURE,
-    auth: {
-      user: EMAIL_SMTP_USER,
-      pass: EMAIL_SMTP_PASS
-    }
-  });
+  emailInitTried = true;
+  try {
+    const nodemailer = require("nodemailer");
 
-  return emailTransport;
+    emailTransport = nodemailer.createTransport({
+      host: EMAIL_SMTP_HOST,
+      port: EMAIL_SMTP_PORT,
+      secure: EMAIL_SMTP_SECURE,
+      auth: { user: EMAIL_SMTP_USER, pass: EMAIL_SMTP_PASS },
+
+      // Prevent long hangs on Railway
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 15_000
+    });
+
+    return emailTransport;
+  } catch (e) {
+    emailInitError = e && e.message ? e.message : String(e);
+    emailTransport = null;
+    return null;
+  }
 }
 
 async function sendEmail(subject, text) {
-  const t = getEmailTransport();
-  if (!t) {
+  if (!emailConfigured()) {
     console.log("Email not configured, skipping send.");
-    return null;
+    return { ok: false, skipped: true, error: "Email not configured" };
   }
 
+  const t = getEmailTransport();
+  if (!t) {
+    const err = emailInitError || "Email transport init failed";
+    console.log("Email init failed:", err);
+    return { ok: false, skipped: false, error: err };
+  }
+
+  const toList = parseEmailToList(EMAIL_TO);
+  const payload = { from: EMAIL_FROM, to: toList, subject, text };
+
+  const hardTimeoutMs = 15_000;
+
   try {
-    const info = await t.sendMail({
-      from: EMAIL_FROM,
-      to: EMAIL_TO,
-      subject,
-      text
-    });
-    console.log("Email sent:", info && info.messageId ? info.messageId : "(no messageId)");
-    return info && info.messageId ? info.messageId : "sent";
+    const info = await Promise.race([
+      t.sendMail(payload),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Email send timed out")), hardTimeoutMs))
+    ]);
+
+    const messageId = info && info.messageId ? info.messageId : "(no messageId)";
+    console.log("Email sent:", messageId, "|", subject);
+    return { ok: true, skipped: false, error: null, messageId };
   } catch (e) {
-    console.log("Email failed:", e.message || String(e));
-    return null;
+    const msg = e && e.message ? e.message : String(e);
+    console.log("Email failed:", msg, "|", subject);
+    return { ok: false, skipped: false, error: msg };
   }
 }
 
@@ -186,7 +217,7 @@ let smsLibraryError = null;
 function initTwilioOnce() {
   if (twilioClient || smsLibraryOk || smsLibraryError) return;
   try {
-    const twilio = require("twilio");
+    const twilio = requiresrequire("twilio");
     smsLibraryOk = true;
     if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
       twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
@@ -286,16 +317,18 @@ async function dumpDebugState(page, tag, extra = {}) {
     } catch {}
 
     try {
-      const ls = await page.evaluate(() => {
-        const out = {};
-        try {
-          for (let i = 0; i < localStorage.length; i++) {
-            const k = localStorage.key(i);
-            out[k] = localStorage.getItem(k);
-          }
-        } catch {}
-        return out;
-      }).catch(() => ({}));
+      const ls = await page
+        .evaluate(() => {
+          const out = {};
+          try {
+            for (let i = 0; i < localStorage.length; i++) {
+              const k = localStorage.key(i);
+              out[k] = localStorage.getItem(k);
+            }
+          } catch {}
+          return out;
+        })
+        .catch(() => ({}));
       fs.writeFileSync(`${base}.localstorage.json`, JSON.stringify(ls, null, 2));
     } catch {}
 
@@ -395,11 +428,13 @@ app.get("/health", (req, res) => {
 
 app.get("/email-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-  await sendEmail(
+
+  const result = await sendEmail(
     "T-Bot email test",
     `Email test sent at ${nowLocal()}\n\nIf you received this, SendGrid SMTP is set up correctly.`
   );
-  res.send("OK: Email attempted (or email not configured).");
+
+  res.json({ ok: true, emailConfigured: emailConfigured(), result });
 });
 
 app.get("/last-shot", (req, res) => {
@@ -474,7 +509,7 @@ app.get("/dns-test", async (req, res) => {
       const addrs = await dns.lookup(h, { all: true });
       out[h] = { ok: true, addrs };
     } catch (e) {
-      out[h] = { ok: false, error: (e && e.message) ? e.message : String(e) };
+      out[h] = { ok: false, error: e && e.message ? e.message : String(e) };
     }
   }
   res.json(out);
@@ -483,11 +518,7 @@ app.get("/dns-test", async (req, res) => {
 app.get("/net-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
-  const urls = [
-    "https://bgol.pro/",
-    "https://dsj89.com/",
-    "https://dsj72.com/"
-  ];
+  const urls = ["https://bgol.pro/", "https://dsj89.com/", "https://dsj72.com/"];
 
   const results = {};
   for (const u of urls) {
@@ -496,7 +527,7 @@ app.get("/net-test", async (req, res) => {
       const text = await r.text();
       results[u] = { ok: true, status: r.status, bodyPreview: text.slice(0, 240) };
     } catch (e) {
-      results[u] = { ok: false, error: (e && e.message) ? e.message : String(e) };
+      results[u] = { ok: false, error: e && e.message ? e.message : String(e) };
     }
   }
   res.json(results);
@@ -545,10 +576,12 @@ app.post("/run", async (req, res) => {
       console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
       console.log("Email configured:", emailConfigured());
 
-      await sendEmail(
+      console.log("About to send START email...");
+      const startEmailRes = await sendEmail(
         `${subjectPrefix} started`,
         `T-Bot started at ${startedAt}\nRun ID: ${lastRunId}\nAccounts: ${cfg.accounts.length}\nDebug capture: ${DEBUG_CAPTURE ? "ON" : "OFF"}`
       );
+      console.log("START email result:", startEmailRes);
 
       await sendSMS(`T-Bot started at ${startedAt}`);
 
@@ -575,10 +608,12 @@ app.post("/run", async (req, res) => {
         return `FAIL: ${r.username} (${r.error})`;
       });
 
-      await sendEmail(
+      console.log("About to send FINISH email...");
+      const finishEmailRes = await sendEmail(
         `${subjectPrefix} ${anyFailed ? "finished with failures" : "completed"}`,
         `T-Bot finished at ${finishedAt}\nRun ID: ${lastRunId}\n\nResults:\n${summaryLines.join("\n")}\n`
       );
+      console.log("FINISH email result:", finishEmailRes);
 
       await sendSMS(anyFailed ? `T-Bot finished with failures at ${finishedAt}` : `T-Bot completed at ${finishedAt}`);
 
@@ -588,10 +623,13 @@ app.post("/run", async (req, res) => {
       lastError = msg;
 
       const failedAt = nowLocal();
-      await sendEmail(
+
+      console.log("About to send FAILED email...");
+      const failEmailRes = await sendEmail(
         `${subjectPrefix} FAILED`,
         `T-Bot failed at ${failedAt}\nRun ID: ${lastRunId}\nError: ${msg}\n`
       );
+      console.log("FAILED email result:", failEmailRes);
 
       await sendSMS(`T-Bot failed at ${failedAt}: ${msg}`);
       console.log("Run failed:", msg);
@@ -629,9 +667,8 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
   });
 
-  const harPath = DEBUG_CAPTURE && lastDebugDir
-    ? path.join(lastDebugDir, `har-${sanitize(account.username)}-${Date.now()}.har`)
-    : null;
+  const harPath =
+    DEBUG_CAPTURE && lastDebugDir ? path.join(lastDebugDir, `har-${sanitize(account.username)}-${Date.now()}.har`) : null;
 
   const context = await browser.newContext({
     viewport: { width: 1280, height: 720 },
@@ -644,7 +681,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
   page.on("requestfailed", (req) => {
     const f = req.failure();
-    const errText = (f && f.errorText) ? f.errorText : "unknown";
+    const errText = f && f.errorText ? f.errorText : "unknown";
     if (req.url().includes("/api/")) console.log("REQUEST FAILED:", req.url(), "=>", errText);
   });
 
@@ -657,22 +694,22 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
   });
 
   try {
-    await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await sleep(1200);
     await dumpDebugState(page, "after-goto", { loginUrl, username: account.username });
 
     const userField = page.locator('input[type="email"], input[type="text"]').first();
     const passField = page.locator('input[type="password"]').first();
 
-    await userField.waitFor({ timeout: 20000 });
-    await passField.waitFor({ timeout: 20000 });
+    await userField.waitFor({ timeout: 20_000 });
+    await passField.waitFor({ timeout: 20_000 });
 
     let loggedIn = false;
 
     for (let attempt = 1; attempt <= 6; attempt++) {
       console.log("Login attempt", attempt, "for", account.username, "on", loginUrl);
 
-      await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
       await sleep(1200);
 
       await userField.fill("");
@@ -688,7 +725,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
       const loginBtn = page.getByRole("button", { name: /login/i }).first();
       if (await loginBtn.isVisible().catch(() => false)) {
-        await loginBtn.click({ timeout: 10000 });
+        await loginBtn.click({ timeout: 10_000 });
       } else {
         await passField.press("Enter");
       }
@@ -698,7 +735,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
       const fu = futuresUrlFromLoginUrl(loginUrl);
       if (fu) {
-        await page.goto(fu, { waitUntil: "domcontentloaded", timeout: 60000 });
+        await page.goto(fu, { waitUntil: "domcontentloaded", timeout: 60_000 });
         await sleep(1500);
         await dumpDebugState(page, "after-futures-direct", { futuresUrl: fu });
 
@@ -723,7 +760,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     const futuresUrl = futuresUrlFromLoginUrl(loginUrl);
     if (!futuresUrl) throw new Error("Could not build Futures URL from login URL");
 
-    await page.goto(futuresUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await page.goto(futuresUrl, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await sleep(1500);
     await dumpDebugState(page, "after-futures", { futuresUrl });
 
@@ -733,7 +770,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       throw new Error("Could not find Invited me tab");
     }
 
-    await invited.click({ timeout: 10000 }).catch(() => null);
+    await invited.click({ timeout: 10_000 }).catch(() => null);
     await sleep(1200);
     await dumpDebugState(page, "after-invited", {});
 
@@ -754,7 +791,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       throw new Error("Confirm button not found");
     }
 
-    await confirmBtn.click({ timeout: 10000 });
+    await confirmBtn.click({ timeout: 10_000 });
     await sleep(1500);
     await dumpDebugState(page, "after-confirm", {});
   } finally {
