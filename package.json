@@ -8,9 +8,9 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@sendgrid/mail": "^8.1.4",
     "express": "^4.19.2",
-    "nodemailer": "^6.9.15",
-    "playwright": "^1.58.1",
+    "playwright": "1.58.1",
     "twilio": "^5.3.4"
   }
 }
