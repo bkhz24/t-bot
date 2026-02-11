@@ -6,7 +6,10 @@ const sgMail = require("@sendgrid/mail");
 
 const PORT = process.env.PORT || 8080;
 
+// Required
 const BOT_PASSWORD = process.env.BOT_PASSWORD || "";
+
+// SendGrid
 const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || "";
 const EMAIL_FROM = process.env.EMAIL_FROM || "";
 const EMAIL_TO = process.env.EMAIL_TO || "";
@@ -31,8 +34,11 @@ function initSendGrid() {
 }
 
 async function sendEmail(subject, text) {
-  if (!EMAIL_ENABLED) return { ok: false, skipped: true, error: "EMAIL_ENABLED is off" };
-  if (!emailConfigured()) return { ok: false, skipped: true, error: "Email not configured" };
+  if (!EMAIL_ENABLED)
+    return { ok: false, skipped: true, error: "EMAIL_ENABLED is off" };
+
+  if (!emailConfigured())
+    return { ok: false, skipped: true, error: "Email not configured" };
 
   initSendGrid();
 
@@ -45,17 +51,28 @@ async function sendEmail(subject, text) {
     };
 
     await sgMail.send(msg);
+
+    console.log("Email sent:", subject);
     return { ok: true, skipped: false, error: null };
   } catch (e) {
-    const msg = (e && e.response && e.response.body)
-      ? JSON.stringify(e.response.body)
-      : (e && e.message ? e.message : String(e));
+    const err =
+      e && e.response && e.response.body
+        ? JSON.stringify(e.response.body)
+        : e && e.message
+        ? e.message
+        : String(e);
 
-    return { ok: false, skipped: false, error: msg };
+    console.log("Email failed:", err, "|", subject);
+
+    return { ok: false, skipped: false, error: err };
   }
 }
 
 const app = express();
+
+app.get("/", (req, res) => {
+  res.send("T-Bot is running");
+});
 
 app.get("/health", (req, res) => {
   res.json({
@@ -69,10 +86,11 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/email-test", async (req, res) => {
-  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
+  if (!authOk(req))
+    return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
   const runId = crypto.randomBytes(6).toString("hex");
-  const subject = `Email test ${runId}`;
+  const subject = `T-Bot Email Test ${runId}`;
   const text = `SendGrid email test at ${nowLocal()}\nRun ID: ${runId}\n`;
 
   const result = await sendEmail(subject, text);
@@ -84,8 +102,17 @@ app.get("/email-test", async (req, res) => {
   });
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("Starting Container");
-  console.log("Listening on", PORT);
-  console.log("Email configured:", emailConfigured());
-});
+app.get("/run-test", async (req, res) => {
+  if (!authOk(req))
+    return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
+
+  const runId = crypto.randomBytes(6).toString("hex");
+  const started = nowLocal();
+
+  console.log("Bot started");
+  console.log("Run ID:", runId);
+
+  console.log("About to send START email...");
+  const startResult = await sendEmail(
+    `T-Bot Run ${runId} started`,
+
