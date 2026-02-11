@@ -115,4 +115,32 @@ app.get("/run-test", async (req, res) => {
   console.log("About to send START email...");
   const startResult = await sendEmail(
     `T-Bot Run ${runId} started`,
+    `T-Bot started at ${started}\nRun ID: ${runId}\n`
+  );
+  console.log("START email result:", startResult);
 
+  // Simulate bot work
+  await new Promise(r => setTimeout(r, 3000));
+
+  const finished = nowLocal();
+
+  console.log("About to send FINISH email...");
+  const finishResult = await sendEmail(
+    `T-Bot Run ${runId} completed`,
+    `T-Bot finished at ${finished}\nRun ID: ${runId}\n`
+  );
+  console.log("FINISH email result:", finishResult);
+
+  res.json({
+    ok: true,
+    runId,
+    startResult,
+    finishResult
+  });
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("Starting Container");
+  console.log("Listening on", PORT);
+  console.log("Email configured:", emailConfigured());
+});
