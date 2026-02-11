@@ -7,8 +7,8 @@ const path = require("path");
 const dns = require("dns").promises;
 const { chromium } = require("playwright");
 
-// SendGrid Web API (HTTPS)
-const sgMail = require("@sendgrid/mail");
+// Email (SMTP)
+const nodemailer = require("nodemailer");
 
 const PORT = process.env.PORT || 8080;
 
@@ -25,35 +25,25 @@ const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_FROM = process.env.TWILIO_FROM || "";
 const TWILIO_TO = process.env.TWILIO_TO || "";
 
-// Email config
+// Email config (SendGrid SMTP)
 function envTruthy(v) {
   const s = (v || "").toString().trim().toLowerCase();
   return s === "1" || s === "true" || s === "yes" || s === "on";
 }
 
 const EMAIL_ENABLED = envTruthy(process.env.EMAIL_ENABLED || "1");
-
-// Choose provider:
-// - sendgrid (recommended): HTTPS API, works on Railway
-// - smtp (kept only for completeness, but likely blocked on Railway)
-const EMAIL_PROVIDER = (process.env.EMAIL_PROVIDER || "sendgrid").toString().trim().toLowerCase();
-
-const EMAIL_FROM = process.env.EMAIL_FROM || "";
-const EMAIL_TO = process.env.EMAIL_TO || "";
-const EMAIL_SUBJECT_PREFIX = (process.env.EMAIL_SUBJECT_PREFIX || "T-Bot").toString();
-
-// SendGrid API
-const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || "";
-
-// SMTP (optional fallback if your host allows SMTP)
 const EMAIL_SMTP_HOST = process.env.EMAIL_SMTP_HOST || "";
 const EMAIL_SMTP_PORT = Number(process.env.EMAIL_SMTP_PORT || "587");
 const EMAIL_SMTP_SECURE = envTruthy(process.env.EMAIL_SMTP_SECURE || "false"); // true for 465
 const EMAIL_SMTP_USER = process.env.EMAIL_SMTP_USER || "";
 const EMAIL_SMTP_PASS = process.env.EMAIL_SMTP_PASS || "";
+const EMAIL_FROM = process.env.EMAIL_FROM || "";
+const EMAIL_TO = process.env.EMAIL_TO || "";
 
-// Neutral debug capture
+// Neutral debug capture + log bundle
 const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE || "0");
+const DIAG_LOG_BUNDLE = envTruthy(process.env.DIAG_LOG_BUNDLE || "1"); // log diagnostic bundles to console by default
+const DIAG_HTML_SNIPPET_CHARS = Number(process.env.DIAG_HTML_SNIPPET_CHARS || "2000");
 
 // --------------------
 // Login URLs
@@ -137,74 +127,57 @@ function safeJsonParseAccounts() {
 // Email helper
 // --------------------
 function emailConfigured() {
-  if (!EMAIL_ENABLED) return false;
-  if (!EMAIL_FROM || !EMAIL_TO) return false;
-
-  if (EMAIL_PROVIDER === "sendgrid") {
-    return !!SENDGRID_API_KEY;
-  }
-
-  // smtp fallback
   return !!(
+    EMAIL_ENABLED &&
     EMAIL_SMTP_HOST &&
     EMAIL_SMTP_PORT &&
     EMAIL_SMTP_USER &&
-    EMAIL_SMTP_PASS
+    EMAIL_SMTP_PASS &&
+    EMAIL_FROM &&
+    EMAIL_TO
   );
 }
 
+let emailTransport = null;
+function getEmailTransport() {
+  if (!emailConfigured()) return null;
+  if (emailTransport) return emailTransport;
+
+  emailTransport = nodemailer.createTransport({
+    host: EMAIL_SMTP_HOST,
+    port: EMAIL_SMTP_PORT,
+    secure: EMAIL_SMTP_SECURE,
+    auth: {
+      user: EMAIL_SMTP_USER,
+      pass: EMAIL_SMTP_PASS
+    },
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 20000
+  });
+
+  return emailTransport;
+}
+
 async function sendEmail(subject, text) {
-  if (!EMAIL_ENABLED) return { ok: false, skipped: true, error: "EMAIL_ENABLED is off" };
-  if (!EMAIL_FROM || !EMAIL_TO) return { ok: false, skipped: false, error: "EMAIL_FROM or EMAIL_TO missing" };
-
-  const fullSubject = `${EMAIL_SUBJECT_PREFIX} | ${subject}`;
-
-  if (EMAIL_PROVIDER === "sendgrid") {
-    if (!SENDGRID_API_KEY) return { ok: false, skipped: false, error: "SENDGRID_API_KEY missing" };
-
-    try {
-      sgMail.setApiKey(SENDGRID_API_KEY);
-
-      await sgMail.send({
-        to: EMAIL_TO,
-        from: EMAIL_FROM,
-        subject: fullSubject,
-        text
-      });
-
-      console.log("Email sent via SendGrid API:", fullSubject);
-      return { ok: true, skipped: false };
-    } catch (e) {
-      const msg = (e && e.message) ? e.message : String(e);
-      console.log("Email failed (SendGrid API):", msg, "|", fullSubject);
-      return { ok: false, skipped: false, error: msg };
-    }
+  const t = getEmailTransport();
+  if (!t) {
+    console.log("Email not configured, skipping send.");
+    return { ok: false, skipped: true, error: "not_configured" };
   }
 
-  // SMTP fallback (likely blocked on Railway)
   try {
-    // Lazy require so you can keep this file working even if you remove nodemailer later
-    const nodemailer = require("nodemailer");
-    const t = nodemailer.createTransport({
-      host: EMAIL_SMTP_HOST,
-      port: EMAIL_SMTP_PORT,
-      secure: EMAIL_SMTP_SECURE,
-      auth: { user: EMAIL_SMTP_USER, pass: EMAIL_SMTP_PASS }
-    });
-
-    await t.sendMail({
+    const info = await t.sendMail({
       from: EMAIL_FROM,
       to: EMAIL_TO,
-      subject: fullSubject,
+      subject,
       text
     });
-
-    console.log("Email sent via SMTP:", fullSubject);
-    return { ok: true, skipped: false };
+    console.log("Email sent:", info && info.messageId ? info.messageId : "(no messageId)");
+    return { ok: true, skipped: false, messageId: info && info.messageId ? info.messageId : null };
   } catch (e) {
-    const msg = (e && e.message) ? e.message : String(e);
-    console.log("Email failed (SMTP):", msg, "|", fullSubject);
-    return { ok: false, skipped: false, error: msg };
+    console.log("Email failed:", (e && e.message) ? e.message : String(e), "|", subject);
+    return { ok: false, skipped: false, error: (e && e.message) ? e.message : String(e) };
   }
 }
 
@@ -359,6 +332,108 @@ function sanitize(s) {
 }
 
 // --------------------
+// Diagnostic log bundle (neutral)
+// --------------------
+function createDiagCollector() {
+  const consoleErrors = [];
+  const requestFails = [];
+
+  function pushBounded(arr, item, max = 30) {
+    arr.push(item);
+    if (arr.length > max) arr.shift();
+  }
+
+  return {
+    consoleErrors,
+    requestFails,
+    onConsole(msg) {
+      if (msg.type() === "error") pushBounded(consoleErrors, msg.text());
+    },
+    onRequestFailed(req) {
+      const f = req.failure();
+      const errText = (f && f.errorText) ? f.errorText : "unknown";
+      pushBounded(requestFails, { url: req.url(), errorText: errText });
+    }
+  };
+}
+
+async function logDiagBundle(page, tag, collector, extra = {}) {
+  if (!DIAG_LOG_BUNDLE) return;
+
+  try {
+    const url = page.url();
+    const title = await page.title().catch(() => "");
+
+    const domSummary = await page.evaluate(() => {
+      const textOf = (el) => (el && (el.innerText || el.textContent) ? (el.innerText || el.textContent).trim() : "");
+      const visible = (el) => {
+        if (!el) return false;
+        const st = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return st && st.visibility !== "hidden" && st.display !== "none" && rect.width > 0 && rect.height > 0;
+      };
+
+      const buttons = Array.from(document.querySelectorAll("button, [role='button'], input[type='button'], input[type='submit']"))
+        .filter(visible)
+        .slice(0, 12)
+        .map((el) => textOf(el).slice(0, 80))
+        .filter(Boolean);
+
+      const inputs = Array.from(document.querySelectorAll("input"))
+        .slice(0, 12)
+        .map((el) => ({
+          type: el.getAttribute("type") || "",
+          placeholder: (el.getAttribute("placeholder") || "").slice(0, 80),
+          name: (el.getAttribute("name") || "").slice(0, 40),
+          id: (el.getAttribute("id") || "").slice(0, 40),
+          disabled: !!el.disabled
+        }));
+
+      const modalText = Array.from(document.querySelectorAll("[role='dialog'], .modal, .ant-modal, .el-dialog, .van-dialog, .popup, .toast"))
+        .filter(visible)
+        .slice(0, 3)
+        .map((el) => textOf(el).slice(0, 240))
+        .filter(Boolean);
+
+      // Probe confirm candidates (does not click, just counts)
+      const confirmCandidates = Array.from(document.querySelectorAll("button, [role='button'], a"))
+        .map((el) => ({ el, t: textOf(el).toLowerCase() }))
+        .filter((x) => x.t.includes("confirm"))
+        .slice(0, 10)
+        .map((x) => ({
+          text: textOf(x.el).slice(0, 80),
+          disabled: !!x.el.disabled,
+          visible: visible(x.el)
+        }));
+
+      return { buttons, inputs, modalText, confirmCandidates };
+    }).catch(() => null);
+
+    const htmlSnippet = await page.content()
+      .then((h) => (h || "").slice(0, DIAG_HTML_SNIPPET_CHARS))
+      .catch(() => "");
+
+    const payload = {
+      tag,
+      at: new Date().toISOString(),
+      url,
+      title,
+      domSummary,
+      consoleErrors: collector ? collector.consoleErrors : [],
+      requestFails: collector ? collector.requestFails : [],
+      extra,
+      htmlSnippet
+    };
+
+    console.log("=== DIAG_BUNDLE_START ===");
+    console.log(JSON.stringify(payload, null, 2));
+    console.log("=== DIAG_BUNDLE_END ===");
+  } catch (e) {
+    console.log("logDiagBundle failed:", (e && e.message) ? e.message : String(e));
+  }
+}
+
+// --------------------
 // Express app
 // --------------------
 const app = express();
@@ -374,10 +449,10 @@ app.get("/", (req, res) => {
     <h2>T-Bot</h2>
     <div>Running: <b>${isRunning ? "YES" : "NO"}</b></div>
     <div>Last run: ${lastRunAt ? escapeHtml(lastRunAt) : "-"}</div>
-    <div>Debug capture: <b>${DEBUG_CAPTURE ? "ON" : "OFF"}</b></div>
+    <div>DEBUG_CAPTURE: <b>${DEBUG_CAPTURE ? "ON" : "OFF"}</b></div>
+    <div>DIAG_LOG_BUNDLE: <b>${DIAG_LOG_BUNDLE ? "ON" : "OFF"}</b></div>
     <div>LOGIN_URLS: <code>${escapeHtml(LOGIN_URLS.join(", "))}</code></div>
     <div>Email configured: <b>${emailConfigured() ? "YES" : "NO"}</b></div>
-    <div>Email provider: <b>${escapeHtml(EMAIL_PROVIDER)}</b></div>
 
     <div style="color:red; margin-top:10px;">
       ${pwMissing ? "BOT_PASSWORD or RUN_PASSWORD not set<br/>" : ""}
@@ -420,8 +495,8 @@ app.get("/health", (req, res) => {
     smsLibraryOk,
     smsLibraryError,
     emailConfigured: emailConfigured(),
-    emailProvider: EMAIL_PROVIDER,
     debugCapture: DEBUG_CAPTURE,
+    diagLogBundle: DIAG_LOG_BUNDLE,
     lastDebugDir,
     loginUrls: LOGIN_URLS
   });
@@ -429,14 +504,11 @@ app.get("/health", (req, res) => {
 
 app.get("/email-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-
   const result = await sendEmail(
-    "email test",
-    `Email test sent at ${nowLocal()}\n\nIf you received this, email is set up correctly.\nProvider: ${EMAIL_PROVIDER}\n`
+    "T-Bot email test",
+    `Email test sent at ${nowLocal()}\n\nIf you received this, SMTP is set up correctly.`
   );
-
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.send(JSON.stringify({ ok: true, attempted: true, result }, null, 2));
+  res.json({ ok: true, attempted: true, result });
 });
 
 app.get("/last-shot", (req, res) => {
@@ -499,7 +571,10 @@ app.get("/dns-test", async (req, res) => {
     "bgol.pro",
     "dsj89.com",
     "dsj72.com",
-    "smtp.sendgrid.net"
+    "api.bgol.pro",
+    "api.dsj89.com",
+    "api.dsj72.com",
+    "api.ddjea.com"
   ];
 
   const out = {};
@@ -520,18 +595,13 @@ app.get("/net-test", async (req, res) => {
   const urls = [
     "https://bgol.pro/",
     "https://dsj89.com/",
-    "https://dsj72.com/",
-    "https://api.sendgrid.com/v3/user/profile"
+    "https://dsj72.com/"
   ];
 
   const results = {};
   for (const u of urls) {
     try {
-      const headers = {};
-      if (u.includes("api.sendgrid.com") && SENDGRID_API_KEY) {
-        headers["Authorization"] = `Bearer ${SENDGRID_API_KEY}`;
-      }
-      const r = await fetch(u, { method: "GET", headers });
+      const r = await fetch(u, { method: "GET" });
       const text = await r.text();
       results[u] = { ok: true, status: r.status, bodyPreview: text.slice(0, 240) };
     } catch (e) {
@@ -569,11 +639,11 @@ app.post("/run", async (req, res) => {
   writePlaceholderLastShot();
 
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  res.send("Run started. Check logs, /health, and /debug if enabled.");
+  res.send("Run started. Watch Railway logs. Copy/paste any DIAG_BUNDLE blocks back here.");
 
   (async () => {
     const startedAt = nowLocal();
-    const runLabel = `Run ${lastRunId}`;
+    const subjectPrefix = `T-Bot Run ${lastRunId}`;
 
     try {
       console.log("Bot started");
@@ -581,16 +651,16 @@ app.post("/run", async (req, res) => {
       console.log("Accounts loaded:", cfg.accounts.length);
       console.log("Code received length:", code.length);
       console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
+      console.log("DIAG_LOG_BUNDLE:", DIAG_LOG_BUNDLE);
       console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
-      console.log("Email provider:", EMAIL_PROVIDER);
       console.log("Email configured:", emailConfigured());
 
       console.log("About to send START email...");
-      const startEmailRes = await sendEmail(
-        `${runLabel} started`,
-        `T-Bot started at ${startedAt}\nRun ID: ${lastRunId}\nAccounts: ${cfg.accounts.length}\nDebug capture: ${DEBUG_CAPTURE ? "ON" : "OFF"}\nProvider: ${EMAIL_PROVIDER}\n`
+      const startEmail = await sendEmail(
+        `${subjectPrefix} started`,
+        `T-Bot started at ${startedAt}\nRun ID: ${lastRunId}\nAccounts: ${cfg.accounts.length}\nDebug capture: ${DEBUG_CAPTURE ? "ON" : "OFF"}\nDiag log bundle: ${DIAG_LOG_BUNDLE ? "ON" : "OFF"}\n`
       );
-      console.log("START email result:", startEmailRes);
+      console.log("START email result:", startEmail);
 
       await sendSMS(`T-Bot started at ${startedAt}`);
 
@@ -618,11 +688,11 @@ app.post("/run", async (req, res) => {
       });
 
       console.log("About to send FINISH email...");
-      const finishEmailRes = await sendEmail(
-        `${runLabel} ${anyFailed ? "finished with failures" : "completed"}`,
+      const finishEmail = await sendEmail(
+        `${subjectPrefix} ${anyFailed ? "finished with failures" : "completed"}`,
         `T-Bot finished at ${finishedAt}\nRun ID: ${lastRunId}\n\nResults:\n${summaryLines.join("\n")}\n`
       );
-      console.log("FINISH email result:", finishEmailRes);
+      console.log("FINISH email result:", finishEmail);
 
       await sendSMS(anyFailed ? `T-Bot finished with failures at ${finishedAt}` : `T-Bot completed at ${finishedAt}`);
 
@@ -632,12 +702,12 @@ app.post("/run", async (req, res) => {
       lastError = msg;
 
       const failedAt = nowLocal();
-      console.log("About to send FAILED email...");
-      const failEmailRes = await sendEmail(
-        `Run ${lastRunId} FAILED`,
+      console.log("About to send FAIL email...");
+      const failEmail = await sendEmail(
+        `${subjectPrefix} FAILED`,
         `T-Bot failed at ${failedAt}\nRun ID: ${lastRunId}\nError: ${msg}\n`
       );
-      console.log("FAILED email result:", failEmailRes);
+      console.log("FAIL email result:", failEmail);
 
       await sendSMS(`T-Bot failed at ${failedAt}: ${msg}`);
       console.log("Run failed:", msg);
@@ -688,13 +758,17 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
   const page = await context.newPage();
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
 
+  const diag = createDiagCollector();
+
   page.on("requestfailed", (req) => {
+    diag.onRequestFailed(req);
     const f = req.failure();
     const errText = (f && f.errorText) ? f.errorText : "unknown";
     if (req.url().includes("/api/")) console.log("REQUEST FAILED:", req.url(), "=>", errText);
   });
 
   page.on("console", (msg) => {
+    diag.onConsole(msg);
     if (msg.type() === "error") console.log("PAGE CONSOLE: error", msg.text());
   });
 
@@ -706,12 +780,19 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await sleep(1200);
     await dumpDebugState(page, "after-goto", { loginUrl, username: account.username });
+    await logDiagBundle(page, "after-goto", diag, { loginUrl, username: account.username });
 
     const userField = page.locator('input[type="email"], input[type="text"]').first();
     const passField = page.locator('input[type="password"]').first();
 
-    await userField.waitFor({ timeout: 20000 });
-    await passField.waitFor({ timeout: 20000 });
+    try {
+      await userField.waitFor({ timeout: 20000 });
+      await passField.waitFor({ timeout: 20000 });
+    } catch (e) {
+      await dumpDebugState(page, "login-fields-missing", { loginUrl });
+      await logDiagBundle(page, "login-fields-missing", diag, { loginUrl, error: (e && e.message) ? e.message : String(e) });
+      throw e;
+    }
 
     let loggedIn = false;
 
@@ -741,12 +822,14 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
       await sleep(1800);
       await dumpDebugState(page, `after-login-attempt-${attempt}`, { attempt });
+      await logDiagBundle(page, `after-login-attempt-${attempt}`, diag, { attempt });
 
       const fu = futuresUrlFromLoginUrl(loginUrl);
       if (fu) {
         await page.goto(fu, { waitUntil: "domcontentloaded", timeout: 60000 });
         await sleep(1500);
         await dumpDebugState(page, "after-futures-direct", { futuresUrl: fu });
+        await logDiagBundle(page, "after-futures-direct", diag, { futuresUrl: fu });
 
         const hasInvitedTab = await page.locator("text=/invited me/i").first().isVisible().catch(() => false);
         const hasPositionOrder = await page.locator("text=Position order").first().isVisible().catch(() => false);
@@ -763,6 +846,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
     if (!loggedIn) {
       await dumpDebugState(page, "login-failed", { loginUrl });
+      await logDiagBundle(page, "login-failed", diag, { loginUrl });
       throw new Error("Login failed");
     }
 
@@ -772,20 +856,24 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await page.goto(futuresUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await sleep(1500);
     await dumpDebugState(page, "after-futures", { futuresUrl });
+    await logDiagBundle(page, "after-futures", diag, { futuresUrl });
 
     const invited = page.locator("text=/invited me/i").first();
     if (!(await invited.isVisible().catch(() => false))) {
       await dumpDebugState(page, "invited-missing", {});
+      await logDiagBundle(page, "invited-missing", diag, {});
       throw new Error("Could not find Invited me tab");
     }
 
     await invited.click({ timeout: 10000 }).catch(() => null);
     await sleep(1200);
     await dumpDebugState(page, "after-invited", {});
+    await logDiagBundle(page, "after-invited", diag, {});
 
     const codeBox = page.locator('input[placeholder*="order code" i], input[placeholder*="Please enter" i]').first();
     if (!(await codeBox.isVisible().catch(() => false))) {
       await dumpDebugState(page, "code-box-missing", {});
+      await logDiagBundle(page, "code-box-missing", diag, {});
       throw new Error("Order code input not found");
     }
 
@@ -793,16 +881,19 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await codeBox.fill(orderCode);
     await sleep(600);
     await dumpDebugState(page, "after-code", { codeLength: String(orderCode || "").length });
+    await logDiagBundle(page, "after-code", diag, { codeLength: String(orderCode || "").length });
 
     const confirmBtn = page.getByRole("button", { name: /confirm/i }).first();
     if (!(await confirmBtn.isVisible().catch(() => false))) {
       await dumpDebugState(page, "confirm-missing", {});
+      await logDiagBundle(page, "confirm-missing", diag, {});
       throw new Error("Confirm button not found");
     }
 
     await confirmBtn.click({ timeout: 10000 });
     await sleep(1500);
     await dumpDebugState(page, "after-confirm", {});
+    await logDiagBundle(page, "after-confirm", diag, {});
   } finally {
     await context.close().catch(() => null);
     await browser.close().catch(() => null);
@@ -811,10 +902,15 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Starting Container");
-  console.log("Listening on", PORT);
+  console.log("Listening on", reminded(), PORT);
+});
+
+function reminded() {
+  // Avoids accidental em dash usage. Also keeps logs consistent.
   console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
+  console.log("DIAG_LOG_BUNDLE:", DIAG_LOG_BUNDLE);
   console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
   console.log("Email configured:", emailConfigured());
-  console.log("Email provider:", EMAIL_PROVIDER);
   writePlaceholderLastShot();
-});
+  return "";
+}
