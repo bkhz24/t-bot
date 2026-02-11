@@ -5,7 +5,6 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const dns = require("dns").promises;
-const { chromium } = require("playwright");
 
 const PORT = process.env.PORT || 8080;
 
@@ -16,100 +15,15 @@ const ACCOUNTS_JSON = process.env.ACCOUNTS_JSON || "";
 // Optional: LOGIN_URLS override from Railway (comma-separated)
 const LOGIN_URLS_ENV = process.env.LOGIN_URLS || "";
 
-// Neutral debug capture
+// --------------------
+// Helpers
+// --------------------
 function envTruthy(v) {
   const s = (v || "").toString().trim().toLowerCase();
   return s === "1" || s === "true" || s === "yes" || s === "on";
 }
+
 const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE || "0");
-
-// --------------------
-// Email config (SendGrid Web API)
-// --------------------
-const EMAIL_ENABLED = envTruthy(process.env.EMAIL_ENABLED || "1");
-const EMAIL_PROVIDER = (process.env.EMAIL_PROVIDER || "sendgrid").toString().trim().toLowerCase();
-
-const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || "";
-const EMAIL_FROM = (process.env.EMAIL_FROM || "").toString().trim(); // MUST match verified sender email exactly
-const EMAIL_FROM_NAME = (process.env.EMAIL_FROM_NAME || "T-Bot").toString().trim();
-const EMAIL_TO = (process.env.EMAIL_TO || "").toString().trim();
-
-function emailConfigured() {
-  if (!EMAIL_ENABLED) return false;
-  if (EMAIL_PROVIDER !== "sendgrid") return false;
-  return !!(SENDGRID_API_KEY && EMAIL_FROM && EMAIL_TO);
-}
-
-async function sendEmail(subject, text) {
-  const cfgOk = emailConfigured();
-  if (!cfgOk) {
-    console.log("Email not configured, skipping send.");
-    return { ok: false, skipped: true, error: "Email not configured" };
-  }
-
-  try {
-    // Lazy require so deploy still works even if package changes
-    const sgMail = require("@sendgrid/mail");
-    sgMail.setApiKey(SENDGRID_API_KEY);
-
-    const msg = {
-      to: EMAIL_TO,
-      from: { email: EMAIL_FROM, name: EMAIL_FROM_NAME },
-      subject,
-      text
-    };
-
-    const [res] = await sgMail.send(msg);
-    const status = res && res.statusCode ? res.statusCode : null;
-    const msgId =
-      (res && res.headers && (res.headers["x-message-id"] || res.headers["X-Message-Id"])) || null;
-
-    console.log("Email sent:", { status, msgId });
-    return { ok: true, skipped: false, status, msgId };
-  } catch (e) {
-    // SendGrid errors often include response.body.errors
-    const body = e && e.response && e.response.body ? e.response.body : null;
-    const errText = body ? JSON.stringify(body) : (e && e.message ? e.message : String(e));
-    console.log("Email failed (SendGrid API):", errText, "|", subject);
-    return { ok: false, skipped: false, error: errText };
-  }
-}
-
-// --------------------
-// Login URLs
-// --------------------
-function parseLoginUrls() {
-  const fallback = [
-    "https://bgol.pro/pc/#/login",
-    "https://dsj89.com/pc/#/login",
-    "https://dsj72.com/pc/#/login"
-  ];
-
-  const raw = (LOGIN_URLS_ENV || "").trim();
-  if (!raw) return fallback;
-
-  const list = raw
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean);
-
-  return list.length ? list : fallback;
-}
-
-const LOGIN_URLS = parseLoginUrls();
-
-// After login, go straight to the Futures trading page
-function futuresUrlFromLoginUrl(loginUrl) {
-  try {
-    const u = new URL(loginUrl);
-    const base = `${u.protocol}//${u.host}`;
-    const isPc = loginUrl.includes("/pc/#/");
-    const prefix = isPc ? "/pc/#/" : "/h5/#/";
-    return `${base}${prefix}contractTransaction`;
-  } catch {
-    return null;
-  }
-}
 
 function nowLocal() {
   return new Date().toLocaleString("en-US", { timeZoneName: "short" });
@@ -155,14 +69,113 @@ function safeJsonParseAccounts() {
 }
 
 // --------------------
-// Run state
+// Safe Playwright loader
 // --------------------
-let isRunning = false;
-let lastRunAt = null;
-let lastError = null;
+let chromium = null;
+let playwrightOk = false;
+let playwrightError = null;
 
+function loadPlaywrightOnce() {
+  if (playwrightOk || playwrightError) return;
+  try {
+    const pw = require("playwright");
+    chromium = pw.chromium;
+    playwrightOk = true;
+  } catch (e) {
+    playwrightOk = false;
+    playwrightError = e && e.message ? e.message : String(e);
+  }
+}
+
+// --------------------
+// Email config (SendGrid Web API)
+// --------------------
+const EMAIL_ENABLED = envTruthy(process.env.EMAIL_ENABLED || "1");
+const EMAIL_PROVIDER = (process.env.EMAIL_PROVIDER || "sendgrid").toString().trim().toLowerCase();
+
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || "";
+const EMAIL_FROM = (process.env.EMAIL_FROM || "").toString().trim(); // must match verified sender email exactly
+const EMAIL_FROM_NAME = (process.env.EMAIL_FROM_NAME || "T-Bot").toString().trim();
+const EMAIL_TO = (process.env.EMAIL_TO || "").toString().trim();
+
+function emailConfigured() {
+  if (!EMAIL_ENABLED) return false;
+  if (EMAIL_PROVIDER !== "sendgrid") return false;
+  return !!(SENDGRID_API_KEY && EMAIL_FROM && EMAIL_TO);
+}
+
+async function sendEmail(subject, text) {
+  const cfgOk = emailConfigured();
+  if (!cfgOk) {
+    console.log("Email not configured, skipping send.");
+    return { ok: false, skipped: true, error: "Email not configured" };
+  }
+
+  try {
+    const sgMail = require("@sendgrid/mail");
+    sgMail.setApiKey(SENDGRID_API_KEY);
+
+    const msg = {
+      to: EMAIL_TO,
+      from: { email: EMAIL_FROM, name: EMAIL_FROM_NAME },
+      subject,
+      text
+    };
+
+    const [res] = await sgMail.send(msg);
+    const status = res && res.statusCode ? res.statusCode : null;
+    const msgId =
+      (res && res.headers && (res.headers["x-message-id"] || res.headers["X-Message-Id"])) || null;
+
+    console.log("Email sent:", { status, msgId });
+    return { ok: true, skipped: false, status, msgId };
+  } catch (e) {
+    const body = e && e.response && e.response.body ? e.response.body : null;
+    const errText = body ? JSON.stringify(body) : e && e.message ? e.message : String(e);
+    console.log("Email failed (SendGrid API):", errText, "|", subject);
+    return { ok: false, skipped: false, error: errText };
+  }
+}
+
+// --------------------
+// Login URLs
+// --------------------
+function parseLoginUrls() {
+  const fallback = [
+    "https://bgol.pro/pc/#/login",
+    "https://dsj89.com/pc/#/login",
+    "https://dsj72.com/pc/#/login"
+  ];
+
+  const raw = (LOGIN_URLS_ENV || "").trim();
+  if (!raw) return fallback;
+
+  const list = raw
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+
+  return list.length ? list : fallback;
+}
+
+const LOGIN_URLS = parseLoginUrls();
+
+function futuresUrlFromLoginUrl(loginUrl) {
+  try {
+    const u = new URL(loginUrl);
+    const base = `${u.protocol}//${u.host}`;
+    const isPc = loginUrl.includes("/pc/#/");
+    const prefix = isPc ? "/pc/#/" : "/h5/#/";
+    return `${base}${prefix}contractTransaction`;
+  } catch {
+    return null;
+  }
+}
+
+// --------------------
+// Debug capture
+// --------------------
 let lastShotPath = null;
-let lastRunId = null;
 let lastDebugDir = null;
 
 function ensureDir(dir) {
@@ -267,6 +280,14 @@ function sanitize(s) {
 }
 
 // --------------------
+// Run state
+// --------------------
+let isRunning = false;
+let lastRunAt = null;
+let lastError = null;
+let lastRunId = null;
+
+// --------------------
 // Express app
 // --------------------
 const app = express();
@@ -277,6 +298,8 @@ app.get("/", (req, res) => {
   const pwMissing = !BOT_PASSWORD;
   const accountsMissing = !cfg.ok;
 
+  loadPlaywrightOnce();
+
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`
     <h2>T-Bot</h2>
@@ -286,6 +309,8 @@ app.get("/", (req, res) => {
     <div>LOGIN_URLS: <code>${escapeHtml(LOGIN_URLS.join(", "))}</code></div>
     <div>Email configured: <b>${emailConfigured() ? "YES" : "NO"}</b></div>
     <div>Email provider: <b>${escapeHtml(EMAIL_PROVIDER)}</b></div>
+    <div>Playwright: <b>${playwrightOk ? "OK" : "MISSING"}</b></div>
+    ${playwrightOk ? "" : `<div style="color:red;">Playwright error: ${escapeHtml(playwrightError || "")}</div>`}
 
     <div style="color:red; margin-top:10px;">
       ${pwMissing ? "BOT_PASSWORD or RUN_PASSWORD not set<br/>" : ""}
@@ -314,6 +339,7 @@ app.get("/", (req, res) => {
 
 app.get("/health", (req, res) => {
   const cfg = safeJsonParseAccounts();
+  loadPlaywrightOnce();
 
   res.json({
     ok: true,
@@ -327,7 +353,9 @@ app.get("/health", (req, res) => {
     emailProvider: EMAIL_PROVIDER,
     debugCapture: DEBUG_CAPTURE,
     lastDebugDir,
-    loginUrls: LOGIN_URLS
+    loginUrls: LOGIN_URLS,
+    playwrightOk,
+    playwrightError
   });
 });
 
@@ -336,21 +364,10 @@ app.get("/email-test", async (req, res) => {
 
   const result = await sendEmail(
     "T-Bot | email test",
-    `Email test sent at ${nowLocal()}\n\nIf you received this, SendGrid Web API is set up correctly.\n\nFrom: ${EMAIL_FROM}\nTo: ${EMAIL_TO}\n`
+    `Email test sent at ${nowLocal()}\n\nFrom: ${EMAIL_FROM}\nTo: ${EMAIL_TO}\n`
   );
 
-  res.json({
-    ok: true,
-    attempted: true,
-    config: {
-      enabled: EMAIL_ENABLED,
-      provider: EMAIL_PROVIDER,
-      configured: emailConfigured(),
-      from: EMAIL_FROM,
-      to: EMAIL_TO
-    },
-    result
-  });
+  res.json({ ok: true, attempted: true, result });
 });
 
 app.get("/last-shot", (req, res) => {
@@ -381,12 +398,7 @@ app.get("/debug", (req, res) => {
 
   const files = safeListDir(lastDebugDir);
   const links = files
-    .map(
-      (f) =>
-        `<li><a href="/debug/files?p=${encodeURIComponent(BOT_PASSWORD)}&f=${encodeURIComponent(f)}">${escapeHtml(
-          f
-        )}</a></li>`
-    )
+    .map((f) => `<li><a href="/debug/files?p=${encodeURIComponent(BOT_PASSWORD)}&f=${encodeURIComponent(f)}">${escapeHtml(f)}</a></li>`)
     .join("");
 
   res.send(`
@@ -468,6 +480,13 @@ app.post("/run", async (req, res) => {
   if (!code) return res.status(400).send("No code provided.");
   if (isRunning) return res.send("Bot is already running. Please wait.");
 
+  loadPlaywrightOnce();
+  if (!playwrightOk || !chromium) {
+    return res
+      .status(500)
+      .send(`Playwright is not available in this deployment. Fix dependencies. Error: ${playwrightError || ""}`);
+  }
+
   isRunning = true;
   lastError = null;
   lastRunAt = nowLocal();
@@ -508,33 +527,18 @@ app.post("/run", async (req, res) => {
       );
       console.log("START email result:", startEmailRes);
 
-      const results = [];
-
       for (const account of cfg.accounts) {
         console.log("----");
         console.log("Account:", account.username);
-        try {
-          const used = await runAccountAllSites(account, code);
-          results.push({ username: account.username, ok: true, site: used });
-        } catch (e) {
-          const msg = e && e.message ? e.message : String(e);
-          results.push({ username: account.username, ok: false, error: msg });
-          lastError = `Account failed ${account.username}: ${msg}`;
-        }
+        await runAccountAllSites(account, code);
       }
 
       const finishedAt = nowLocal();
-      const anyFailed = results.some((r) => !r.ok);
-
-      const summaryLines = results.map((r) => {
-        if (r.ok) return `OK: ${r.username} (${r.site})`;
-        return `FAIL: ${r.username} (${r.error})`;
-      });
 
       console.log("About to send FINISH email...");
       const finishEmailRes = await sendEmail(
-        `${subjectPrefix} ${anyFailed ? "finished with failures" : "completed"}`,
-        `T-Bot finished at ${finishedAt}\nRun ID: ${lastRunId}\n\nResults:\n${summaryLines.join("\n")}\n`
+        `${subjectPrefix} completed`,
+        `T-Bot finished at ${finishedAt}\nRun ID: ${lastRunId}\n`
       );
       console.log("FINISH email result:", finishEmailRes);
 
@@ -716,7 +720,12 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
   }
 }
 
+// --------------------
+// Startup
+// --------------------
 app.listen(PORT, "0.0.0.0", () => {
+  loadPlaywrightOnce();
+
   console.log("Starting Container");
   console.log("Listening on", PORT);
   console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
@@ -724,5 +733,7 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("Email provider:", EMAIL_PROVIDER);
   console.log("Email configured:", emailConfigured());
   console.log("Email from/to:", EMAIL_FROM, EMAIL_TO);
+  console.log("Playwright:", playwrightOk ? "OK" : "MISSING");
+  if (!playwrightOk) console.log("Playwright error:", playwrightError);
   writePlaceholderLastShot();
 });
