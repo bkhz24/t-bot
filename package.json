@@ -1,5 +1,5 @@
 {
-  "name": "t-bot",
+  "name": "sendgrid-email-test",
   "version": "1.0.0",
   "private": true,
   "main": "index.js",
@@ -9,8 +9,6 @@
   },
   "dependencies": {
     "@sendgrid/mail": "^8.1.4",
-    "express": "^4.19.2",
-    "playwright": "1.58.1",
-    "twilio": "^5.3.4"
+    "express": "^4.19.2"
   }
 }
