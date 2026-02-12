@@ -23,16 +23,15 @@ function envTruthy(v) {
   const s = (v || "").toString().trim().toLowerCase();
   return s === "1" || s === "true" || s === "yes" || s === "on";
 }
-function envInt(name, def) {
-  const n = Number(process.env[name]);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : def;
-}
+
 function nowLocal() {
   return new Date().toLocaleString("en-US", { timeZoneName: "short" });
 }
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
+
 function escapeHtml(s) {
   return String(s)
     .replaceAll("&", "&amp;")
@@ -41,10 +40,12 @@ function escapeHtml(s) {
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
 }
+
 function authOk(req) {
   const p = (req.query.p || "").toString();
   return !!BOT_PASSWORD && p === BOT_PASSWORD;
 }
+
 function sanitize(s) {
   return String(s || "")
     .replaceAll("@", "_at_")
@@ -54,20 +55,8 @@ function sanitize(s) {
     .slice(0, 80);
 }
 
-// --------------------
-// Tunables via Railway
-// --------------------
+// Neutral debug capture
 const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE || "0");
-
-// Login flow tuning (Railway)
-const LOGIN_ATTEMPTS = envInt("LOGIN_ATTEMPTS", 6); // per site
-const WAIT_AFTER_GOTO_MS = envInt("WAIT_AFTER_GOTO_MS", 1200);
-const WAIT_AFTER_LOGIN_MS = envInt("WAIT_AFTER_LOGIN_MS", 1800);
-const WAIT_AFTER_FUTURES_DIRECT_MS = envInt("WAIT_AFTER_FUTURES_DIRECT_MS", 1500);
-const WAIT_AFTER_FUTURES_MS = envInt("WAIT_AFTER_FUTURES_MS", 1500);
-const WAIT_AFTER_INVITED_MS = envInt("WAIT_AFTER_INVITED_MS", 1200);
-const CONFIRM_WAIT_MS = envInt("CONFIRM_WAIT_MS", 1500); // wait after clicking Confirm
-const POST_CONFIRM_WAIT_MS = envInt("POST_CONFIRM_WAIT_MS", 1500); // extra wait after confirm
 
 // --------------------
 // Email config (SendGrid Web API)
@@ -76,15 +65,20 @@ const EMAIL_ENABLED = envTruthy(process.env.EMAIL_ENABLED || "1");
 const EMAIL_PROVIDER = (process.env.EMAIL_PROVIDER || "sendgrid").toString().trim().toLowerCase();
 
 const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || "";
-const EMAIL_FROM = (process.env.EMAIL_FROM || "").toString().trim(); // verified sender
+const EMAIL_FROM = (process.env.EMAIL_FROM || "").toString().trim(); // must match verified sender
 const EMAIL_FROM_NAME = (process.env.EMAIL_FROM_NAME || "T-Bot").toString().trim();
 const EMAIL_TO = (process.env.EMAIL_TO || "").toString().trim();
 
-// Email behavior toggles (Railway)
-const EMAIL_ONLY_ON_FAILURE = envTruthy(process.env.EMAIL_ONLY_ON_FAILURE || "0"); // if 1, suppress start/finish
-const EMAIL_ON_START = envTruthy(process.env.EMAIL_ON_START || "1");
-const EMAIL_ON_FINISH = envTruthy(process.env.EMAIL_ON_FINISH || "1");
-const EMAIL_ALERT_ON_ACCOUNT_FAIL = envTruthy(process.env.EMAIL_ALERT_ON_ACCOUNT_FAIL || "0"); // one email per account, after all sites fail
+// Alert controls
+const EMAIL_ACCOUNT_FAIL_ALERTS = envTruthy(process.env.EMAIL_ACCOUNT_FAIL_ALERTS || "1");
+const EMAIL_MAX_FAIL_ALERTS = Number(process.env.EMAIL_MAX_FAIL_ALERTS || "2");
+
+// Verification controls
+const VERIFY_TOAST = envTruthy(process.env.VERIFY_TOAST || "1");
+const VERIFY_PENDING = envTruthy(process.env.VERIFY_PENDING || "1");
+const VERIFY_TIMEOUT_MS = Number(process.env.VERIFY_TIMEOUT_MS || "12000");
+const CONFIRM_RETRIES = Number(process.env.CONFIRM_RETRIES || "3");
+const CONFIRM_RETRY_DELAY_MS = Number(process.env.CONFIRM_RETRY_DELAY_MS || "1500");
 
 function emailConfigured() {
   if (!EMAIL_ENABLED) return false;
@@ -161,10 +155,14 @@ function futuresUrlFromLoginUrl(loginUrl) {
 }
 
 function safeJsonParseAccounts() {
-  if (!ACCOUNTS_JSON) return { ok: false, accounts: [], error: "ACCOUNTS_JSON not set" };
+  if (!ACCOUNTS_JSON) {
+    return { ok: false, accounts: [], error: "ACCOUNTS_JSON not set" };
+  }
   try {
     const parsed = JSON.parse(ACCOUNTS_JSON);
-    if (!Array.isArray(parsed)) return { ok: false, accounts: [], error: "ACCOUNTS_JSON must be a JSON array" };
+    if (!Array.isArray(parsed)) {
+      return { ok: false, accounts: [], error: "ACCOUNTS_JSON must be a JSON array" };
+    }
     const cleaned = parsed.map((a) => ({
       username: (a.username || "").trim(),
       password: String(a.password || "")
@@ -265,6 +263,77 @@ function safeListDir(dir) {
 }
 
 // --------------------
+// Confirmation gates
+// --------------------
+async function waitForToastOrModal(page) {
+  if (!VERIFY_TOAST) return { ok: false, type: "toast_off", detail: "VERIFY_TOAST disabled" };
+
+  const patterns = [
+    /already followed/i,
+    /followed the order/i,
+    /success/i,
+    /successful/i,
+    /completed/i,
+    /confirm success/i
+  ];
+
+  const start = Date.now();
+  while (Date.now() - start < VERIFY_TIMEOUT_MS) {
+    for (const re of patterns) {
+      const loc = page.locator(`text=${re.source}`).first();
+      const visible = await loc.isVisible().catch(() => false);
+      if (visible) {
+        const txt = await loc.textContent().catch(() => "");
+        return { ok: true, type: "toast", detail: (txt || "").trim().slice(0, 160) || re.toString() };
+      }
+    }
+    await sleep(300);
+  }
+
+  return { ok: false, type: "toast_timeout", detail: "No confirmation toast/modal found" };
+}
+
+async function verifyPendingInPositionOrder(page) {
+  if (!VERIFY_PENDING) return { ok: false, type: "pending_off", detail: "VERIFY_PENDING disabled" };
+
+  const tab = page.locator("text=/position order/i").first();
+  const canClick = await tab.isVisible().catch(() => false);
+  if (canClick) {
+    await tab.click({ timeout: 8000 }).catch(() => null);
+    await sleep(1200);
+  }
+
+  const pending = page.locator("text=/pending/i").first();
+  const start = Date.now();
+  while (Date.now() - start < VERIFY_TIMEOUT_MS) {
+    const ok = await pending.isVisible().catch(() => false);
+    if (ok) {
+      return { ok: true, type: "pending", detail: "Pending found in Position order" };
+    }
+    await sleep(350);
+  }
+
+  return { ok: false, type: "pending_timeout", detail: "No Pending found in Position order" };
+}
+
+async function verifyOrderFollowed(page) {
+  // Gate A: toast/modal
+  const toastRes = await waitForToastOrModal(page);
+
+  // Gate B: pending in position order
+  const pendingRes = await verifyPendingInPositionOrder(page);
+
+  if (toastRes.ok && pendingRes.ok) return { ok: true, detail: "toast and pending seen" };
+  if (toastRes.ok) return { ok: true, detail: `toast seen (${toastRes.detail})` };
+  if (pendingRes.ok) return { ok: true, detail: "pending seen" };
+
+  return {
+    ok: false,
+    detail: `No confirmation. Toast: ${toastRes.type}. Pending: ${pendingRes.type}.`
+  };
+}
+
+// --------------------
 // Express app
 // --------------------
 const app = express();
@@ -284,6 +353,9 @@ app.get("/", (req, res) => {
     <div>LOGIN_URLS: <code>${escapeHtml(LOGIN_URLS.join(", "))}</code></div>
     <div>Email configured: <b>${emailConfigured() ? "YES" : "NO"}</b></div>
     <div>Email provider: <b>${escapeHtml(EMAIL_PROVIDER)}</b></div>
+    <div>Verify toast: <b>${VERIFY_TOAST ? "ON" : "OFF"}</b></div>
+    <div>Verify pending: <b>${VERIFY_PENDING ? "ON" : "OFF"}</b></div>
+    <div>Confirm retries: <b>${CONFIRM_RETRIES}</b></div>
 
     <div style="color:red; margin-top:10px;">
       ${pwMissing ? "BOT_PASSWORD or RUN_PASSWORD not set<br/>" : ""}
@@ -312,6 +384,7 @@ app.get("/", (req, res) => {
 
 app.get("/health", (req, res) => {
   const cfg = safeJsonParseAccounts();
+
   res.json({
     ok: true,
     running: isRunning,
@@ -325,21 +398,12 @@ app.get("/health", (req, res) => {
     debugCapture: DEBUG_CAPTURE,
     lastDebugDir,
     loginUrls: LOGIN_URLS,
-    tunables: {
-      LOGIN_ATTEMPTS,
-      WAIT_AFTER_GOTO_MS,
-      WAIT_AFTER_LOGIN_MS,
-      WAIT_AFTER_FUTURES_DIRECT_MS,
-      WAIT_AFTER_FUTURES_MS,
-      WAIT_AFTER_INVITED_MS,
-      CONFIRM_WAIT_MS,
-      POST_CONFIRM_WAIT_MS
-    },
-    emailOptions: {
-      EMAIL_ONLY_ON_FAILURE,
-      EMAIL_ON_START,
-      EMAIL_ON_FINISH,
-      EMAIL_ALERT_ON_ACCOUNT_FAIL
+    verify: {
+      toast: VERIFY_TOAST,
+      pending: VERIFY_PENDING,
+      timeoutMs: VERIFY_TIMEOUT_MS,
+      confirmRetries: CONFIRM_RETRIES,
+      confirmRetryDelayMs: CONFIRM_RETRY_DELAY_MS
     }
   });
 });
@@ -349,7 +413,7 @@ app.get("/email-test", async (req, res) => {
 
   const result = await sendEmail(
     "T-Bot | email test",
-    `Email test sent at ${nowLocal()}\nFrom: ${EMAIL_FROM}\nTo: ${EMAIL_TO}\n`
+    `Email test sent at ${nowLocal()}\n\nIf you received this, SendGrid Web API is set up correctly.\n\nFrom: ${EMAIL_FROM}\nTo: ${EMAIL_TO}\n`
   );
 
   res.json({
@@ -394,7 +458,12 @@ app.get("/debug", (req, res) => {
 
   const files = safeListDir(lastDebugDir);
   const links = files
-    .map((f) => `<li><a href="/debug/files?p=${encodeURIComponent(BOT_PASSWORD)}&f=${encodeURIComponent(f)}">${escapeHtml(f)}</a></li>`)
+    .map(
+      (f) =>
+        `<li><a href="/debug/files?p=${encodeURIComponent(BOT_PASSWORD)}&f=${encodeURIComponent(f)}">${escapeHtml(
+          f
+        )}</a></li>`
+    )
     .join("");
 
   res.send(`
@@ -421,6 +490,7 @@ app.get("/debug/files", (req, res) => {
 
 app.get("/dns-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
+
   const hosts = [
     "bgol.pro",
     "dsj89.com",
@@ -448,6 +518,7 @@ app.get("/net-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
   const urls = ["https://bgol.pro/", "https://dsj89.com/", "https://dsj72.com/", "https://api.sendgrid.com/"];
+
   const results = {};
   for (const u of urls) {
     try {
@@ -494,7 +565,8 @@ app.post("/run", async (req, res) => {
   (async () => {
     const startedAt = nowLocal();
     const subjectPrefix = `T-Bot | Run ${lastRunId}`;
-    const results = [];
+
+    let failAlertsSent = 0;
 
     try {
       console.log("Bot started");
@@ -503,29 +575,17 @@ app.post("/run", async (req, res) => {
       console.log("Code received length:", code.length);
       console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
       console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
+      console.log("Email provider:", EMAIL_PROVIDER);
       console.log("Email configured:", emailConfigured());
-      console.log("Email options:", {
-        EMAIL_ONLY_ON_FAILURE,
-        EMAIL_ON_START,
-        EMAIL_ON_FINISH,
-        EMAIL_ALERT_ON_ACCOUNT_FAIL
-      });
 
-      if (!EMAIL_ONLY_ON_FAILURE && EMAIL_ON_START) {
-        console.log("About to send START email...");
-        const startEmailRes = await sendEmail(
-          `${subjectPrefix} started`,
-          [
-            `T-Bot started at ${startedAt}`,
-            `Run ID: ${lastRunId}`,
-            `Accounts: ${cfg.accounts.length}`,
-            `Debug capture: ${DEBUG_CAPTURE ? "ON" : "OFF"}`,
-            "",
-            "You will get a completion email with per-account results."
-          ].join("\n")
-        );
-        console.log("START email result:", startEmailRes);
-      }
+      await sendEmail(
+        `${subjectPrefix} started`,
+        `T-Bot started at ${startedAt}\nRun ID: ${lastRunId}\nAccounts: ${cfg.accounts.length}\nDebug capture: ${
+          DEBUG_CAPTURE ? "ON" : "OFF"
+        }\n\nYou will get a completion email with per-account results.\n`
+      );
+
+      const results = [];
 
       for (const account of cfg.accounts) {
         console.log("----");
@@ -533,54 +593,39 @@ app.post("/run", async (req, res) => {
 
         try {
           const used = await runAccountAllSites(account, code);
-          results.push({ username: account.username, ok: true, site: used });
+          results.push({ username: account.username, ok: true, site: used.site, note: used.note });
         } catch (e) {
           const msg = e && e.message ? e.message : String(e);
           results.push({ username: account.username, ok: false, error: msg });
           lastError = `Account failed ${account.username}: ${msg}`;
 
-          // Only email once here: after all sites failed for this account
-          if (EMAIL_ALERT_ON_ACCOUNT_FAIL) {
+          if (EMAIL_ACCOUNT_FAIL_ALERTS && failAlertsSent < EMAIL_MAX_FAIL_ALERTS) {
+            failAlertsSent += 1;
             await sendEmail(
-              `${subjectPrefix} account failed: ${account.username}`,
-              [
-                `Account failed AFTER trying all sites.`,
-                `Run ID: ${lastRunId}`,
-                `Time: ${nowLocal()}`,
-                "",
-                `Account: ${account.username}`,
-                `Error: ${msg}`
-              ].join("\n")
+              `${subjectPrefix} account FAILED: ${account.username}`,
+              `Account failed: ${account.username}\nRun ID: ${lastRunId}\nTime: ${nowLocal()}\n\nError:\n${msg}\n`
             );
           }
         }
       }
 
       const finishedAt = nowLocal();
+      const anyFailed = results.some((r) => !r.ok);
+
+      const summaryLines = results.map((r) => {
+        if (r.ok) return `SUCCESS: ${r.username} (${r.site})${r.note ? ` - ${r.note}` : ""}`;
+        return `FAIL: ${r.username} (${r.error})`;
+      });
+
       const okCount = results.filter((r) => r.ok).length;
       const failCount = results.length - okCount;
 
-      const summaryLines = results.map((r) => {
-        if (r.ok) return `${r.username} - SUCCESS (${r.site})`;
-        return `${r.username} - FAIL (${r.error})`;
-      });
-
-      if (!EMAIL_ONLY_ON_FAILURE && EMAIL_ON_FINISH) {
-        console.log("About to send FINISH email...");
-        const finishEmailRes = await sendEmail(
-          `${subjectPrefix} finished (${okCount} ok, ${failCount} fail)`,
-          [
-            `T-Bot finished at ${finishedAt}`,
-            `Run ID: ${lastRunId}`,
-            "",
-            `Summary: ${okCount} success, ${failCount} failed`,
-            "",
-            "Per-account status:",
-            ...summaryLines
-          ].join("\n")
-        );
-        console.log("FINISH email result:", finishEmailRes);
-      }
+      await sendEmail(
+        `${subjectPrefix} ${anyFailed ? "finished with failures" : "completed"}`,
+        `T-Bot finished at ${finishedAt}\nRun ID: ${lastRunId}\n\nSummary: ${okCount} success, ${failCount} failed\n\nPer-account status:\n${summaryLines.join(
+          "\n"
+        )}\n`
+      );
 
       console.log("Bot completed");
     } catch (e) {
@@ -588,18 +633,7 @@ app.post("/run", async (req, res) => {
       lastError = msg;
 
       const failedAt = nowLocal();
-      await sendEmail(
-        `${subjectPrefix} FAILED`,
-        [
-          `T-Bot failed at ${failedAt}`,
-          `Run ID: ${lastRunId}`,
-          "",
-          `Error: ${msg}`,
-          "",
-          "Partial per-account status (if any ran):",
-          ...results.map((r) => (r.ok ? `${r.username} - SUCCESS (${r.site})` : `${r.username} - FAIL (${r.error})`))
-        ].join("\n")
-      );
+      await sendEmail(`${subjectPrefix} FAILED`, `T-Bot failed at ${failedAt}\nRun ID: ${lastRunId}\nError: ${msg}\n`);
 
       console.log("Run failed:", msg);
     } finally {
@@ -617,9 +651,9 @@ async function runAccountAllSites(account, orderCode) {
   for (const loginUrl of LOGIN_URLS) {
     console.log("Trying site:", loginUrl, "for", account.username);
     try {
-      await runAccountOnSite(account, orderCode, loginUrl);
+      const note = await runAccountOnSite(account, orderCode, loginUrl);
       console.log("SUCCESS:", account.username, "on", loginUrl);
-      return loginUrl;
+      return { site: loginUrl, note };
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
       console.log("Site failed:", loginUrl, "for", account.username, "err:", msg);
@@ -664,7 +698,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
   try {
     await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await sleep(WAIT_AFTER_GOTO_MS);
+    await sleep(1200);
     await dumpDebugState(page, "after-goto", { loginUrl, username: account.username });
 
     const userField = page.locator('input[type="email"], input[type="text"]').first();
@@ -675,11 +709,11 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
     let loggedIn = false;
 
-    for (let attempt = 1; attempt <= LOGIN_ATTEMPTS; attempt++) {
+    for (let attempt = 1; attempt <= 6; attempt++) {
       console.log("Login attempt", attempt, "for", account.username, "on", loginUrl);
 
       await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-      await sleep(WAIT_AFTER_GOTO_MS);
+      await sleep(1200);
 
       await userField.fill("");
       await passField.fill("");
@@ -699,17 +733,17 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
         await passField.press("Enter");
       }
 
-      await sleep(WAIT_AFTER_LOGIN_MS);
+      await sleep(1800);
       await dumpDebugState(page, `after-login-attempt-${attempt}`, { attempt });
 
       const fu = futuresUrlFromLoginUrl(loginUrl);
       if (fu) {
         await page.goto(fu, { waitUntil: "domcontentloaded", timeout: 60000 });
-        await sleep(WAIT_AFTER_FUTURES_DIRECT_MS);
+        await sleep(1500);
         await dumpDebugState(page, "after-futures-direct", { futuresUrl: fu });
 
         const hasInvitedTab = await page.locator("text=/invited me/i").first().isVisible().catch(() => false);
-        const hasPositionOrder = await page.locator("text=Position order").first().isVisible().catch(() => false);
+        const hasPositionOrder = await page.locator("text=/position order/i").first().isVisible().catch(() => false);
 
         if (hasInvitedTab || hasPositionOrder) {
           loggedIn = true;
@@ -730,7 +764,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     if (!futuresUrl) throw new Error("Could not build Futures URL from login URL");
 
     await page.goto(futuresUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await sleep(WAIT_AFTER_FUTURES_MS);
+    await sleep(1500);
     await dumpDebugState(page, "after-futures", { futuresUrl });
 
     const invited = page.locator("text=/invited me/i").first();
@@ -740,7 +774,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     }
 
     await invited.click({ timeout: 10000 }).catch(() => null);
-    await sleep(WAIT_AFTER_INVITED_MS);
+    await sleep(1200);
     await dumpDebugState(page, "after-invited", {});
 
     const codeBox = page
@@ -762,12 +796,29 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       throw new Error("Confirm button not found");
     }
 
-    await confirmBtn.click({ timeout: 10000 });
-    await sleep(CONFIRM_WAIT_MS);
-    await dumpDebugState(page, "after-confirm", {});
+    // Confirm + verification gates with retries
+    let lastVerify = null;
 
-    // Extra optional wait to let the UI settle before moving on
-    await sleep(POST_CONFIRM_WAIT_MS);
+    for (let i = 1; i <= CONFIRM_RETRIES; i++) {
+      console.log("Confirm attempt", i, "for", account.username);
+      await confirmBtn.click({ timeout: 10000 }).catch(() => null);
+      await sleep(1200);
+      await dumpDebugState(page, `after-confirm-attempt-${i}`, {});
+
+      const verify = await verifyOrderFollowed(page);
+      lastVerify = verify;
+
+      if (verify.ok) {
+        await dumpDebugState(page, "confirm-verified", { verify });
+        return verify.detail || "verified";
+      }
+
+      console.log("Verification not satisfied:", verify.detail);
+      await sleep(CONFIRM_RETRY_DELAY_MS);
+    }
+
+    await dumpDebugState(page, "confirm-verification-failed", { lastVerify });
+    throw new Error(lastVerify && lastVerify.detail ? lastVerify.detail : "Confirm verification failed");
   } finally {
     await context.close().catch(() => null);
     await browser.close().catch(() => null);
@@ -782,21 +833,7 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("Email provider:", EMAIL_PROVIDER);
   console.log("Email configured:", emailConfigured());
   console.log("Email from/to:", EMAIL_FROM, EMAIL_TO);
-  console.log("Email options:", {
-    EMAIL_ONLY_ON_FAILURE,
-    EMAIL_ON_START,
-    EMAIL_ON_FINISH,
-    EMAIL_ALERT_ON_ACCOUNT_FAIL
-  });
-  console.log("Tunables:", {
-    LOGIN_ATTEMPTS,
-    WAIT_AFTER_GOTO_MS,
-    WAIT_AFTER_LOGIN_MS,
-    WAIT_AFTER_FUTURES_DIRECT_MS,
-    WAIT_AFTER_FUTURES_MS,
-    WAIT_AFTER_INVITED_MS,
-    CONFIRM_WAIT_MS,
-    POST_CONFIRM_WAIT_MS
-  });
+  console.log("Verify toast/pending:", VERIFY_TOAST, VERIFY_PENDING);
+  console.log("Confirm retries:", CONFIRM_RETRIES);
   writePlaceholderLastShot();
 });
