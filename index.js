@@ -5,6 +5,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const dns = require("dns").promises;
+const { chromium } = require("playwright");
 
 const PORT = process.env.PORT || 8080;
 
@@ -22,17 +23,16 @@ function envTruthy(v) {
   const s = (v || "").toString().trim().toLowerCase();
   return s === "1" || s === "true" || s === "yes" || s === "on";
 }
-
-const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE || "0");
-
+function envInt(name, def) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : def;
+}
 function nowLocal() {
   return new Date().toLocaleString("en-US", { timeZoneName: "short" });
 }
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
-
 function escapeHtml(s) {
   return String(s)
     .replaceAll("&", "&amp;")
@@ -41,51 +41,33 @@ function escapeHtml(s) {
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
 }
-
 function authOk(req) {
   const p = (req.query.p || "").toString();
   return !!BOT_PASSWORD && p === BOT_PASSWORD;
 }
-
-function safeJsonParseAccounts() {
-  if (!ACCOUNTS_JSON) {
-    return { ok: false, accounts: [], error: "ACCOUNTS_JSON not set" };
-  }
-  try {
-    const parsed = JSON.parse(ACCOUNTS_JSON);
-    if (!Array.isArray(parsed)) {
-      return { ok: false, accounts: [], error: "ACCOUNTS_JSON must be a JSON array" };
-    }
-    const cleaned = parsed.map((a) => ({
-      username: (a.username || "").trim(),
-      password: String(a.password || "")
-    }));
-    const bad = cleaned.find((a) => !a.username || !a.password);
-    if (bad) return { ok: false, accounts: [], error: "Each account must have username + password" };
-    return { ok: true, accounts: cleaned, error: null };
-  } catch (e) {
-    return { ok: false, accounts: [], error: `ACCOUNTS_JSON invalid JSON: ${e.message}` };
-  }
+function sanitize(s) {
+  return String(s || "")
+    .replaceAll("@", "_at_")
+    .replaceAll(".", "_")
+    .replaceAll("/", "_")
+    .replaceAll("\\", "_")
+    .slice(0, 80);
 }
 
 // --------------------
-// Safe Playwright loader
+// Tunables via Railway
 // --------------------
-let chromium = null;
-let playwrightOk = false;
-let playwrightError = null;
+const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE || "0");
 
-function loadPlaywrightOnce() {
-  if (playwrightOk || playwrightError) return;
-  try {
-    const pw = require("playwright");
-    chromium = pw.chromium;
-    playwrightOk = true;
-  } catch (e) {
-    playwrightOk = false;
-    playwrightError = e && e.message ? e.message : String(e);
-  }
-}
+// Login flow tuning (Railway)
+const LOGIN_ATTEMPTS = envInt("LOGIN_ATTEMPTS", 6); // per site
+const WAIT_AFTER_GOTO_MS = envInt("WAIT_AFTER_GOTO_MS", 1200);
+const WAIT_AFTER_LOGIN_MS = envInt("WAIT_AFTER_LOGIN_MS", 1800);
+const WAIT_AFTER_FUTURES_DIRECT_MS = envInt("WAIT_AFTER_FUTURES_DIRECT_MS", 1500);
+const WAIT_AFTER_FUTURES_MS = envInt("WAIT_AFTER_FUTURES_MS", 1500);
+const WAIT_AFTER_INVITED_MS = envInt("WAIT_AFTER_INVITED_MS", 1200);
+const CONFIRM_WAIT_MS = envInt("CONFIRM_WAIT_MS", 1500); // wait after clicking Confirm
+const POST_CONFIRM_WAIT_MS = envInt("POST_CONFIRM_WAIT_MS", 1500); // extra wait after confirm
 
 // --------------------
 // Email config (SendGrid Web API)
@@ -94,9 +76,15 @@ const EMAIL_ENABLED = envTruthy(process.env.EMAIL_ENABLED || "1");
 const EMAIL_PROVIDER = (process.env.EMAIL_PROVIDER || "sendgrid").toString().trim().toLowerCase();
 
 const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || "";
-const EMAIL_FROM = (process.env.EMAIL_FROM || "").toString().trim(); // must match verified sender email exactly
+const EMAIL_FROM = (process.env.EMAIL_FROM || "").toString().trim(); // verified sender
 const EMAIL_FROM_NAME = (process.env.EMAIL_FROM_NAME || "T-Bot").toString().trim();
 const EMAIL_TO = (process.env.EMAIL_TO || "").toString().trim();
+
+// Email behavior toggles (Railway)
+const EMAIL_ONLY_ON_FAILURE = envTruthy(process.env.EMAIL_ONLY_ON_FAILURE || "0"); // if 1, suppress start/finish
+const EMAIL_ON_START = envTruthy(process.env.EMAIL_ON_START || "1");
+const EMAIL_ON_FINISH = envTruthy(process.env.EMAIL_ON_FINISH || "1");
+const EMAIL_ALERT_ON_ACCOUNT_FAIL = envTruthy(process.env.EMAIL_ALERT_ON_ACCOUNT_FAIL || "0"); // one email per account, after all sites fail
 
 function emailConfigured() {
   if (!EMAIL_ENABLED) return false;
@@ -131,7 +119,7 @@ async function sendEmail(subject, text) {
     return { ok: true, skipped: false, status, msgId };
   } catch (e) {
     const body = e && e.response && e.response.body ? e.response.body : null;
-    const errText = body ? JSON.stringify(body) : e && e.message ? e.message : String(e);
+    const errText = body ? JSON.stringify(body) : (e && e.message ? e.message : String(e));
     console.log("Email failed (SendGrid API):", errText, "|", subject);
     return { ok: false, skipped: false, error: errText };
   }
@@ -172,10 +160,32 @@ function futuresUrlFromLoginUrl(loginUrl) {
   }
 }
 
+function safeJsonParseAccounts() {
+  if (!ACCOUNTS_JSON) return { ok: false, accounts: [], error: "ACCOUNTS_JSON not set" };
+  try {
+    const parsed = JSON.parse(ACCOUNTS_JSON);
+    if (!Array.isArray(parsed)) return { ok: false, accounts: [], error: "ACCOUNTS_JSON must be a JSON array" };
+    const cleaned = parsed.map((a) => ({
+      username: (a.username || "").trim(),
+      password: String(a.password || "")
+    }));
+    const bad = cleaned.find((a) => !a.username || !a.password);
+    if (bad) return { ok: false, accounts: [], error: "Each account must have username + password" };
+    return { ok: true, accounts: cleaned, error: null };
+  } catch (e) {
+    return { ok: false, accounts: [], error: `ACCOUNTS_JSON invalid JSON: ${e.message}` };
+  }
+}
+
 // --------------------
-// Debug capture
+// Run state
 // --------------------
+let isRunning = false;
+let lastRunAt = null;
+let lastError = null;
+
 let lastShotPath = null;
+let lastRunId = null;
 let lastDebugDir = null;
 
 function ensureDir(dir) {
@@ -237,22 +247,6 @@ async function dumpDebugState(page, tag, extra = {}) {
     } catch {}
 
     try {
-      const ls = await page
-        .evaluate(() => {
-          const out = {};
-          try {
-            for (let i = 0; i < localStorage.length; i++) {
-              const k = localStorage.key(i);
-              out[k] = localStorage.getItem(k);
-            }
-          } catch {}
-          return out;
-        })
-        .catch(() => ({}));
-      fs.writeFileSync(`${base}.localstorage.json`, JSON.stringify(ls, null, 2));
-    } catch {}
-
-    try {
       fs.writeFileSync(`${base}.extra.json`, JSON.stringify(extra, null, 2));
     } catch {}
 
@@ -270,23 +264,6 @@ function safeListDir(dir) {
   }
 }
 
-function sanitize(s) {
-  return String(s || "")
-    .replaceAll("@", "_at_")
-    .replaceAll(".", "_")
-    .replaceAll("/", "_")
-    .replaceAll("\\", "_")
-    .slice(0, 80);
-}
-
-// --------------------
-// Run state
-// --------------------
-let isRunning = false;
-let lastRunAt = null;
-let lastError = null;
-let lastRunId = null;
-
 // --------------------
 // Express app
 // --------------------
@@ -298,8 +275,6 @@ app.get("/", (req, res) => {
   const pwMissing = !BOT_PASSWORD;
   const accountsMissing = !cfg.ok;
 
-  loadPlaywrightOnce();
-
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`
     <h2>T-Bot</h2>
@@ -309,8 +284,6 @@ app.get("/", (req, res) => {
     <div>LOGIN_URLS: <code>${escapeHtml(LOGIN_URLS.join(", "))}</code></div>
     <div>Email configured: <b>${emailConfigured() ? "YES" : "NO"}</b></div>
     <div>Email provider: <b>${escapeHtml(EMAIL_PROVIDER)}</b></div>
-    <div>Playwright: <b>${playwrightOk ? "OK" : "MISSING"}</b></div>
-    ${playwrightOk ? "" : `<div style="color:red;">Playwright error: ${escapeHtml(playwrightError || "")}</div>`}
 
     <div style="color:red; margin-top:10px;">
       ${pwMissing ? "BOT_PASSWORD or RUN_PASSWORD not set<br/>" : ""}
@@ -339,8 +312,6 @@ app.get("/", (req, res) => {
 
 app.get("/health", (req, res) => {
   const cfg = safeJsonParseAccounts();
-  loadPlaywrightOnce();
-
   res.json({
     ok: true,
     running: isRunning,
@@ -354,8 +325,22 @@ app.get("/health", (req, res) => {
     debugCapture: DEBUG_CAPTURE,
     lastDebugDir,
     loginUrls: LOGIN_URLS,
-    playwrightOk,
-    playwrightError
+    tunables: {
+      LOGIN_ATTEMPTS,
+      WAIT_AFTER_GOTO_MS,
+      WAIT_AFTER_LOGIN_MS,
+      WAIT_AFTER_FUTURES_DIRECT_MS,
+      WAIT_AFTER_FUTURES_MS,
+      WAIT_AFTER_INVITED_MS,
+      CONFIRM_WAIT_MS,
+      POST_CONFIRM_WAIT_MS
+    },
+    emailOptions: {
+      EMAIL_ONLY_ON_FAILURE,
+      EMAIL_ON_START,
+      EMAIL_ON_FINISH,
+      EMAIL_ALERT_ON_ACCOUNT_FAIL
+    }
   });
 });
 
@@ -364,10 +349,21 @@ app.get("/email-test", async (req, res) => {
 
   const result = await sendEmail(
     "T-Bot | email test",
-    `Email test sent at ${nowLocal()}\n\nFrom: ${EMAIL_FROM}\nTo: ${EMAIL_TO}\n`
+    `Email test sent at ${nowLocal()}\nFrom: ${EMAIL_FROM}\nTo: ${EMAIL_TO}\n`
   );
 
-  res.json({ ok: true, attempted: true, result });
+  res.json({
+    ok: true,
+    attempted: true,
+    config: {
+      enabled: EMAIL_ENABLED,
+      provider: EMAIL_PROVIDER,
+      configured: emailConfigured(),
+      from: EMAIL_FROM,
+      to: EMAIL_TO
+    },
+    result
+  });
 });
 
 app.get("/last-shot", (req, res) => {
@@ -425,7 +421,6 @@ app.get("/debug/files", (req, res) => {
 
 app.get("/dns-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-
   const hosts = [
     "bgol.pro",
     "dsj89.com",
@@ -453,7 +448,6 @@ app.get("/net-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
   const urls = ["https://bgol.pro/", "https://dsj89.com/", "https://dsj72.com/", "https://api.sendgrid.com/"];
-
   const results = {};
   for (const u of urls) {
     try {
@@ -480,13 +474,6 @@ app.post("/run", async (req, res) => {
   if (!code) return res.status(400).send("No code provided.");
   if (isRunning) return res.send("Bot is already running. Please wait.");
 
-  loadPlaywrightOnce();
-  if (!playwrightOk || !chromium) {
-    return res
-      .status(500)
-      .send(`Playwright is not available in this deployment. Fix dependencies. Error: ${playwrightError || ""}`);
-  }
-
   isRunning = true;
   lastError = null;
   lastRunAt = nowLocal();
@@ -507,6 +494,7 @@ app.post("/run", async (req, res) => {
   (async () => {
     const startedAt = nowLocal();
     const subjectPrefix = `T-Bot | Run ${lastRunId}`;
+    const results = [];
 
     try {
       console.log("Bot started");
@@ -515,32 +503,84 @@ app.post("/run", async (req, res) => {
       console.log("Code received length:", code.length);
       console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
       console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
-      console.log("Email provider:", EMAIL_PROVIDER);
       console.log("Email configured:", emailConfigured());
+      console.log("Email options:", {
+        EMAIL_ONLY_ON_FAILURE,
+        EMAIL_ON_START,
+        EMAIL_ON_FINISH,
+        EMAIL_ALERT_ON_ACCOUNT_FAIL
+      });
 
-      console.log("About to send START email...");
-      const startEmailRes = await sendEmail(
-        `${subjectPrefix} started`,
-        `T-Bot started at ${startedAt}\nRun ID: ${lastRunId}\nAccounts: ${cfg.accounts.length}\nDebug capture: ${
-          DEBUG_CAPTURE ? "ON" : "OFF"
-        }\n`
-      );
-      console.log("START email result:", startEmailRes);
+      if (!EMAIL_ONLY_ON_FAILURE && EMAIL_ON_START) {
+        console.log("About to send START email...");
+        const startEmailRes = await sendEmail(
+          `${subjectPrefix} started`,
+          [
+            `T-Bot started at ${startedAt}`,
+            `Run ID: ${lastRunId}`,
+            `Accounts: ${cfg.accounts.length}`,
+            `Debug capture: ${DEBUG_CAPTURE ? "ON" : "OFF"}`,
+            "",
+            "You will get a completion email with per-account results."
+          ].join("\n")
+        );
+        console.log("START email result:", startEmailRes);
+      }
 
       for (const account of cfg.accounts) {
         console.log("----");
         console.log("Account:", account.username);
-        await runAccountAllSites(account, code);
+
+        try {
+          const used = await runAccountAllSites(account, code);
+          results.push({ username: account.username, ok: true, site: used });
+        } catch (e) {
+          const msg = e && e.message ? e.message : String(e);
+          results.push({ username: account.username, ok: false, error: msg });
+          lastError = `Account failed ${account.username}: ${msg}`;
+
+          // Only email once here: after all sites failed for this account
+          if (EMAIL_ALERT_ON_ACCOUNT_FAIL) {
+            await sendEmail(
+              `${subjectPrefix} account failed: ${account.username}`,
+              [
+                `Account failed AFTER trying all sites.`,
+                `Run ID: ${lastRunId}`,
+                `Time: ${nowLocal()}`,
+                "",
+                `Account: ${account.username}`,
+                `Error: ${msg}`
+              ].join("\n")
+            );
+          }
+        }
       }
 
       const finishedAt = nowLocal();
+      const okCount = results.filter((r) => r.ok).length;
+      const failCount = results.length - okCount;
 
-      console.log("About to send FINISH email...");
-      const finishEmailRes = await sendEmail(
-        `${subjectPrefix} completed`,
-        `T-Bot finished at ${finishedAt}\nRun ID: ${lastRunId}\n`
-      );
-      console.log("FINISH email result:", finishEmailRes);
+      const summaryLines = results.map((r) => {
+        if (r.ok) return `${r.username} - SUCCESS (${r.site})`;
+        return `${r.username} - FAIL (${r.error})`;
+      });
+
+      if (!EMAIL_ONLY_ON_FAILURE && EMAIL_ON_FINISH) {
+        console.log("About to send FINISH email...");
+        const finishEmailRes = await sendEmail(
+          `${subjectPrefix} finished (${okCount} ok, ${failCount} fail)`,
+          [
+            `T-Bot finished at ${finishedAt}`,
+            `Run ID: ${lastRunId}`,
+            "",
+            `Summary: ${okCount} success, ${failCount} failed`,
+            "",
+            "Per-account status:",
+            ...summaryLines
+          ].join("\n")
+        );
+        console.log("FINISH email result:", finishEmailRes);
+      }
 
       console.log("Bot completed");
     } catch (e) {
@@ -548,7 +588,18 @@ app.post("/run", async (req, res) => {
       lastError = msg;
 
       const failedAt = nowLocal();
-      await sendEmail(`${subjectPrefix} FAILED`, `T-Bot failed at ${failedAt}\nRun ID: ${lastRunId}\nError: ${msg}\n`);
+      await sendEmail(
+        `${subjectPrefix} FAILED`,
+        [
+          `T-Bot failed at ${failedAt}`,
+          `Run ID: ${lastRunId}`,
+          "",
+          `Error: ${msg}`,
+          "",
+          "Partial per-account status (if any ran):",
+          ...results.map((r) => (r.ok ? `${r.username} - SUCCESS (${r.site})` : `${r.username} - FAIL (${r.error})`))
+        ].join("\n")
+      );
 
       console.log("Run failed:", msg);
     } finally {
@@ -613,7 +664,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
   try {
     await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await sleep(1200);
+    await sleep(WAIT_AFTER_GOTO_MS);
     await dumpDebugState(page, "after-goto", { loginUrl, username: account.username });
 
     const userField = page.locator('input[type="email"], input[type="text"]').first();
@@ -624,11 +675,11 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
     let loggedIn = false;
 
-    for (let attempt = 1; attempt <= 6; attempt++) {
+    for (let attempt = 1; attempt <= LOGIN_ATTEMPTS; attempt++) {
       console.log("Login attempt", attempt, "for", account.username, "on", loginUrl);
 
       await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-      await sleep(1200);
+      await sleep(WAIT_AFTER_GOTO_MS);
 
       await userField.fill("");
       await passField.fill("");
@@ -648,13 +699,13 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
         await passField.press("Enter");
       }
 
-      await sleep(1800);
+      await sleep(WAIT_AFTER_LOGIN_MS);
       await dumpDebugState(page, `after-login-attempt-${attempt}`, { attempt });
 
       const fu = futuresUrlFromLoginUrl(loginUrl);
       if (fu) {
         await page.goto(fu, { waitUntil: "domcontentloaded", timeout: 60000 });
-        await sleep(1500);
+        await sleep(WAIT_AFTER_FUTURES_DIRECT_MS);
         await dumpDebugState(page, "after-futures-direct", { futuresUrl: fu });
 
         const hasInvitedTab = await page.locator("text=/invited me/i").first().isVisible().catch(() => false);
@@ -679,7 +730,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     if (!futuresUrl) throw new Error("Could not build Futures URL from login URL");
 
     await page.goto(futuresUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await sleep(1500);
+    await sleep(WAIT_AFTER_FUTURES_MS);
     await dumpDebugState(page, "after-futures", { futuresUrl });
 
     const invited = page.locator("text=/invited me/i").first();
@@ -689,7 +740,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     }
 
     await invited.click({ timeout: 10000 }).catch(() => null);
-    await sleep(1200);
+    await sleep(WAIT_AFTER_INVITED_MS);
     await dumpDebugState(page, "after-invited", {});
 
     const codeBox = page
@@ -712,20 +763,18 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     }
 
     await confirmBtn.click({ timeout: 10000 });
-    await sleep(1500);
+    await sleep(CONFIRM_WAIT_MS);
     await dumpDebugState(page, "after-confirm", {});
+
+    // Extra optional wait to let the UI settle before moving on
+    await sleep(POST_CONFIRM_WAIT_MS);
   } finally {
     await context.close().catch(() => null);
     await browser.close().catch(() => null);
   }
 }
 
-// --------------------
-// Startup
-// --------------------
 app.listen(PORT, "0.0.0.0", () => {
-  loadPlaywrightOnce();
-
   console.log("Starting Container");
   console.log("Listening on", PORT);
   console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
@@ -733,7 +782,21 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("Email provider:", EMAIL_PROVIDER);
   console.log("Email configured:", emailConfigured());
   console.log("Email from/to:", EMAIL_FROM, EMAIL_TO);
-  console.log("Playwright:", playwrightOk ? "OK" : "MISSING");
-  if (!playwrightOk) console.log("Playwright error:", playwrightError);
+  console.log("Email options:", {
+    EMAIL_ONLY_ON_FAILURE,
+    EMAIL_ON_START,
+    EMAIL_ON_FINISH,
+    EMAIL_ALERT_ON_ACCOUNT_FAIL
+  });
+  console.log("Tunables:", {
+    LOGIN_ATTEMPTS,
+    WAIT_AFTER_GOTO_MS,
+    WAIT_AFTER_LOGIN_MS,
+    WAIT_AFTER_FUTURES_DIRECT_MS,
+    WAIT_AFTER_FUTURES_MS,
+    WAIT_AFTER_INVITED_MS,
+    CONFIRM_WAIT_MS,
+    POST_CONFIRM_WAIT_MS
+  });
   writePlaceholderLastShot();
 });
