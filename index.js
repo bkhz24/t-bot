@@ -14,7 +14,7 @@ const BOT_PASSWORD = process.env.BOT_PASSWORD || process.env.RUN_PASSWORD || "";
 const ACCOUNTS_JSON = process.env.ACCOUNTS_JSON || "";
 
 // Optional: LOGIN_URLS override from Railway (comma-separated)
-const LOGIN_URLS_ENV = process.env.LOGINLS || "";
+const LOGIN_URLS_ENV = process.env.LOGIN_URLS || "";
 
 // --------------------
 // Helpers
