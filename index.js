@@ -87,10 +87,12 @@ const VERIFY_TIMEOUT_MS = Number(process.env.VERIFY_TIMEOUT_MS || "12000");
 const CONFIRM_RETRIES = Number(process.env.CONFIRM_RETRIES || "3");
 const CONFIRM_RETRY_DELAY_MS = Number(process.env.CONFIRM_RETRY_DELAY_MS || "1500");
 
-// Fast site pre-check controls (A)
+// Fast site pre-check controls
 const SITE_PREFLIGHT_ENABLED = envTruthy(process.env.SITE_PREFLIGHT_ENABLED || "1");
 const SITE_PREFLIGHT_LOGIN_WAIT_MS = Number(process.env.SITE_PREFLIGHT_LOGIN_WAIT_MS || "5000");
 const SITE_PREFLIGHT_GOTO_TIMEOUT_MS = Number(process.env.SITE_PREFLIGHT_GOTO_TIMEOUT_MS || "15000");
+const SITE_PREFLIGHT_RETRIES = Number(process.env.SITE_PREFLIGHT_RETRIES || "2");
+const SITE_PREFLIGHT_RETRY_DELAY_MS = Number(process.env.SITE_PREFLIGHT_RETRY_DELAY_MS || "1200");
 
 function parseEmailToList(raw) {
   return raw
@@ -372,10 +374,12 @@ app.get("/", (req, res) => {
     <div>LOGIN_URLS: <code>${escapeHtml(LOGIN_URLS.join(", "))}</code></div>
     <div>Email configured: <b>${emailConfigured() ? "YES" : "NO"}</b></div>
     <div>Email provider: <b>${escapeHtml(EMAIL_PROVIDER)}</b></div>
-    <div>Verify toast: <b>${VERIFY_TOAST ? "ON" : "OFF"}</b></div>
-    <div>Verify pending: <b>${VERIFY_PENDING ? "ON" : "OFF"}</b></div>
-    <div>Confirm retries: <b>${CONFIRM_RETRIES}</b></div>
-    <div>Preflight: <b>${SITE_PREFLIGHT_ENABLED ? "ON" : "OFF"}</b> (login wait ${SITE_PREFLIGHT_LOGIN_WAIT_MS}ms)</div>
+
+    <div style="margin-top:10px;">
+      <div>Preflight: <b>${SITE_PREFLIGHT_ENABLED ? "ON" : "OFF"}</b></div>
+      <div>Preflight retries: <b>${SITE_PREFLIGHT_RETRIES}</b> (delay ${SITE_PREFLIGHT_RETRY_DELAY_MS}ms)</div>
+      <div>Preflight login wait: <b>${SITE_PREFLIGHT_LOGIN_WAIT_MS}</b>ms</div>
+    </div>
 
     <div style="color:red; margin-top:10px;">
       ${pwMissing ? "BOT_PASSWORD or RUN_PASSWORD not set<br/>" : ""}
@@ -393,6 +397,7 @@ app.get("/", (req, res) => {
 
     <div style="margin-top:12px;">
       Health: <a href="/health">/health</a>
+      | Site check: <a href="/site-check?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/site-check</a>
       | Last screenshot: <a href="/last-shot?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/last-shot</a>
       | Debug: <a href="/debug?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/debug</a>
       | DNS test: <a href="/dns-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/dns-test</a>
@@ -418,19 +423,70 @@ app.get("/health", (req, res) => {
     debugCapture: DEBUG_CAPTURE,
     lastDebugDir,
     loginUrls: LOGIN_URLS,
-    verify: {
-      toast: VERIFY_TOAST,
-      pending: VERIFY_PENDING,
-      timeoutMs: VERIFY_TIMEOUT_MS,
-      confirmRetries: CONFIRM_RETRIES,
-      confirmRetryDelayMs: CONFIRM_RETRY_DELAY_MS
-    },
     preflight: {
       enabled: SITE_PREFLIGHT_ENABLED,
       gotoTimeoutMs: SITE_PREFLIGHT_GOTO_TIMEOUT_MS,
-      loginWaitMs: SITE_PREFLIGHT_LOGIN_WAIT_MS
+      loginWaitMs: SITE_PREFLIGHT_LOGIN_WAIT_MS,
+      retries: SITE_PREFLIGHT_RETRIES,
+      retryDelayMs: SITE_PREFLIGHT_RETRY_DELAY_MS
     }
   });
+});
+
+// Quick status check of current LOGIN_URLS
+app.get("/site-check", async (req, res) => {
+  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+  });
+
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 720 },
+    locale: "en-US"
+  });
+
+  const page = await context.newPage();
+
+  const report = [];
+  try {
+    for (const u of LOGIN_URLS) {
+      const loginUrl = normalizeUrl(u);
+      const entry = { url: loginUrl, ok: false, status: null, title: null, error: null };
+
+      try {
+        const resp = await page.goto(loginUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: SITE_PREFLIGHT_GOTO_TIMEOUT_MS
+        });
+
+        entry.status = resp ? resp.status() : null;
+        entry.title = await page.title().catch(() => null);
+
+        const userField = page.locator('input[type="email"], input[type="text"]').first();
+        const passField = page.locator('input[type="password"]').first();
+
+        const okUser = await userField.isVisible().catch(() => false);
+        const okPass = await passField.isVisible().catch(() => false);
+
+        entry.ok = !!(entry.status && entry.status < 400 && okUser && okPass);
+      } catch (e) {
+        entry.error = e && e.message ? e.message : String(e);
+      }
+
+      report.push(entry);
+    }
+
+    res.json({
+      time: nowLocal(),
+      urls: LOGIN_URLS,
+      report
+    });
+  } finally {
+    await context.close().catch(() => null);
+    await browser.close().catch(() => null);
+  }
 });
 
 app.get("/email-test", async (req, res) => {
@@ -438,7 +494,7 @@ app.get("/email-test", async (req, res) => {
 
   const result = await sendEmail(
     "T-Bot | email test",
-    `Email test sent at ${nowLocal()}\n\nIf you received this, SendGrid Web API is set up correctly.\n\nFrom: ${EMAIL_FROM}\nTo: ${EMAIL_TO_LIST.join(", ")}\n`
+    `Email test sent at ${nowLocal()}\n\nFrom: ${EMAIL_FROM}\nTo: ${EMAIL_TO_LIST.join(", ")}\n`
   );
 
   res.json({
@@ -516,17 +572,7 @@ app.get("/debug/files", (req, res) => {
 app.get("/dns-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
-  const hosts = [
-    "bgol.pro",
-    "dsj89.com",
-    "dsj72.com",
-    "api.bgol.pro",
-    "api.dsj89.com",
-    "api.dsj72.com",
-    "api.ddjea.com",
-    "api.sendgrid.com"
-  ];
-
+  const hosts = ["api.sendgrid.com"];
   const out = {};
   for (const h of hosts) {
     try {
@@ -541,9 +587,7 @@ app.get("/dns-test", async (req, res) => {
 
 app.get("/net-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-
-  const urls = ["https://bgol.pro/", "https://dsj89.com/", "https://dsj72.com/", "https://api.sendgrid.com/"];
-
+  const urls = ["https://api.sendgrid.com/"];
   const results = {};
   for (const u of urls) {
     try {
@@ -607,7 +651,7 @@ app.post("/run", async (req, res) => {
         `${subjectPrefix} started`,
         `T-Bot started at ${startedAt}\nRun ID: ${lastRunId}\nAccounts: ${cfg.accounts.length}\nDebug capture: ${
           DEBUG_CAPTURE ? "ON" : "OFF"
-        }\n\nYou will get a completion email with per-account results.\n`
+        }\n`
       );
 
       const results = [];
@@ -678,12 +722,11 @@ async function runAccountAllSites(account, orderCode) {
 
     console.log("Trying site:", loginUrl, "for", account.username);
 
-    // If url still cannot parse, skip
     try {
       new URL(loginUrl);
     } catch {
-      console.log("Site failed:", loginUrl, "for", account.username, "err:", "Invalid URL");
       last = new Error("Invalid URL");
+      console.log("Site failed:", loginUrl, "for", account.username, "err:", "Invalid URL");
       continue;
     }
 
@@ -719,13 +762,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
   const page = await context.newPage();
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
 
-  // Log only, never used for pass/fail (B)
-  page.on("requestfailed", (req) => {
-    const f = req.failure();
-    const errText = f && f.errorText ? f.errorText : "unknown";
-    if (req.url().includes("/api/")) console.log("REQUEST FAILED:", req.url(), "=>", errText);
-  });
-
   page.on("console", (msg) => {
     if (msg.type() === "error") console.log("PAGE CONSOLE: error", msg.text());
   });
@@ -734,11 +770,13 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     console.log("PAGE ERROR:", err && err.message ? err.message : String(err));
   });
 
-  try {
-    // A) Fast pre-check: goto + status + login inputs within ~5s
-    const resp = await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: SITE_PREFLIGHT_GOTO_TIMEOUT_MS });
-    const status = resp ? resp.status() : null;
+  async function preflightOnce() {
+    const resp = await page.goto(loginUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: SITE_PREFLIGHT_GOTO_TIMEOUT_MS
+    });
 
+    const status = resp ? resp.status() : null;
     await sleep(700);
     await dumpDebugState(page, "after-goto", { loginUrl, username: account.username, status });
 
@@ -750,25 +788,37 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     const passField = page.locator('input[type="password"]').first();
 
     if (SITE_PREFLIGHT_ENABLED) {
-      const okUser = await userField.isVisible().catch(() => false);
-      const okPass = await passField.isVisible().catch(() => false);
-      if (!okUser || !okPass) {
-        // give it a quick chance (5s)
-        await userField.waitFor({ timeout: SITE_PREFLIGHT_LOGIN_WAIT_MS }).catch(() => null);
-        await passField.waitFor({ timeout: SITE_PREFLIGHT_LOGIN_WAIT_MS }).catch(() => null);
+      await userField.waitFor({ timeout: SITE_PREFLIGHT_LOGIN_WAIT_MS });
+      await passField.waitFor({ timeout: SITE_PREFLIGHT_LOGIN_WAIT_MS });
+    }
 
-        const okUser2 = await userField.isVisible().catch(() => false);
-        const okPass2 = await passField.isVisible().catch(() => false);
-        if (!okUser2 || !okPass2) {
-          await dumpDebugState(page, "preflight-login-missing", {});
-          throw new Error("Preflight failed: login inputs not visible");
-        }
+    return { userField, passField };
+  }
+
+  try {
+    // Preflight with retries
+    let fields = null;
+    let lastPreflightErr = null;
+
+    for (let i = 1; i <= Math.max(1, SITE_PREFLIGHT_RETRIES); i++) {
+      try {
+        fields = await preflightOnce();
+        lastPreflightErr = null;
+        break;
+      } catch (e) {
+        lastPreflightErr = e;
+        const msg = e && e.message ? e.message : String(e);
+        console.log("Preflight attempt", i, "failed for", loginUrl, "err:", msg);
+        await dumpDebugState(page, `preflight-failed-${i}`, { err: msg });
+        await sleep(SITE_PREFLIGHT_RETRY_DELAY_MS);
       }
     }
 
-    // At this point, the page is a legit login page, proceed normally
-    await userField.waitFor({ timeout: 20000 });
-    await passField.waitFor({ timeout: 20000 });
+    if (!fields) {
+      throw lastPreflightErr || new Error("Preflight failed");
+    }
+
+    const { userField, passField } = fields;
 
     let loggedIn = false;
 
@@ -898,5 +948,6 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("Verify toast/pending:", VERIFY_TOAST, VERIFY_PENDING);
   console.log("Confirm retries:", CONFIRM_RETRIES);
   console.log("Preflight enabled:", SITE_PREFLIGHT_ENABLED, "loginWaitMs:", SITE_PREFLIGHT_LOGIN_WAIT_MS);
+  console.log("Preflight retries:", SITE_PREFLIGHT_RETRIES, "retryDelayMs:", SITE_PREFLIGHT_RETRY_DELAY_MS);
   writePlaceholderLastShot();
 });
