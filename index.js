@@ -55,6 +55,13 @@ function sanitize(s) {
     .slice(0, 80);
 }
 
+function normalizeUrl(u) {
+  const raw = (u || "").toString().trim();
+  if (!raw) return "";
+  if (raw.startsWith("http://") || raw.startsWith("https://")) return raw;
+  return `https://${raw}`;
+}
+
 // Neutral debug capture
 const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE || "0");
 
@@ -80,22 +87,24 @@ const VERIFY_TIMEOUT_MS = Number(process.env.VERIFY_TIMEOUT_MS || "12000");
 const CONFIRM_RETRIES = Number(process.env.CONFIRM_RETRIES || "3");
 const CONFIRM_RETRY_DELAY_MS = Number(process.env.CONFIRM_RETRY_DELAY_MS || "1500");
 
-function emailToList() {
-  // Supports: "a@x.com,b@y.com" or "a@x.com, b@y.com"
-  const list = (EMAIL_TO_RAW || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+// Fast site pre-check controls (A)
+const SITE_PREFLIGHT_ENABLED = envTruthy(process.env.SITE_PREFLIGHT_ENABLED || "1");
+const SITE_PREFLIGHT_LOGIN_WAIT_MS = Number(process.env.SITE_PREFLIGHT_LOGIN_WAIT_MS || "5000");
+const SITE_PREFLIGHT_GOTO_TIMEOUT_MS = Number(process.env.SITE_PREFLIGHT_GOTO_TIMEOUT_MS || "15000");
 
-  // If user set a single email with no commas, list will be [that email]
-  return list;
+function parseEmailToList(raw) {
+  return raw
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
 }
+
+const EMAIL_TO_LIST = parseEmailToList(EMAIL_TO_RAW);
 
 function emailConfigured() {
   if (!EMAIL_ENABLED) return false;
   if (EMAIL_PROVIDER !== "sendgrid") return false;
-  const toList = emailToList();
-  return !!(SENDGRID_API_KEY && EMAIL_FROM && toList.length);
+  return !!(SENDGRID_API_KEY && EMAIL_FROM && EMAIL_TO_LIST.length);
 }
 
 async function sendEmail(subject, text) {
@@ -105,14 +114,12 @@ async function sendEmail(subject, text) {
     return { ok: false, skipped: true, error: "Email not configured" };
   }
 
-  const toList = emailToList();
-
   try {
     const sgMail = require("@sendgrid/mail");
     sgMail.setApiKey(SENDGRID_API_KEY);
 
     const msg = {
-      to: toList, // IMPORTANT: array for multiple recipients
+      to: EMAIL_TO_LIST,
       from: { email: EMAIL_FROM, name: EMAIL_FROM_NAME },
       subject,
       text
@@ -123,26 +130,19 @@ async function sendEmail(subject, text) {
     const msgId =
       (res && res.headers && (res.headers["x-message-id"] || res.headers["X-Message-Id"])) || null;
 
-    console.log("Email sent:", { status, msgId, to: toList });
-    return { ok: true, skipped: false, status, msgId, to: toList };
+    console.log("Email sent:", { status, msgId, to: EMAIL_TO_LIST });
+    return { ok: true, skipped: false, status, msgId, to: EMAIL_TO_LIST };
   } catch (e) {
     const body = e && e.response && e.response.body ? e.response.body : null;
     const errText = body ? JSON.stringify(body) : (e && e.message ? e.message : String(e));
     console.log("Email failed (SendGrid API):", errText, "|", subject);
-    return { ok: false, skipped: false, error: errText, to: toList };
+    return { ok: false, skipped: false, error: errText };
   }
 }
 
 // --------------------
 // Login URLs
 // --------------------
-function normalizeUrl(u) {
-  const s = (u || "").trim();
-  if (!s) return "";
-  if (s.startsWith("http://") || s.startsWith("https://")) return s;
-  return `https://${s}`;
-}
-
 function parseLoginUrls() {
   const fallback = [
     "https://bgol.pro/pc/#/login",
@@ -156,6 +156,7 @@ function parseLoginUrls() {
   const list = raw
     .split(",")
     .map((x) => normalizeUrl(x))
+    .map((x) => x.trim())
     .filter(Boolean);
 
   return list.length ? list : fallback;
@@ -289,17 +290,19 @@ function safeListDir(dir) {
 async function waitForToastOrModal(page) {
   if (!VERIFY_TOAST) return { ok: false, type: "toast_off", detail: "VERIFY_TOAST disabled" };
 
-  // NOTE: text=... is literal match. Keep this list short and high signal.
   const patterns = [
     /already followed/i,
     /followed the order/i,
+    /success/i,
+    /successful/i,
+    /completed/i,
     /confirm success/i
   ];
 
   const start = Date.now();
   while (Date.now() - start < VERIFY_TIMEOUT_MS) {
     for (const re of patterns) {
-      const loc = page.locator(re).first();
+      const loc = page.locator(`text=${re.source}`).first();
       const visible = await loc.isVisible().catch(() => false);
       if (visible) {
         const txt = await loc.textContent().catch(() => "");
@@ -315,14 +318,14 @@ async function waitForToastOrModal(page) {
 async function verifyPendingInPositionOrder(page) {
   if (!VERIFY_PENDING) return { ok: false, type: "pending_off", detail: "VERIFY_PENDING disabled" };
 
-  const tab = page.locator(/position order/i).first();
+  const tab = page.locator("text=/position order/i").first();
   const canClick = await tab.isVisible().catch(() => false);
   if (canClick) {
     await tab.click({ timeout: 8000 }).catch(() => null);
     await sleep(1200);
   }
 
-  const pending = page.locator(/pending/i).first();
+  const pending = page.locator("text=/pending/i").first();
   const start = Date.now();
   while (Date.now() - start < VERIFY_TIMEOUT_MS) {
     const ok = await pending.isVisible().catch(() => false);
@@ -369,10 +372,10 @@ app.get("/", (req, res) => {
     <div>LOGIN_URLS: <code>${escapeHtml(LOGIN_URLS.join(", "))}</code></div>
     <div>Email configured: <b>${emailConfigured() ? "YES" : "NO"}</b></div>
     <div>Email provider: <b>${escapeHtml(EMAIL_PROVIDER)}</b></div>
-    <div>Email TO: <code>${escapeHtml(emailToList().join(", "))}</code></div>
     <div>Verify toast: <b>${VERIFY_TOAST ? "ON" : "OFF"}</b></div>
     <div>Verify pending: <b>${VERIFY_PENDING ? "ON" : "OFF"}</b></div>
     <div>Confirm retries: <b>${CONFIRM_RETRIES}</b></div>
+    <div>Preflight: <b>${SITE_PREFLIGHT_ENABLED ? "ON" : "OFF"}</b> (login wait ${SITE_PREFLIGHT_LOGIN_WAIT_MS}ms)</div>
 
     <div style="color:red; margin-top:10px;">
       ${pwMissing ? "BOT_PASSWORD or RUN_PASSWORD not set<br/>" : ""}
@@ -412,7 +415,6 @@ app.get("/health", (req, res) => {
     configError: cfg.error,
     emailConfigured: emailConfigured(),
     emailProvider: EMAIL_PROVIDER,
-    emailTo: emailToList(),
     debugCapture: DEBUG_CAPTURE,
     lastDebugDir,
     loginUrls: LOGIN_URLS,
@@ -422,6 +424,11 @@ app.get("/health", (req, res) => {
       timeoutMs: VERIFY_TIMEOUT_MS,
       confirmRetries: CONFIRM_RETRIES,
       confirmRetryDelayMs: CONFIRM_RETRY_DELAY_MS
+    },
+    preflight: {
+      enabled: SITE_PREFLIGHT_ENABLED,
+      gotoTimeoutMs: SITE_PREFLIGHT_GOTO_TIMEOUT_MS,
+      loginWaitMs: SITE_PREFLIGHT_LOGIN_WAIT_MS
     }
   });
 });
@@ -431,7 +438,7 @@ app.get("/email-test", async (req, res) => {
 
   const result = await sendEmail(
     "T-Bot | email test",
-    `Email test sent at ${nowLocal()}\n\nIf you received this, SendGrid Web API is set up correctly.\n\nFrom: ${EMAIL_FROM}\nTo: ${emailToList().join(", ")}\n`
+    `Email test sent at ${nowLocal()}\n\nIf you received this, SendGrid Web API is set up correctly.\n\nFrom: ${EMAIL_FROM}\nTo: ${EMAIL_TO_LIST.join(", ")}\n`
   );
 
   res.json({
@@ -442,7 +449,7 @@ app.get("/email-test", async (req, res) => {
       provider: EMAIL_PROVIDER,
       configured: emailConfigured(),
       from: EMAIL_FROM,
-      to: emailToList()
+      to: EMAIL_TO_LIST
     },
     result
   });
@@ -595,7 +602,6 @@ app.post("/run", async (req, res) => {
       console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
       console.log("Email provider:", EMAIL_PROVIDER);
       console.log("Email configured:", emailConfigured());
-      console.log("Email TO list:", emailToList());
 
       await sendEmail(
         `${subjectPrefix} started`,
@@ -667,8 +673,20 @@ app.post("/run", async (req, res) => {
 async function runAccountAllSites(account, orderCode) {
   let last = null;
 
-  for (const loginUrl of LOGIN_URLS) {
+  for (const rawUrl of LOGIN_URLS) {
+    const loginUrl = normalizeUrl(rawUrl);
+
     console.log("Trying site:", loginUrl, "for", account.username);
+
+    // If url still cannot parse, skip
+    try {
+      new URL(loginUrl);
+    } catch {
+      console.log("Site failed:", loginUrl, "for", account.username, "err:", "Invalid URL");
+      last = new Error("Invalid URL");
+      continue;
+    }
+
     try {
       const note = await runAccountOnSite(account, orderCode, loginUrl);
       console.log("SUCCESS:", account.username, "on", loginUrl);
@@ -701,6 +719,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
   const page = await context.newPage();
   await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
 
+  // Log only, never used for pass/fail (B)
   page.on("requestfailed", (req) => {
     const f = req.failure();
     const errText = f && f.errorText ? f.errorText : "unknown";
@@ -716,13 +735,38 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
   });
 
   try {
-    await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await sleep(1200);
-    await dumpDebugState(page, "after-goto", { loginUrl, username: account.username });
+    // A) Fast pre-check: goto + status + login inputs within ~5s
+    const resp = await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: SITE_PREFLIGHT_GOTO_TIMEOUT_MS });
+    const status = resp ? resp.status() : null;
+
+    await sleep(700);
+    await dumpDebugState(page, "after-goto", { loginUrl, username: account.username, status });
+
+    if (SITE_PREFLIGHT_ENABLED && status && status >= 400) {
+      throw new Error(`Preflight failed: HTTP ${status}`);
+    }
 
     const userField = page.locator('input[type="email"], input[type="text"]').first();
     const passField = page.locator('input[type="password"]').first();
 
+    if (SITE_PREFLIGHT_ENABLED) {
+      const okUser = await userField.isVisible().catch(() => false);
+      const okPass = await passField.isVisible().catch(() => false);
+      if (!okUser || !okPass) {
+        // give it a quick chance (5s)
+        await userField.waitFor({ timeout: SITE_PREFLIGHT_LOGIN_WAIT_MS }).catch(() => null);
+        await passField.waitFor({ timeout: SITE_PREFLIGHT_LOGIN_WAIT_MS }).catch(() => null);
+
+        const okUser2 = await userField.isVisible().catch(() => false);
+        const okPass2 = await passField.isVisible().catch(() => false);
+        if (!okUser2 || !okPass2) {
+          await dumpDebugState(page, "preflight-login-missing", {});
+          throw new Error("Preflight failed: login inputs not visible");
+        }
+      }
+    }
+
+    // At this point, the page is a legit login page, proceed normally
     await userField.waitFor({ timeout: 20000 });
     await passField.waitFor({ timeout: 20000 });
 
@@ -734,8 +778,8 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
       await sleep(1200);
 
-      await userField.fill("");
-      await passField.fill("");
+      await userField.fill("").catch(() => null);
+      await passField.fill("").catch(() => null);
 
       await userField.click({ timeout: 5000 });
       await userField.fill(account.username);
@@ -749,7 +793,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       if (await loginBtn.isVisible().catch(() => false)) {
         await loginBtn.click({ timeout: 10000 });
       } else {
-        await passField.press("Enter");
+        await passField.press("Enter").catch(() => null);
       }
 
       await sleep(1800);
@@ -761,8 +805,8 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
         await sleep(1500);
         await dumpDebugState(page, "after-futures-direct", { futuresUrl: fu });
 
-        const hasInvitedTab = await page.locator(/invited me/i).first().isVisible().catch(() => false);
-        const hasPositionOrder = await page.locator(/position order/i).first().isVisible().catch(() => false);
+        const hasInvitedTab = await page.locator("text=/invited me/i").first().isVisible().catch(() => false);
+        const hasPositionOrder = await page.locator("text=/position order/i").first().isVisible().catch(() => false);
 
         if (hasInvitedTab || hasPositionOrder) {
           loggedIn = true;
@@ -786,7 +830,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await sleep(1500);
     await dumpDebugState(page, "after-futures", { futuresUrl });
 
-    const invited = page.locator(/invited me/i).first();
+    const invited = page.locator("text=/invited me/i").first();
     if (!(await invited.isVisible().catch(() => false))) {
       await dumpDebugState(page, "invited-missing", {});
       throw new Error("Could not find Invited me tab");
@@ -815,7 +859,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       throw new Error("Confirm button not found");
     }
 
-    // Confirm + verification gates with retries
     let lastVerify = null;
 
     for (let i = 1; i <= CONFIRM_RETRIES; i++) {
@@ -851,10 +894,9 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
   console.log("Email provider:", EMAIL_PROVIDER);
   console.log("Email configured:", emailConfigured());
-  console.log("Email from:", EMAIL_FROM);
-  console.log("Email to list:", emailToList());
+  console.log("Email from/to:", EMAIL_FROM, EMAIL_TO_LIST.join(", "));
   console.log("Verify toast/pending:", VERIFY_TOAST, VERIFY_PENDING);
   console.log("Confirm retries:", CONFIRM_RETRIES);
+  console.log("Preflight enabled:", SITE_PREFLIGHT_ENABLED, "loginWaitMs:", SITE_PREFLIGHT_LOGIN_WAIT_MS);
   writePlaceholderLastShot();
 });
-
