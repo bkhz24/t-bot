@@ -55,6 +55,7 @@ function sanitize(s) {
     .slice(0, 80);
 }
 
+// Neutral debug capture
 const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE || "0");
 
 // --------------------
@@ -75,17 +76,16 @@ const EMAIL_MAX_FAIL_ALERTS = Number(process.env.EMAIL_MAX_FAIL_ALERTS || "2");
 // Verification controls
 const VERIFY_TOAST = envTruthy(process.env.VERIFY_TOAST || "1");
 const VERIFY_PENDING = envTruthy(process.env.VERIFY_PENDING || "1");
-const VERIFY_TIMEOUT_MS = Number(process.env.VERIFY_TIMEOUT_MS || "20000");
+const VERIFY_TIMEOUT_MS = Number(process.env.VERIFY_TIMEOUT_MS || "12000");
 const CONFIRM_RETRIES = Number(process.env.CONFIRM_RETRIES || "3");
 const CONFIRM_RETRY_DELAY_MS = Number(process.env.CONFIRM_RETRY_DELAY_MS || "1500");
 
 // Preflight controls
 const PREFLIGHT_ENABLED = envTruthy(process.env.PREFLIGHT_ENABLED || "1");
-const PREFLIGHT_LOGIN_WAIT_MS = Number(process.env.PREFLIGHT_LOGIN_WAIT_MS || "12000");
-const PREFLIGHT_RETRIES = Number(process.env.PREFLIGHT_RETRIES || "2");
+const PREFLIGHT_LOGIN_WAIT_MS = Number(process.env.PREFLIGHT_LOGIN_WAIT_MS || "5000");
+const PREFLIGHT_RETRIES = Number(process.env.PREFLIGHT_RETRIES || "3");
 const PREFLIGHT_RETRY_DELAY_MS = Number(process.env.PREFLIGHT_RETRY_DELAY_MS || "1500");
-const PREFLIGHT_MAX_GOOD_SITES = Number(process.env.PREFLIGHT_MAX_GOOD_SITES || "2"); // pick top N good sites
-const PREFLIGHT_REQUIRE_AT_LEAST_ONE_OK = envTruthy(process.env.PREFLIGHT_REQUIRE_OK || "1"); // if none good, abort run
+const PREFLIGHT_MAX_SITES = Number(process.env.PREFLIGHT_MAX_SITES || "2"); // keep small for stability
 
 function emailConfigured() {
   if (!EMAIL_ENABLED) return false;
@@ -272,9 +272,9 @@ function safeListDir(dir) {
 }
 
 // --------------------
-// Selectors + blockers
+// Locators that work even if the login is inside an iframe
 // --------------------
-const USERNAME_SELECTOR = [
+const USER_INPUT_SELECTOR = [
   'input[type="email"]',
   'input[type="text"]',
   'input[type="tel"]',
@@ -288,58 +288,39 @@ const USERNAME_SELECTOR = [
   'input[placeholder*="mobile" i]'
 ].join(", ");
 
-const PASSWORD_SELECTOR = [
+const PASS_INPUT_SELECTOR = [
   'input[type="password"]',
-  'input[name*="pass" i]',
-  'input[placeholder*="pass" i]'
+  'input[placeholder*="password" i]'
 ].join(", ");
 
-const BLOCKED_TEXT_PATTERNS = [
-  /captcha/i,
-  /verify you are human/i,
-  /human verification/i,
-  /security check/i,
-  /access denied/i,
-  /temporarily unavailable/i,
-  /too many requests/i,
-  /rate limit/i,
-  /cloudflare/i
-];
+async function findVisibleLocatorInAllFrames(page, selector) {
+  // main frame first
+  const mainLoc = page.locator(selector).first();
+  if (await mainLoc.isVisible().catch(() => false)) return { frame: null, locator: mainLoc };
 
-async function pageLooksBlocked(page) {
-  try {
-    const bodyText = await page.locator("body").innerText({ timeout: 3000 }).catch(() => "");
-    const t = (bodyText || "").slice(0, 3000);
-    for (const re of BLOCKED_TEXT_PATTERNS) {
-      if (re.test(t)) return { blocked: true, reason: `Matched: ${re}` };
-    }
-    return { blocked: false, reason: "" };
-  } catch {
-    return { blocked: false, reason: "" };
+  // then all frames
+  for (const frame of page.frames()) {
+    try {
+      // skip main frame (already checked)
+      if (frame === page.mainFrame()) continue;
+      const loc = frame.locator(selector).first();
+      const ok = await loc.isVisible().catch(() => false);
+      if (ok) return { frame, locator: loc };
+    } catch {}
   }
+
+  return { frame: null, locator: null };
 }
 
-async function findVisibleInFrames(page, selector, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-
-  while (Date.now() < deadline) {
-    // main frame first
-    const mainLoc = page.locator(selector).first();
-    if (await mainLoc.isVisible().catch(() => false)) return { where: "main", locator: mainLoc };
-
-    // then frames
-    const frames = page.frames();
-    for (const fr of frames) {
-      if (fr === page.mainFrame()) continue;
-      const loc = fr.locator(selector).first();
-      const ok = await loc.isVisible().catch(() => false);
-      if (ok) return { where: "frame", locator: loc };
-    }
-
+async function waitForLoginFormAnywhere(page, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const u = await findVisibleLocatorInAllFrames(page, USER_INPUT_SELECTOR);
+    const p = await findVisibleLocatorInAllFrames(page, PASS_INPUT_SELECTOR);
+    if (u.locator && p.locator) return { ok: true, user: u, pass: p };
     await sleep(250);
   }
-
-  return { where: null, locator: null };
+  return { ok: false };
 }
 
 // --------------------
@@ -348,13 +329,11 @@ async function findVisibleInFrames(page, selector, timeoutMs) {
 async function waitForToastOrModal(page) {
   if (!VERIFY_TOAST) return { ok: false, type: "toast_off", detail: "VERIFY_TOAST disabled" };
 
+  // keep these conservative so we don’t accidentally match random “success” UI elsewhere
   const patterns = [
     /already followed/i,
     /followed the order/i,
-    /success/i,
-    /successful/i,
-    /completed/i,
-    /confirm success/i
+    /order followed/i
   ];
 
   const start = Date.now();
@@ -411,94 +390,74 @@ async function verifyOrderFollowed(page) {
 }
 
 // --------------------
-// Preflight: find good sites once per run
+// Preflight site selection
 // --------------------
-async function preflightSite(loginUrl) {
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
-  });
+async function preflightPickSites() {
+  if (!PREFLIGHT_ENABLED) return LOGIN_URLS.slice(0, PREFLIGHT_MAX_SITES);
 
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 720 },
-    locale: "en-US",
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-  });
+  const picked = [];
+  for (const loginUrl of LOGIN_URLS) {
+    if (picked.length >= PREFLIGHT_MAX_SITES) break;
 
-  const page = await context.newPage();
+    for (let attempt = 1; attempt <= PREFLIGHT_RETRIES; attempt++) {
+      console.log(`Preflight checking: ${loginUrl} attempt ${attempt}`);
+      const browser = await chromium.launch({
+        headless: true,
+        args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+      });
 
-  try {
-    const resp = await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      const context = await browser.newContext({
+        viewport: { width: 1280, height: 720 },
+        locale: "en-US",
+        userAgent:
+          process.env.USER_AGENT ||
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+      });
 
-    const status = resp ? resp.status() : null;
-    if (status && status >= 400) {
-      await dumpDebugState(page, "preflight-http-fail", { loginUrl, status });
-      throw new Error(`Preflight failed: HTTP ${status}`);
-    }
+      // light anti-detection
+      await context.addInitScript(() => {
+        try {
+          Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+        } catch {}
+      });
 
-    await sleep(800);
+      const page = await context.newPage();
 
-    const blocked = await pageLooksBlocked(page);
-    if (blocked.blocked) {
-      await dumpDebugState(page, "preflight-blocked", { loginUrl, reason: blocked.reason });
-      throw new Error(`Preflight blocked: ${blocked.reason}`);
-    }
-
-    const foundUser = await findVisibleInFrames(page, USERNAME_SELECTOR, PREFLIGHT_LOGIN_WAIT_MS);
-    if (!foundUser.locator) {
-      await dumpDebugState(page, "preflight-no-user", { loginUrl, waitedMs: PREFLIGHT_LOGIN_WAIT_MS });
-      throw new Error(`locator.waitFor: Timeout ${PREFLIGHT_LOGIN_WAIT_MS}ms exceeded.`);
-    }
-
-    return { ok: true, loginUrl };
-  } finally {
-    await context.close().catch(() => null);
-    await browser.close().catch(() => null);
-  }
-}
-
-async function chooseSitesForRun() {
-  if (!PREFLIGHT_ENABLED) return { chosen: LOGIN_URLS.slice(0, PREFLIGHT_MAX_GOOD_SITES), details: [] };
-
-  const good = [];
-  const details = [];
-
-  for (const url of LOGIN_URLS) {
-    let lastErr = null;
-
-    for (let i = 1; i <= PREFLIGHT_RETRIES; i++) {
       try {
-        console.log("Preflight checking:", url, "attempt", i);
-        const r = await preflightSite(url);
-        good.push(r.loginUrl);
-        details.push({ url, ok: true });
-        console.log("Preflight OK:", url);
+        const resp = await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+        await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => null);
+
+        const status = resp ? resp.status() : null;
+        if (status && status >= 400) {
+          await dumpDebugState(page, "preflight-http-fail", { loginUrl, status });
+          throw new Error(`Preflight failed: HTTP ${status}`);
+        }
+
+        const form = await waitForLoginFormAnywhere(page, PREFLIGHT_LOGIN_WAIT_MS);
+        if (!form.ok) {
+          await dumpDebugState(page, "preflight-no-user", { loginUrl });
+          throw new Error(`locator.waitFor: Timeout ${PREFLIGHT_LOGIN_WAIT_MS}ms exceeded.`);
+        }
+
+        console.log("Preflight OK:", loginUrl);
+        picked.push(loginUrl);
         break;
       } catch (e) {
         const msg = e && e.message ? e.message : String(e);
-        lastErr = msg;
-        details.push({ url, ok: false, err: msg, attempt: i });
-        console.log("Preflight attempt", i, "failed for", url, "err:", msg);
+        console.log(`Preflight attempt ${attempt} failed for ${loginUrl} err: ${msg}`);
+        await dumpDebugState(page, `preflight-failed-${attempt}`, { loginUrl, err: msg });
         await sleep(PREFLIGHT_RETRY_DELAY_MS);
+        if (attempt === PREFLIGHT_RETRIES) {
+          console.log(`Preflight: skipping ${loginUrl} final err: ${msg}`);
+        }
+      } finally {
+        await context.close().catch(() => null);
+        await browser.close().catch(() => null);
       }
     }
-
-    if (good.length >= PREFLIGHT_MAX_GOOD_SITES) break;
-
-    if (!good.includes(url) && lastErr) {
-      console.log("Preflight: skipping", url, "final err:", lastErr);
-    }
   }
 
-  const chosen = good.slice(0, PREFLIGHT_MAX_GOOD_SITES);
-
-  if (PREFLIGHT_REQUIRE_AT_LEAST_ONE_OK && chosen.length === 0) {
-    throw new Error("No healthy sites found in preflight. Aborting run.");
-  }
-
-  console.log("Chosen sites for this run:", chosen.join(", ") || "(none)");
-  return { chosen, details };
+  return picked.length ? picked : LOGIN_URLS.slice(0, PREFLIGHT_MAX_SITES);
 }
 
 // --------------------
@@ -524,7 +483,7 @@ app.get("/", (req, res) => {
     <div>Verify toast: <b>${VERIFY_TOAST ? "ON" : "OFF"}</b></div>
     <div>Verify pending: <b>${VERIFY_PENDING ? "ON" : "OFF"}</b></div>
     <div>Confirm retries: <b>${CONFIRM_RETRIES}</b></div>
-    <div>Preflight enabled: <b>${PREFLIGHT_ENABLED ? "YES" : "NO"}</b>, loginWaitMs: <b>${PREFLIGHT_LOGIN_WAIT_MS}</b></div>
+    <div>Preflight enabled: <b>${PREFLIGHT_ENABLED ? "true" : "false"}</b> loginWaitMs: <b>${PREFLIGHT_LOGIN_WAIT_MS}</b></div>
 
     <div style="color:red; margin-top:10px;">
       ${pwMissing ? "BOT_PASSWORD or RUN_PASSWORD not set<br/>" : ""}
@@ -566,7 +525,21 @@ app.get("/health", (req, res) => {
     emailProvider: EMAIL_PROVIDER,
     debugCapture: DEBUG_CAPTURE,
     lastDebugDir,
-    loginUrls: LOGIN_URLS
+    loginUrls: LOGIN_URLS,
+    verify: {
+      toast: VERIFY_TOAST,
+      pending: VERIFY_PENDING,
+      timeoutMs: VERIFY_TIMEOUT_MS,
+      confirmRetries: CONFIRM_RETRIES,
+      confirmRetryDelayMs: CONFIRM_RETRY_DELAY_MS
+    },
+    preflight: {
+      enabled: PREFLIGHT_ENABLED,
+      loginWaitMs: PREFLIGHT_LOGIN_WAIT_MS,
+      retries: PREFLIGHT_RETRIES,
+      retryDelayMs: PREFLIGHT_RETRY_DELAY_MS,
+      maxSites: PREFLIGHT_MAX_SITES
+    }
   });
 });
 
@@ -654,6 +627,9 @@ app.get("/dns-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
   const hosts = [
+    "bgol.pro",
+    "dsj89.com",
+    "dsj72.com",
     "dsj006.cc",
     "dsj12.cc",
     "dsj91.cc",
@@ -738,27 +714,18 @@ app.post("/run", async (req, res) => {
       console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
       console.log("Email provider:", EMAIL_PROVIDER);
       console.log("Email configured:", emailConfigured());
-
-      // Choose sites once per run
-      let chosenSites = [];
-      try {
-        const chosen = await chooseSitesForRun();
-        chosenSites = chosen.chosen;
-      } catch (e) {
-        const msg = e && e.message ? e.message : String(e);
-        await sendEmail(
-          `${subjectPrefix} FAILED`,
-          `T-Bot failed immediately because no healthy sites were found.\nRun ID: ${lastRunId}\nTime: ${nowLocal()}\n\nError:\n${msg}\n`
-        );
-        throw e;
-      }
+      console.log("Preflight enabled:", PREFLIGHT_ENABLED, "loginWaitMs:", PREFLIGHT_LOGIN_WAIT_MS);
+      console.log("Preflight retries:", PREFLIGHT_RETRIES, "retryDelayMs:", PREFLIGHT_RETRY_DELAY_MS);
 
       await sendEmail(
         `${subjectPrefix} started`,
         `T-Bot started at ${startedAt}\nRun ID: ${lastRunId}\nAccounts: ${cfg.accounts.length}\nDebug capture: ${
           DEBUG_CAPTURE ? "ON" : "OFF"
-        }\n\nChosen sites for this run:\n${chosenSites.join("\n")}\n\nYou will get a completion email with per-account results.\n`
+        }\n\nYou will get a completion email with per-account results.\n`
       );
+
+      const chosenSites = await preflightPickSites();
+      console.log("Chosen sites for this run:", chosenSites.join(", "));
 
       const results = [];
 
@@ -806,6 +773,10 @@ app.post("/run", async (req, res) => {
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
       lastError = msg;
+
+      const failedAt = nowLocal();
+      await sendEmail(`${subjectPrefix} FAILED`, `T-Bot failed at ${failedAt}\nRun ID: ${lastRunId}\nError: ${msg}\n`);
+
       console.log("Run failed:", msg);
     } finally {
       isRunning = false;
@@ -816,10 +787,10 @@ app.post("/run", async (req, res) => {
 // --------------------
 // Playwright core
 // --------------------
-async function runAccountAllSites(account, orderCode, sites) {
+async function runAccountAllSites(account, orderCode, siteList) {
   let last = null;
 
-  for (const loginUrl of sites) {
+  for (const loginUrl of siteList) {
     console.log("Trying site:", loginUrl, "for", account.username);
     try {
       const note = await runAccountOnSite(account, orderCode, loginUrl);
@@ -832,13 +803,18 @@ async function runAccountAllSites(account, orderCode, sites) {
     }
   }
 
-  throw last || new Error("All chosen sites failed");
+  throw last || new Error("All sites failed");
 }
 
 async function runAccountOnSite(account, orderCode, loginUrl) {
   const browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+    args: [
+      "--no-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-blink-features=AutomationControlled"
+    ]
   });
 
   const harPath =
@@ -848,8 +824,16 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     viewport: { width: 1280, height: 720 },
     locale: "en-US",
     userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+      process.env.USER_AGENT ||
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     recordHar: harPath ? { path: harPath, content: "embed" } : undefined
+  });
+
+  // light anti-detection
+  await context.addInitScript(() => {
+    try {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    } catch {}
   });
 
   const page = await context.newPage();
@@ -871,21 +855,15 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
   try {
     await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await sleep(1200);
+    await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => null);
+    await sleep(800);
     await dumpDebugState(page, "after-goto", { loginUrl, username: account.username });
 
-    const blocked = await pageLooksBlocked(page);
-    if (blocked.blocked) {
-      await dumpDebugState(page, "blocked-on-login", { reason: blocked.reason });
-      throw new Error(`BLOCKED: ${blocked.reason}`);
-    }
-
-    const foundUser = await findVisibleInFrames(page, USERNAME_SELECTOR, 25000);
-    const foundPass = await findVisibleInFrames(page, PASSWORD_SELECTOR, 25000);
-
-    if (!foundUser.locator || !foundPass.locator) {
-      await dumpDebugState(page, "login-fields-missing", { loginUrl });
-      throw new Error("Login form not found");
+    // Wait for login form anywhere (main or iframe)
+    const loginForm = await waitForLoginFormAnywhere(page, 25000);
+    if (!loginForm.ok) {
+      await dumpDebugState(page, "login-fields-missing", { loginUrl, username: account.username });
+      throw new Error("locator.waitFor: Timeout 25000ms exceeded.");
     }
 
     let loggedIn = false;
@@ -894,47 +872,61 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       console.log("Login attempt", attempt, "for", account.username, "on", loginUrl);
 
       await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-      await sleep(1200);
+      await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => null);
+      await sleep(800);
 
-      const b2 = await pageLooksBlocked(page);
-      if (b2.blocked) {
-        await dumpDebugState(page, "blocked-during-login", { reason: b2.reason, attempt });
-        throw new Error(`BLOCKED: ${b2.reason}`);
-      }
-
-      const uField = (await findVisibleInFrames(page, USERNAME_SELECTOR, 20000)).locator;
-      const pField = (await findVisibleInFrames(page, PASSWORD_SELECTOR, 20000)).locator;
-
-      if (!uField || !pField) {
-        await dumpDebugState(page, "login-fields-missing-retry", { attempt });
+      const lf = await waitForLoginFormAnywhere(page, 25000);
+      if (!lf.ok) {
+        await dumpDebugState(page, `login-fields-missing-${attempt}`, { loginUrl, attempt });
         continue;
       }
 
-      await uField.fill("").catch(() => null);
-      await pField.fill("").catch(() => null);
+      // Fill fields (works whether they're in iframe or main frame)
+      await lf.user.locator.fill("").catch(() => null);
+      await lf.pass.locator.fill("").catch(() => null);
 
-      await uField.click({ timeout: 5000 }).catch(() => null);
-      await uField.fill(account.username).catch(() => null);
-      await sleep(250);
+      await lf.user.locator.click({ timeout: 5000 }).catch(() => null);
+      await lf.user.locator.fill(account.username).catch(() => null);
+      await sleep(200);
 
-      await pField.click({ timeout: 5000 }).catch(() => null);
-      await pField.fill(account.password).catch(() => null);
-      await sleep(250);
+      await lf.pass.locator.click({ timeout: 5000 }).catch(() => null);
+      await lf.pass.locator.fill(account.password).catch(() => null);
+      await sleep(200);
 
-      const loginBtn = page.getByRole("button", { name: /login/i }).first();
-      if (await loginBtn.isVisible().catch(() => false)) {
-        await loginBtn.click({ timeout: 10000 }).catch(() => null);
+      // Click login (try both main page and frames)
+      const loginBtnMain = page.getByRole("button", { name: /login/i }).first();
+      let clicked = false;
+
+      if (await loginBtnMain.isVisible().catch(() => false)) {
+        await loginBtnMain.click({ timeout: 10000 }).catch(() => null);
+        clicked = true;
       } else {
-        await pField.press("Enter").catch(() => null);
+        // try inside frames
+        for (const frame of page.frames()) {
+          try {
+            const btn = frame.getByRole("button", { name: /login/i }).first();
+            if (await btn.isVisible().catch(() => false)) {
+              await btn.click({ timeout: 10000 }).catch(() => null);
+              clicked = true;
+              break;
+            }
+          } catch {}
+        }
       }
 
-      await sleep(1800);
+      if (!clicked) {
+        // fallback: Enter on password
+        await lf.pass.locator.press("Enter").catch(() => null);
+      }
+
+      await sleep(1400);
       await dumpDebugState(page, `after-login-attempt-${attempt}`, { attempt });
 
       const fu = futuresUrlFromLoginUrl(loginUrl);
       if (fu) {
         await page.goto(fu, { waitUntil: "domcontentloaded", timeout: 60000 });
-        await sleep(1500);
+        await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => null);
+        await sleep(900);
         await dumpDebugState(page, "after-futures-direct", { futuresUrl: fu });
 
         const hasInvitedTab = await page.locator("text=/invited me/i").first().isVisible().catch(() => false);
@@ -947,7 +939,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
         }
       }
 
-      await sleep(800);
+      await sleep(600);
     }
 
     if (!loggedIn) {
@@ -959,7 +951,8 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     if (!futuresUrl) throw new Error("Could not build Futures URL from login URL");
 
     await page.goto(futuresUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await sleep(1500);
+    await page.waitForLoadState("networkidle", { timeout: 20000 }).catch(() => null);
+    await sleep(900);
     await dumpDebugState(page, "after-futures", { futuresUrl });
 
     const invited = page.locator("text=/invited me/i").first();
@@ -969,23 +962,12 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     }
 
     await invited.click({ timeout: 10000 }).catch(() => null);
-    await sleep(1200);
+    await sleep(1000);
     await dumpDebugState(page, "after-invited", {});
 
-    // If code box sometimes fails to show, re-click Invited and retry once
-    let codeBox = page
-      .locator('input[placeholder*="order code" i], input[placeholder*="Please enter" i], input[type="text"]')
+    const codeBox = page
+      .locator('input[placeholder*="order code" i], input[placeholder*="Please enter" i], input[placeholder*="code" i]')
       .first();
-
-    if (!(await codeBox.isVisible().catch(() => false))) {
-      await invited.click({ timeout: 10000 }).catch(() => null);
-      await sleep(1200);
-      await dumpDebugState(page, "after-invited-reclick", {});
-      codeBox = page
-        .locator('input[placeholder*="order code" i], input[placeholder*="Please enter" i], input[type="text"]')
-        .first();
-    }
-
     if (!(await codeBox.isVisible().catch(() => false))) {
       await dumpDebugState(page, "code-box-missing", {});
       throw new Error("Order code input not found");
@@ -993,7 +975,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
     await codeBox.click().catch(() => null);
     await codeBox.fill(orderCode);
-    await sleep(600);
+    await sleep(450);
     await dumpDebugState(page, "after-code", { codeLength: String(orderCode || "").length });
 
     const confirmBtn = page.getByRole("button", { name: /confirm/i }).first();
@@ -1007,7 +989,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     for (let i = 1; i <= CONFIRM_RETRIES; i++) {
       console.log("Confirm attempt", i, "for", account.username);
       await confirmBtn.click({ timeout: 10000 }).catch(() => null);
-      await sleep(1200);
+      await sleep(900);
       await dumpDebugState(page, `after-confirm-attempt-${i}`, {});
 
       const verify = await verifyOrderFollowed(page);
