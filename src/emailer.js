@@ -58,7 +58,6 @@ async function sendEmail(env, subject, text) {
     const msgId =
       (res && res.headers && (res.headers["x-message-id"] || res.headers["X-Message-Id"])) || null;
 
-    // Only log these fields (no tracking URLs, no raw response dumps)
     console.log("Email sent:", { status, msgId, to });
 
     return { ok: true, skipped: false, status, msgId, to };
@@ -75,17 +74,38 @@ function stripUrls(s) {
   return String(s).replace(/https?:\/\/\S+/gi, "").trim();
 }
 
-/**
- * perAccount items support either:
- *  - { username, status: "QUEUED"|"SUCCESS"|"FAIL", detail }
- * or legacy:
- *  - { username, ok: boolean, detail }
- */
-function buildRunEmailText({ phase, runId, startedAt, finishedAt, chosenSites, perAccount }) {
+function summarizeCounts(perAccount) {
+  const queued = perAccount.filter((x) => x.state === "queued").length;
+  const ok = perAccount.filter((x) => x.state === "success").length;
+  const fail = perAccount.filter((x) => x.state === "fail").length;
+
+  const parts = [];
+  if (ok) parts.push(`${ok} success`);
+  if (fail) parts.push(`${fail} failed`);
+  if (queued) parts.push(`${queued} queued`);
+
+  return parts.length ? parts.join(", ") : "0";
+}
+
+function buildRunEmailText({
+  phase,
+  runId,
+  startedAt,
+  finishedAt,
+  chosenSites,
+  perAccount,
+  headerNote,
+}) {
+  // perAccount: [{ username, state: "queued"|"success"|"fail", detail }]
   const lines = [];
 
   lines.push(`T-Bot ${phase}`);
   lines.push("");
+
+  if (headerNote) {
+    lines.push(String(headerNote));
+    lines.push("");
+  }
 
   if (startedAt) lines.push(`Started: ${startedAt}`);
   if (finishedAt) lines.push(`Finished: ${finishedAt}`);
@@ -94,42 +114,28 @@ function buildRunEmailText({ phase, runId, startedAt, finishedAt, chosenSites, p
   lines.push("");
 
   if (perAccount && perAccount.length) {
-    const normalized = perAccount.map((a) => {
-      const status =
-        a.status ||
-        (a.ok === true ? "SUCCESS" : a.ok === false ? "FAIL" : "QUEUED");
-      return {
-        username: a.username,
-        status,
-        detail: stripUrls(a.detail || ""),
-      };
-    });
+    lines.push(`Summary: ${summarizeCounts(perAccount)}`);
+    lines.push("");
+    lines.push("Per-account status:");
 
-    if (phase.toLowerCase() === "started") {
-      lines.push(`Summary: ${normalized.length} queued`);
-      lines.push("");
-      lines.push("Per-account status:");
-      for (const a of normalized) {
-        lines.push(`QUEUED: ${a.username}${a.detail ? ` - ${a.detail}` : ""}`);
+    for (const a of perAccount) {
+      const detail = stripUrls(a.detail || "");
+
+      if (a.state === "queued") {
+        // Exactly what you asked: email then " - Queued", no QUEUED: prefix
+        lines.push(`${a.username}${detail ? ` - ${detail}` : ""}`);
+        continue;
       }
-    } else {
-      const okCount = normalized.filter((x) => x.status === "SUCCESS").length;
-      const failCount = normalized.filter((x) => x.status === "FAIL").length;
 
-      lines.push(`Summary: ${okCount} success, ${failCount} failed`);
-      lines.push("");
-      lines.push("Per-account status:");
-
-      for (const a of normalized) {
-        lines.push(`${a.status}: ${a.username}${a.detail ? ` - ${a.detail}` : ""}`);
-      }
+      const status = a.state === "success" ? "SUCCESS" : "FAIL";
+      lines.push(`${status}: ${a.username}${detail ? ` - ${detail}` : ""}`);
     }
   }
 
   lines.push("");
   lines.push("Notes:");
   lines.push("- If a site is flaky (HTTP 500 / DNS), preflight will skip it automatically.");
-  lines.push("- This email intentionally strips URLs so it stays readable.");
+  lines.push("- This email strips URLs so it stays readable.");
 
   return lines.join("\n");
 }
@@ -141,4 +147,3 @@ module.exports = {
   stripUrls,
   buildRunEmailText,
 };
-
