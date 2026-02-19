@@ -7,7 +7,13 @@ const path = require("path");
 const dns = require("dns").promises;
 const { chromium } = require("playwright");
 
-const { envTruthy, emailConfigured, sendEmail, stripUrls, buildRunEmailText } = require("./src/emailer");
+const {
+  envTruthy,
+  emailConfigured,
+  sendEmail,
+  stripUrls,
+  buildRunEmailText,
+} = require("./src/emailer");
 
 const PORT = process.env.PORT || 8080;
 
@@ -20,6 +26,7 @@ const LOGIN_URLS_ENV = process.env.LOGIN_URLS || "";
 
 // Debug capture
 const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE || "0");
+const DIAG_LOG_BUNDLE = envTruthy(process.env.DIAG_LOG_BUNDLE || "1");
 
 // Verification controls
 const VERIFY_TOAST = envTruthy(process.env.VERIFY_TOAST || "1");
@@ -33,13 +40,21 @@ const CONFIRM_WAIT_MS = Number(process.env.CONFIRM_WAIT_MS || "2000");
 const CONFIRM_POST_CLICK_SETTLE_MS = Number(process.env.CONFIRM_POST_CLICK_SETTLE_MS || "1000");
 
 // Preflight controls
-const PREFLIGHT_ENABLED = envTruthy(process.env.PREFLIGHT_ENABLED || process.env.SITE_PREFLIGHT_ENABLED || "1");
+const PREFLIGHT_ENABLED = envTruthy(
+  process.env.PREFLIGHT_ENABLED || process.env.SITE_PREFLIGHT_ENABLED || "1"
+);
 const PREFLIGHT_LOGIN_WAIT_MS = Number(
   process.env.PREFLIGHT_LOGIN_WAIT_MS || process.env.SITE_PREFLIGHT_GOTO_TIMEOUT_MS || "20000"
 );
-const PREFLIGHT_RETRIES = Number(process.env.PREFLIGHT_RETRIES || process.env.SITE_PREFLIGHT_RETRIES || "3");
-const PREFLIGHT_RETRY_DELAY_MS = Number(process.env.PREFLIGHT_RETRY_DELAY_MS || process.env.SITE_PREFLIGHT_RETRY_DELAY_MS || "2000");
-const PREFLIGHT_MAX_SITES = Number(process.env.PREFLIGHT_MAX_SITES || process.env.PREFLIGHT_TOPN || "2");
+const PREFLIGHT_RETRIES = Number(
+  process.env.PREFLIGHT_RETRIES || process.env.SITE_PREFLIGHT_RETRIES || "3"
+);
+const PREFLIGHT_RETRY_DELAY_MS = Number(
+  process.env.PREFLIGHT_RETRY_DELAY_MS || process.env.SITE_PREFLIGHT_RETRY_DELAY_MS || "2000"
+);
+const PREFLIGHT_MAX_SITES = Number(
+  process.env.PREFLIGHT_MAX_SITES || process.env.PREFLIGHT_TOPN || "2"
+);
 const PREFLIGHT_REQUIRE_OK = envTruthy(process.env.PREFLIGHT_REQUIRE_OK || "1");
 
 // Timings
@@ -47,6 +62,7 @@ const WAIT_AFTER_GOTO_MS = Number(process.env.WAIT_AFTER_GOTO_MS || "1500");
 const WAIT_AFTER_LOGIN_MS = Number(process.env.WAIT_AFTER_LOGIN_MS || "2200");
 const WAIT_AFTER_FUTURES_DIRECT_MS = Number(process.env.WAIT_AFTER_FUTURES_DIRECT_MS || "1800");
 const WAIT_AFTER_FUTURES_MS = Number(process.env.WAIT_AFTER_FUTURES_MS || "1800");
+const WAIT_AFTER_INVITED_MS = Number(process.env.WAIT_AFTER_INVITED_MS || "1500");
 
 // --------------------
 // Helpers
@@ -91,48 +107,34 @@ function writePlaceholderLastShot() {
   } catch {}
 }
 
-function normalizeLoginUrl(u) {
-  const s = String(u || "").trim();
-  if (!s) return null;
-  return s;
-}
-
-function toPcLogin(u) {
-  try {
-    const url = new URL(u);
-    return `${url.protocol}//${url.host}/pc/#/login`;
-  } catch {
-    return null;
-  }
-}
-
-function toH5Login(u) {
-  try {
-    const url = new URL(u);
-    return `${url.protocol}//${url.host}/h5/#/login`;
-  } catch {
-    return null;
-  }
-}
-
-function expandPcAndH5(list) {
+// Expand LOGIN_URLS so each domain tries both pc and h5 automatically.
+// User does NOT need to add mobile URLs to Railway.
+function expandPcAndH5(urls) {
   const out = [];
   const seen = new Set();
 
-  for (const raw of list) {
-    const u = normalizeLoginUrl(raw);
-    if (!u) continue;
+  function add(u) {
+    if (!u) return;
+    const k = String(u).trim();
+    if (!k) return;
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(k);
+  }
 
-    // If they gave a full /pc or /h5 url, still generate both variants on the same host.
-    const pc = toPcLogin(u);
-    const h5 = toH5Login(u);
+  for (const u of urls) {
+    add(u);
 
-    for (const v of [pc, h5, u]) {
-      if (!v) continue;
-      if (seen.has(v)) continue;
-      seen.add(v);
-      out.push(v);
-    }
+    try {
+      const url = new URL(u);
+      const base = `${url.protocol}//${url.host}`;
+
+      // If pc login, also add h5 login
+      if (u.includes("/pc/#/login")) add(`${base}/h5/#/login`);
+
+      // If h5 login, also add pc login
+      if (u.includes("/h5/#/login")) add(`${base}/pc/#/login`);
+    } catch {}
   }
 
   return out;
@@ -141,13 +143,14 @@ function expandPcAndH5(list) {
 function parseLoginUrls() {
   const fallback = ["https://dsj006.cc/pc/#/login", "https://dsj12.cc/pc/#/login"];
   const raw = (LOGIN_URLS_ENV || "").trim();
-  const base = raw
-    ? raw.split(",").map((x) => x.trim()).filter(Boolean)
+  const baseList = raw
+    ? raw
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean)
     : fallback;
 
-  // This is the key reliability boost: always try PC and H5 for each domain
-  const expanded = expandPcAndH5(base);
-
+  const expanded = expandPcAndH5(baseList);
   return expanded.length ? expanded : fallback;
 }
 
@@ -442,8 +445,16 @@ async function preflightSites() {
           await context.close().catch(() => null);
           break;
         } catch (e) {
-          console.log("Preflight attempt failed:", loginUrl, "err:", e && e.message ? e.message : String(e));
-          await dumpDebugState(page, `preflight-failed-${i}`, { loginUrl, err: e && e.message ? e.message : String(e) });
+          console.log(
+            "Preflight attempt failed:",
+            loginUrl,
+            "err:",
+            e && e.message ? e.message : String(e)
+          );
+          await dumpDebugState(page, `preflight-failed-${i}`, {
+            loginUrl,
+            err: e && e.message ? e.message : String(e),
+          });
           await context.close().catch(() => null);
           await sleep(PREFLIGHT_RETRY_DELAY_MS);
         }
@@ -479,14 +490,17 @@ async function runForAccount({ page, loginUrl, username, password, code }) {
   const userRes = await findVisibleInAnyFrame(page, USER_SELECTORS, 25000);
   if (!userRes.ok) throw new Error("Login fields missing (user field not visible)");
 
-  const passRes = await findVisibleInAnyFrame(page, PASS_SELECTORS, 12000);
+  const passRes = await findVisibleInAnyFrame(page, PASS_SELECTORS, 10000);
   if (!passRes.ok) throw new Error("Login fields missing (password field not visible)");
 
   const frame = userRes.frame;
   await frame.locator(USER_SELECTORS).first().fill(username, { timeout: 15000 });
   await frame.locator(PASS_SELECTORS).first().fill(password, { timeout: 15000 });
 
-  const loginBtn = frame.getByRole("button", { name: /login|sign in/i }).first();
+  const loginBtn = frame
+    .getByRole("button", { name: /login|sign in/i })
+    .first()
+    .or(frame.locator("button:has-text('Login')").first());
   await loginBtn.click({ timeout: 15000 }).catch(() => null);
 
   await sleep(WAIT_AFTER_LOGIN_MS);
@@ -521,7 +535,7 @@ async function runForAccount({ page, loginUrl, username, password, code }) {
     for (const btn of confirmBtnCandidates) {
       const visible = await btn.isVisible().catch(() => false);
       if (visible) {
-        console.log("Confirm attempt", i, "for", username, "on", loginUrl);
+        console.log("Confirm attempt", i, "for", username);
         await btn.click({ timeout: 8000 }).catch(() => null);
         didClick = true;
         break;
@@ -557,6 +571,24 @@ async function runForAccount({ page, loginUrl, username, password, code }) {
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
+function renderRunFormHtml() {
+  // Simple UI to post to /run
+  return `
+<hr/>
+<h3>Run bot</h3>
+<form method="POST" action="/run">
+  <label>Password:</label><br/>
+  <input name="p" type="password" style="width: 320px; padding: 6px;" /><br/><br/>
+  <label>Code:</label><br/>
+  <input name="code" type="text" style="width: 320px; padding: 6px;" /><br/><br/>
+  <button type="submit" style="padding: 8px 14px;">Run</button>
+</form>
+<p style="margin-top:10px; color:#555;">
+  Tip: This page just submits to <code>/run</code>. Results are in Railway logs and email.
+</p>
+`;
+}
+
 app.get("/", (req, res) => {
   const cfg = safeJsonParseAccounts();
   const pwMissing = !BOT_PASSWORD;
@@ -580,6 +612,8 @@ app.get("/", (req, res) => {
 ${pwMissing ? "<p style='color:#b00'><b>BOT_PASSWORD/RUN_PASSWORD not set</b></p>" : ""}
 ${accountsMissing ? `<p style='color:#b00'><b>${escapeHtml(cfg.error || "ACCOUNTS_JSON not set")}</b></p>` : ""}
 ${lastError ? `<p style='color:#b00'><b>Last error:</b> ${escapeHtml(lastError)}</p>` : ""}
+
+${renderRunFormHtml()}
 
 <hr/>
 <p>
@@ -630,7 +664,7 @@ app.get("/email-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
   const result = await sendEmail(
     process.env,
-    "Complete",
+    "T-Bot | Test",
     `T-Bot email test\n\nSent at: ${nowLocal()}\nFrom: ${process.env.EMAIL_FROM || ""}\nTo: ${process.env.EMAIL_TO || ""}\n`
   );
   res.json({ ok: true, result });
@@ -664,7 +698,12 @@ app.get("/debug", (req, res) => {
 
   const files = safeListDir(lastDebugDir);
   const links = files
-    .map((f) => `<li><a href="/debug/files?p=${encodeURIComponent(req.query.p)}&f=${encodeURIComponent(f)}">${escapeHtml(f)}</a></li>`)
+    .map(
+      (f) =>
+        `<li><a href="/debug/files?p=${encodeURIComponent(req.query.p)}&f=${encodeURIComponent(
+          f
+        )}">${escapeHtml(f)}</a></li>`
+    )
     .join("");
 
   res.send(`
@@ -715,7 +754,7 @@ app.get("/dns-test", async (req, res) => {
 app.get("/net-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
-  const urls = ["https://dsj006.cc/", "https://dsj12.cc/", "https://api.sendgrid.com/"];
+  const urls = ["https://dsj006.cc/", "https://dsj12.cc/", "https://dsj877.cc/", "https://api.sendgrid.com/"];
   const results = {};
 
   for (const u of urls) {
@@ -763,17 +802,16 @@ app.post("/run", async (req, res) => {
   (async () => {
     const startedAt = nowLocal();
 
-    // STARTED email: queued, no weird FAIL prefix
     await sendEmail(
       process.env,
-      "Started",
+      "T-Bot | Started",
       buildRunEmailText({
         phase: "Started",
         runId: lastRunId,
         startedAt,
         finishedAt: null,
         chosenSites: [],
-        perAccount: cfg.accounts.map((a) => ({ username: a.username, state: "queued", detail: "Queued" })),
+        perAccount: cfg.accounts.map((a) => ({ username: a.username, ok: false, detail: "Queued" })),
       })
     );
 
@@ -802,11 +840,9 @@ app.post("/run", async (req, res) => {
       });
 
       try {
-        for (let idx = 0; idx < cfg.accounts.length; idx++) {
-          const acct = cfg.accounts[idx];
+        for (const acct of cfg.accounts) {
           let success = false;
           let lastErr = null;
-          let usedSite = null;
 
           for (const loginUrl of chosenSites) {
             const context = await browser.newContext({
@@ -828,60 +864,34 @@ app.post("/run", async (req, res) => {
                 code,
               });
 
-              perAccount.push({ username: acct.username, state: "success", detail: result.detail });
+              perAccount.push({ username: acct.username, ok: true, detail: result.detail });
               console.log("SUCCESS:", acct.username, "on", loginUrl);
               success = true;
-              usedSite = loginUrl;
 
               await context.close().catch(() => null);
               break;
             } catch (e) {
               lastErr = e && e.message ? e.message : String(e);
-              usedSite = loginUrl;
-              console.log("ACCOUNT FAILED:", acct.username, "on", loginUrl, "err:", lastErr);
               await dumpDebugState(page, "account-failed", { username: acct.username, loginUrl, err: lastErr });
               await context.close().catch(() => null);
             }
           }
 
           if (!success) {
-            perAccount.push({ username: acct.username, state: "fail", detail: lastErr || "Unknown failure" });
+            perAccount.push({ username: acct.username, ok: false, detail: lastErr || "Unknown failure" });
           }
-
-          // Per-account email update so you can jump in immediately
-          const acctState = perAccount[perAccount.length - 1];
-          const subject = acctState.state === "success" ? "Complete" : "Failed";
-          await sendEmail(
-            process.env,
-            subject,
-            buildRunEmailText({
-              phase: "Account Update",
-              runId: lastRunId,
-              startedAt,
-              finishedAt: nowLocal(),
-              chosenSites,
-              headerNote: `Account ${idx + 1} of ${cfg.accounts.length}: ${acct.username} (${acctState.state})\nLast site tried: ${usedSite || "n/a"}`,
-              perAccount: [
-                acctState,
-                ...cfg.accounts
-                  .slice(idx + 1)
-                  .map((a) => ({ username: a.username, state: "queued", detail: "Queued" })),
-              ],
-            })
-          );
         }
       } finally {
         await browser.close().catch(() => null);
       }
 
-      const okCount = perAccount.filter((x) => x.state === "success").length;
-      const failCount = perAccount.filter((x) => x.state === "fail").length;
+      const failCount = perAccount.filter((x) => !x.ok).length;
 
       if (failCount > 0) {
         lastError = `Some accounts failed (${failCount})`;
         await sendEmail(
           process.env,
-          "Failed",
+          "T-Bot | Failed",
           buildRunEmailText({
             phase: "Failed",
             runId: lastRunId,
@@ -895,7 +905,7 @@ app.post("/run", async (req, res) => {
 
       await sendEmail(
         process.env,
-        "Complete",
+        "T-Bot | Complete",
         buildRunEmailText({
           phase: "Complete",
           runId: lastRunId,
@@ -912,7 +922,7 @@ app.post("/run", async (req, res) => {
 
       await sendEmail(
         process.env,
-        "Failed",
+        "T-Bot | Failed",
         buildRunEmailText({
           phase: "Failed",
           runId: lastRunId,
@@ -921,7 +931,7 @@ app.post("/run", async (req, res) => {
           chosenSites,
           perAccount: perAccount.length
             ? perAccount
-            : cfg.accounts.map((a) => ({ username: a.username, state: "fail", detail: lastError })),
+            : cfg.accounts.map((a) => ({ username: a.username, ok: false, detail: lastError })),
         })
       );
 
