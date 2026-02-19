@@ -7,13 +7,7 @@ const path = require("path");
 const dns = require("dns").promises;
 const { chromium } = require("playwright");
 
-const {
-  envTruthy,
-  emailConfigured,
-  sendEmail,
-  stripUrls,
-  buildRunEmailText,
-} = require("./src/emailer");
+const { envTruthy, emailConfigured, sendEmail, stripUrls, buildRunEmailText } = require("./src/emailer");
 
 const PORT = process.env.PORT || 8080;
 
@@ -26,7 +20,6 @@ const LOGIN_URLS_ENV = process.env.LOGIN_URLS || "";
 
 // Debug capture
 const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE || "0");
-const DIAG_LOG_BUNDLE = envTruthy(process.env.DIAG_LOG_BUNDLE || "1");
 
 // Verification controls
 const VERIFY_TOAST = envTruthy(process.env.VERIFY_TOAST || "1");
@@ -40,25 +33,13 @@ const CONFIRM_WAIT_MS = Number(process.env.CONFIRM_WAIT_MS || "2000");
 const CONFIRM_POST_CLICK_SETTLE_MS = Number(process.env.CONFIRM_POST_CLICK_SETTLE_MS || "1000");
 
 // Preflight controls
-const PREFLIGHT_ENABLED = envTruthy(
-  process.env.PREFLIGHT_ENABLED || process.env.SITE_PREFLIGHT_ENABLED || "1"
-);
+const PREFLIGHT_ENABLED = envTruthy(process.env.PREFLIGHT_ENABLED || process.env.SITE_PREFLIGHT_ENABLED || "1");
 const PREFLIGHT_LOGIN_WAIT_MS = Number(
-  process.env.PREFLIGHT_LOGIN_WAIT_MS ||
-    process.env.SITE_PREFLIGHT_GOTO_TIMEOUT_MS ||
-    "20000"
+  process.env.PREFLIGHT_LOGIN_WAIT_MS || process.env.SITE_PREFLIGHT_GOTO_TIMEOUT_MS || "20000"
 );
-const PREFLIGHT_RETRIES = Number(
-  process.env.PREFLIGHT_RETRIES || process.env.SITE_PREFLIGHT_RETRIES || "3"
-);
-const PREFLIGHT_RETRY_DELAY_MS = Number(
-  process.env.PREFLIGHT_RETRY_DELAY_MS ||
-    process.env.SITE_PREFLIGHT_RETRY_DELAY_MS ||
-    "2000"
-);
-const PREFLIGHT_MAX_SITES = Number(
-  process.env.PREFLIGHT_MAX_SITES || process.env.PREFLIGHT_TOPN || "2"
-);
+const PREFLIGHT_RETRIES = Number(process.env.PREFLIGHT_RETRIES || process.env.SITE_PREFLIGHT_RETRIES || "3");
+const PREFLIGHT_RETRY_DELAY_MS = Number(process.env.PREFLIGHT_RETRY_DELAY_MS || process.env.SITE_PREFLIGHT_RETRY_DELAY_MS || "2000");
+const PREFLIGHT_MAX_SITES = Number(process.env.PREFLIGHT_MAX_SITES || process.env.PREFLIGHT_TOPN || "2");
 const PREFLIGHT_REQUIRE_OK = envTruthy(process.env.PREFLIGHT_REQUIRE_OK || "1");
 
 // Timings
@@ -66,7 +47,6 @@ const WAIT_AFTER_GOTO_MS = Number(process.env.WAIT_AFTER_GOTO_MS || "1500");
 const WAIT_AFTER_LOGIN_MS = Number(process.env.WAIT_AFTER_LOGIN_MS || "2200");
 const WAIT_AFTER_FUTURES_DIRECT_MS = Number(process.env.WAIT_AFTER_FUTURES_DIRECT_MS || "1800");
 const WAIT_AFTER_FUTURES_MS = Number(process.env.WAIT_AFTER_FUTURES_MS || "1800");
-const WAIT_AFTER_INVITED_MS = Number(process.env.WAIT_AFTER_INVITED_MS || "1500");
 
 // --------------------
 // Helpers
@@ -111,15 +91,64 @@ function writePlaceholderLastShot() {
   } catch {}
 }
 
+function normalizeLoginUrl(u) {
+  const s = String(u || "").trim();
+  if (!s) return null;
+  return s;
+}
+
+function toPcLogin(u) {
+  try {
+    const url = new URL(u);
+    return `${url.protocol}//${url.host}/pc/#/login`;
+  } catch {
+    return null;
+  }
+}
+
+function toH5Login(u) {
+  try {
+    const url = new URL(u);
+    return `${url.protocol}//${url.host}/h5/#/login`;
+  } catch {
+    return null;
+  }
+}
+
+function expandPcAndH5(list) {
+  const out = [];
+  const seen = new Set();
+
+  for (const raw of list) {
+    const u = normalizeLoginUrl(raw);
+    if (!u) continue;
+
+    // If they gave a full /pc or /h5 url, still generate both variants on the same host.
+    const pc = toPcLogin(u);
+    const h5 = toH5Login(u);
+
+    for (const v of [pc, h5, u]) {
+      if (!v) continue;
+      if (seen.has(v)) continue;
+      seen.add(v);
+      out.push(v);
+    }
+  }
+
+  return out;
+}
+
 function parseLoginUrls() {
   const fallback = ["https://dsj006.cc/pc/#/login", "https://dsj12.cc/pc/#/login"];
   const raw = (LOGIN_URLS_ENV || "").trim();
-  if (!raw) return fallback;
-  const list = raw
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean);
-  return list.length ? list : fallback;
+  const base = raw
+    ? raw.split(",").map((x) => x.trim()).filter(Boolean)
+    : fallback;
+
+  // This is the key reliability boost: always try PC and H5 for each domain
+  const expanded = expandPcAndH5(base);
+
+  return expanded.length ? expanded : fallback;
 }
 
 let LOGIN_URLS = parseLoginUrls();
@@ -293,64 +322,6 @@ async function findVisibleInAnyFrame(page, selector, timeoutMs) {
   return { ok: false, frame: null, locator: null };
 }
 
-async function clickConfirmAnyFrame(page, username) {
-  // Look for confirm-like buttons in every frame, not just the main page
-  const nameRes = [/confirm/i, /submit/i, /^ok$/i];
-  const cssRes = [
-    "button:has-text('Confirm')",
-    "button:has-text('Submit')",
-    "button:has-text('OK')",
-    "[role='button']:has-text('Confirm')",
-    "[role='button']:has-text('Submit')",
-    "[role='button']:has-text('OK')",
-  ];
-
-  for (let i = 1; i <= CONFIRM_RETRIES; i++) {
-    await closeOverlays(page);
-
-    let didClick = false;
-
-    const frames = page.frames();
-    for (const f of frames) {
-      if (didClick) break;
-
-      for (const re of nameRes) {
-        try {
-          const b = f.getByRole("button", { name: re }).first();
-          if (await b.isVisible().catch(() => false)) {
-            console.log("Confirm attempt", i, "for", username);
-            await b.click({ timeout: 8000 }).catch(() => null);
-            didClick = true;
-            break;
-          }
-        } catch {}
-      }
-
-      if (didClick) break;
-
-      for (const sel of cssRes) {
-        try {
-          const b = f.locator(sel).first();
-          if (await b.isVisible().catch(() => false)) {
-            console.log("Confirm attempt", i, "for", username);
-            await b.click({ timeout: 8000 }).catch(() => null);
-            didClick = true;
-            break;
-          }
-        } catch {}
-      }
-    }
-
-    await sleep(CONFIRM_POST_CLICK_SETTLE_MS);
-    await dumpDebugState(page, `after-confirm-attempt-${i}`, { didClick });
-
-    if (didClick) return true;
-    await sleep(CONFIRM_RETRY_DELAY_MS);
-  }
-
-  return false;
-}
-
 // --------------------
 // Verification
 // --------------------
@@ -471,16 +442,8 @@ async function preflightSites() {
           await context.close().catch(() => null);
           break;
         } catch (e) {
-          console.log(
-            "Preflight attempt failed:",
-            loginUrl,
-            "err:",
-            e && e.message ? e.message : String(e)
-          );
-          await dumpDebugState(page, `preflight-failed-${i}`, {
-            loginUrl,
-            err: e && e.message ? e.message : String(e),
-          });
+          console.log("Preflight attempt failed:", loginUrl, "err:", e && e.message ? e.message : String(e));
+          await dumpDebugState(page, `preflight-failed-${i}`, { loginUrl, err: e && e.message ? e.message : String(e) });
           await context.close().catch(() => null);
           await sleep(PREFLIGHT_RETRY_DELAY_MS);
         }
@@ -516,17 +479,14 @@ async function runForAccount({ page, loginUrl, username, password, code }) {
   const userRes = await findVisibleInAnyFrame(page, USER_SELECTORS, 25000);
   if (!userRes.ok) throw new Error("Login fields missing (user field not visible)");
 
-  const passRes = await findVisibleInAnyFrame(page, PASS_SELECTORS, 10000);
+  const passRes = await findVisibleInAnyFrame(page, PASS_SELECTORS, 12000);
   if (!passRes.ok) throw new Error("Login fields missing (password field not visible)");
 
   const frame = userRes.frame;
   await frame.locator(USER_SELECTORS).first().fill(username, { timeout: 15000 });
   await frame.locator(PASS_SELECTORS).first().fill(password, { timeout: 15000 });
 
-  const loginBtn = frame
-    .getByRole("button", { name: /login|sign in/i })
-    .first()
-    .or(frame.locator("button:has-text('Login')").first());
+  const loginBtn = frame.getByRole("button", { name: /login|sign in/i }).first();
   await loginBtn.click({ timeout: 15000 }).catch(() => null);
 
   await sleep(WAIT_AFTER_LOGIN_MS);
@@ -548,13 +508,37 @@ async function runForAccount({ page, loginUrl, username, password, code }) {
   await codeRes.frame.locator(ORDER_CODE_SELECTORS).first().fill(code, { timeout: 15000 });
   await dumpDebugState(page, "after-code", {});
 
-  // Some versions submit on Enter, so do both
-  try {
-    await codeRes.frame.keyboard.press("Enter");
-    await sleep(300);
-  } catch {}
+  let clicked = false;
+  for (let i = 1; i <= CONFIRM_RETRIES; i++) {
+    const confirmBtnCandidates = [
+      page.getByRole("button", { name: /confirm|submit|ok/i }).first(),
+      page.locator("button:has-text('Confirm')").first(),
+      page.locator("button:has-text('Submit')").first(),
+      page.locator("button:has-text('OK')").first(),
+    ];
 
-  const clicked = await clickConfirmAnyFrame(page, username);
+    let didClick = false;
+    for (const btn of confirmBtnCandidates) {
+      const visible = await btn.isVisible().catch(() => false);
+      if (visible) {
+        console.log("Confirm attempt", i, "for", username, "on", loginUrl);
+        await btn.click({ timeout: 8000 }).catch(() => null);
+        didClick = true;
+        break;
+      }
+    }
+
+    await sleep(CONFIRM_POST_CLICK_SETTLE_MS);
+    await dumpDebugState(page, `after-confirm-attempt-${i}`, { didClick });
+
+    if (didClick) {
+      clicked = true;
+      break;
+    }
+
+    await sleep(CONFIRM_RETRY_DELAY_MS);
+  }
+
   if (!clicked) throw new Error("Confirm button not found");
 
   await sleep(CONFIRM_WAIT_MS);
@@ -563,6 +547,7 @@ async function runForAccount({ page, loginUrl, username, password, code }) {
   if (!verify.ok) throw new Error(verify.detail);
 
   await dumpDebugState(page, "confirm-verified", { verify });
+
   return { ok: true, detail: verify.detail };
 }
 
@@ -645,7 +630,7 @@ app.get("/email-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
   const result = await sendEmail(
     process.env,
-    "T-Bot | Test",
+    "Complete",
     `T-Bot email test\n\nSent at: ${nowLocal()}\nFrom: ${process.env.EMAIL_FROM || ""}\nTo: ${process.env.EMAIL_TO || ""}\n`
   );
   res.json({ ok: true, result });
@@ -679,12 +664,7 @@ app.get("/debug", (req, res) => {
 
   const files = safeListDir(lastDebugDir);
   const links = files
-    .map(
-      (f) =>
-        `<li><a href="/debug/files?p=${encodeURIComponent(req.query.p)}&f=${encodeURIComponent(
-          f
-        )}">${escapeHtml(f)}</a></li>`
-    )
+    .map((f) => `<li><a href="/debug/files?p=${encodeURIComponent(req.query.p)}&f=${encodeURIComponent(f)}">${escapeHtml(f)}</a></li>`)
     .join("");
 
   res.send(`
@@ -718,7 +698,7 @@ app.get("/debug/files", (req, res) => {
 app.get("/dns-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
-  const hosts = ["dsj006.cc", "dsj12.cc", "dsj91.cc", "dsj96.com", "dsj82.com", "dsj85.com", "api.sendgrid.com"];
+  const hosts = ["dsj006.cc", "dsj12.cc", "dsj877.cc", "api.sendgrid.com"];
 
   const out = {};
   for (const h of hosts) {
@@ -783,17 +763,17 @@ app.post("/run", async (req, res) => {
   (async () => {
     const startedAt = nowLocal();
 
-    // Started email should show QUEUED, not FAIL
+    // STARTED email: queued, no weird FAIL prefix
     await sendEmail(
       process.env,
-      "T-Bot | Started",
+      "Started",
       buildRunEmailText({
         phase: "Started",
         runId: lastRunId,
         startedAt,
         finishedAt: null,
         chosenSites: [],
-        perAccount: cfg.accounts.map((a) => ({ username: a.username, status: "QUEUED", detail: "Queued" })),
+        perAccount: cfg.accounts.map((a) => ({ username: a.username, state: "queued", detail: "Queued" })),
       })
     );
 
@@ -822,9 +802,11 @@ app.post("/run", async (req, res) => {
       });
 
       try {
-        for (const acct of cfg.accounts) {
+        for (let idx = 0; idx < cfg.accounts.length; idx++) {
+          const acct = cfg.accounts[idx];
           let success = false;
           let lastErr = null;
+          let usedSite = null;
 
           for (const loginUrl of chosenSites) {
             const context = await browser.newContext({
@@ -846,35 +828,60 @@ app.post("/run", async (req, res) => {
                 code,
               });
 
-              perAccount.push({ username: acct.username, status: "SUCCESS", detail: result.detail });
+              perAccount.push({ username: acct.username, state: "success", detail: result.detail });
               console.log("SUCCESS:", acct.username, "on", loginUrl);
               success = true;
+              usedSite = loginUrl;
 
               await context.close().catch(() => null);
               break;
             } catch (e) {
               lastErr = e && e.message ? e.message : String(e);
+              usedSite = loginUrl;
+              console.log("ACCOUNT FAILED:", acct.username, "on", loginUrl, "err:", lastErr);
               await dumpDebugState(page, "account-failed", { username: acct.username, loginUrl, err: lastErr });
               await context.close().catch(() => null);
             }
           }
 
           if (!success) {
-            perAccount.push({ username: acct.username, status: "FAIL", detail: lastErr || "Unknown failure" });
+            perAccount.push({ username: acct.username, state: "fail", detail: lastErr || "Unknown failure" });
           }
+
+          // Per-account email update so you can jump in immediately
+          const acctState = perAccount[perAccount.length - 1];
+          const subject = acctState.state === "success" ? "Complete" : "Failed";
+          await sendEmail(
+            process.env,
+            subject,
+            buildRunEmailText({
+              phase: "Account Update",
+              runId: lastRunId,
+              startedAt,
+              finishedAt: nowLocal(),
+              chosenSites,
+              headerNote: `Account ${idx + 1} of ${cfg.accounts.length}: ${acct.username} (${acctState.state})\nLast site tried: ${usedSite || "n/a"}`,
+              perAccount: [
+                acctState,
+                ...cfg.accounts
+                  .slice(idx + 1)
+                  .map((a) => ({ username: a.username, state: "queued", detail: "Queued" })),
+              ],
+            })
+          );
         }
       } finally {
         await browser.close().catch(() => null);
       }
 
-      const okCount = perAccount.filter((x) => x.status === "SUCCESS").length;
-      const failCount = perAccount.length - okCount;
+      const okCount = perAccount.filter((x) => x.state === "success").length;
+      const failCount = perAccount.filter((x) => x.state === "fail").length;
 
       if (failCount > 0) {
         lastError = `Some accounts failed (${failCount})`;
         await sendEmail(
           process.env,
-          "T-Bot | Failed",
+          "Failed",
           buildRunEmailText({
             phase: "Failed",
             runId: lastRunId,
@@ -884,20 +891,20 @@ app.post("/run", async (req, res) => {
             perAccount,
           })
         );
-      } else {
-        await sendEmail(
-          process.env,
-          "T-Bot | Complete",
-          buildRunEmailText({
-            phase: "Complete",
-            runId: lastRunId,
-            startedAt,
-            finishedAt: nowLocal(),
-            chosenSites,
-            perAccount,
-          })
-        );
       }
+
+      await sendEmail(
+        process.env,
+        "Complete",
+        buildRunEmailText({
+          phase: "Complete",
+          runId: lastRunId,
+          startedAt,
+          finishedAt: nowLocal(),
+          chosenSites,
+          perAccount,
+        })
+      );
 
       console.log("Bot completed");
     } catch (e) {
@@ -905,7 +912,7 @@ app.post("/run", async (req, res) => {
 
       await sendEmail(
         process.env,
-        "T-Bot | Failed",
+        "Failed",
         buildRunEmailText({
           phase: "Failed",
           runId: lastRunId,
@@ -914,7 +921,7 @@ app.post("/run", async (req, res) => {
           chosenSites,
           perAccount: perAccount.length
             ? perAccount
-            : cfg.accounts.map((a) => ({ username: a.username, status: "FAIL", detail: lastError })),
+            : cfg.accounts.map((a) => ({ username: a.username, state: "fail", detail: lastError })),
         })
       );
 
@@ -928,4 +935,3 @@ app.post("/run", async (req, res) => {
 app.listen(PORT, () => {
   console.log("Listening on", PORT);
 });
-
