@@ -40,11 +40,25 @@ const CONFIRM_WAIT_MS = Number(process.env.CONFIRM_WAIT_MS || "2000");
 const CONFIRM_POST_CLICK_SETTLE_MS = Number(process.env.CONFIRM_POST_CLICK_SETTLE_MS || "1000");
 
 // Preflight controls
-const PREFLIGHT_ENABLED = envTruthy(process.env.PREFLIGHT_ENABLED || process.env.SITE_PREFLIGHT_ENABLED || "1");
-const PREFLIGHT_LOGIN_WAIT_MS = Number(process.env.PREFLIGHT_LOGIN_WAIT_MS || process.env.SITE_PREFLIGHT_GOTO_TIMEOUT_MS || "20000");
-const PREFLIGHT_RETRIES = Number(process.env.PREFLIGHT_RETRIES || process.env.SITE_PREFLIGHT_RETRIES || "3");
-const PREFLIGHT_RETRY_DELAY_MS = Number(process.env.PREFLIGHT_RETRY_DELAY_MS || process.env.SITE_PREFLIGHT_RETRY_DELAY_MS || "2000");
-const PREFLIGHT_MAX_SITES = Number(process.env.PREFLIGHT_MAX_SITES || process.env.PREFLIGHT_TOPN || "2");
+const PREFLIGHT_ENABLED = envTruthy(
+  process.env.PREFLIGHT_ENABLED || process.env.SITE_PREFLIGHT_ENABLED || "1"
+);
+const PREFLIGHT_LOGIN_WAIT_MS = Number(
+  process.env.PREFLIGHT_LOGIN_WAIT_MS ||
+    process.env.SITE_PREFLIGHT_GOTO_TIMEOUT_MS ||
+    "20000"
+);
+const PREFLIGHT_RETRIES = Number(
+  process.env.PREFLIGHT_RETRIES || process.env.SITE_PREFLIGHT_RETRIES || "3"
+);
+const PREFLIGHT_RETRY_DELAY_MS = Number(
+  process.env.PREFLIGHT_RETRY_DELAY_MS ||
+    process.env.SITE_PREFLIGHT_RETRY_DELAY_MS ||
+    "2000"
+);
+const PREFLIGHT_MAX_SITES = Number(
+  process.env.PREFLIGHT_MAX_SITES || process.env.PREFLIGHT_TOPN || "2"
+);
 const PREFLIGHT_REQUIRE_OK = envTruthy(process.env.PREFLIGHT_REQUIRE_OK || "1");
 
 // Timings
@@ -98,10 +112,7 @@ function writePlaceholderLastShot() {
 }
 
 function parseLoginUrls() {
-  const fallback = [
-    "https://dsj006.cc/pc/#/login",
-    "https://dsj12.cc/pc/#/login",
-  ];
+  const fallback = ["https://dsj006.cc/pc/#/login", "https://dsj12.cc/pc/#/login"];
   const raw = (LOGIN_URLS_ENV || "").trim();
   if (!raw) return fallback;
   const list = raw
@@ -282,6 +293,64 @@ async function findVisibleInAnyFrame(page, selector, timeoutMs) {
   return { ok: false, frame: null, locator: null };
 }
 
+async function clickConfirmAnyFrame(page, username) {
+  // Look for confirm-like buttons in every frame, not just the main page
+  const nameRes = [/confirm/i, /submit/i, /^ok$/i];
+  const cssRes = [
+    "button:has-text('Confirm')",
+    "button:has-text('Submit')",
+    "button:has-text('OK')",
+    "[role='button']:has-text('Confirm')",
+    "[role='button']:has-text('Submit')",
+    "[role='button']:has-text('OK')",
+  ];
+
+  for (let i = 1; i <= CONFIRM_RETRIES; i++) {
+    await closeOverlays(page);
+
+    let didClick = false;
+
+    const frames = page.frames();
+    for (const f of frames) {
+      if (didClick) break;
+
+      for (const re of nameRes) {
+        try {
+          const b = f.getByRole("button", { name: re }).first();
+          if (await b.isVisible().catch(() => false)) {
+            console.log("Confirm attempt", i, "for", username);
+            await b.click({ timeout: 8000 }).catch(() => null);
+            didClick = true;
+            break;
+          }
+        } catch {}
+      }
+
+      if (didClick) break;
+
+      for (const sel of cssRes) {
+        try {
+          const b = f.locator(sel).first();
+          if (await b.isVisible().catch(() => false)) {
+            console.log("Confirm attempt", i, "for", username);
+            await b.click({ timeout: 8000 }).catch(() => null);
+            didClick = true;
+            break;
+          }
+        } catch {}
+      }
+    }
+
+    await sleep(CONFIRM_POST_CLICK_SETTLE_MS);
+    await dumpDebugState(page, `after-confirm-attempt-${i}`, { didClick });
+
+    if (didClick) return true;
+    await sleep(CONFIRM_RETRY_DELAY_MS);
+  }
+
+  return false;
+}
+
 // --------------------
 // Verification
 // --------------------
@@ -392,7 +461,7 @@ async function preflightSites() {
           const userRes = await findVisibleInAnyFrame(page, USER_SELECTORS, PREFLIGHT_LOGIN_WAIT_MS);
           if (!userRes.ok) {
             await dumpDebugState(page, "preflight-no-user", { loginUrl, status });
-            throw new Error(`Preflight: user field not visible`);
+            throw new Error("Preflight: user field not visible");
           }
 
           await dumpDebugState(page, "preflight-ok", { loginUrl, status });
@@ -402,8 +471,16 @@ async function preflightSites() {
           await context.close().catch(() => null);
           break;
         } catch (e) {
-          console.log("Preflight attempt failed:", loginUrl, "err:", e && e.message ? e.message : String(e));
-          await dumpDebugState(page, `preflight-failed-${i}`, { loginUrl, err: e && e.message ? e.message : String(e) });
+          console.log(
+            "Preflight attempt failed:",
+            loginUrl,
+            "err:",
+            e && e.message ? e.message : String(e)
+          );
+          await dumpDebugState(page, `preflight-failed-${i}`, {
+            loginUrl,
+            err: e && e.message ? e.message : String(e),
+          });
           await context.close().catch(() => null);
           await sleep(PREFLIGHT_RETRY_DELAY_MS);
         }
@@ -429,7 +506,7 @@ async function preflightSites() {
 }
 
 // --------------------
-// Core bot action (minimal: login -> go futures -> enter code -> confirm -> verify)
+// Core bot action
 // --------------------
 async function runForAccount({ page, loginUrl, username, password, code }) {
   await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
@@ -442,20 +519,19 @@ async function runForAccount({ page, loginUrl, username, password, code }) {
   const passRes = await findVisibleInAnyFrame(page, PASS_SELECTORS, 10000);
   if (!passRes.ok) throw new Error("Login fields missing (password field not visible)");
 
-  // Fill in the frame where the user field is visible
   const frame = userRes.frame;
   await frame.locator(USER_SELECTORS).first().fill(username, { timeout: 15000 });
   await frame.locator(PASS_SELECTORS).first().fill(password, { timeout: 15000 });
 
-  // Click login button (best-effort)
-  const loginBtn =
-    frame.getByRole("button", { name: /login|sign in/i }).first().or(frame.locator("button:has-text('Login')").first());
+  const loginBtn = frame
+    .getByRole("button", { name: /login|sign in/i })
+    .first()
+    .or(frame.locator("button:has-text('Login')").first());
   await loginBtn.click({ timeout: 15000 }).catch(() => null);
 
   await sleep(WAIT_AFTER_LOGIN_MS);
   await dumpDebugState(page, "after-login", { loginUrl });
 
-  // Go straight to futures/contract page
   const futuresUrl = futuresUrlFromLoginUrl(loginUrl);
   if (futuresUrl) {
     await page.goto(futuresUrl, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => null);
@@ -463,60 +539,30 @@ async function runForAccount({ page, loginUrl, username, password, code }) {
     await dumpDebugState(page, "after-futures-direct", { futuresUrl });
   }
 
-  // Confirm logged-in by checking we can see something app-like
-  // We keep this loose because the site is buggy
   await sleep(WAIT_AFTER_FUTURES_MS);
   await dumpDebugState(page, "after-futures", {});
 
-  // Enter order code
   const codeRes = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 15000);
   if (!codeRes.ok) throw new Error("Order code field not found");
 
   await codeRes.frame.locator(ORDER_CODE_SELECTORS).first().fill(code, { timeout: 15000 });
   await dumpDebugState(page, "after-code", {});
 
-  // Confirm button (multiple tries)
-  let clicked = false;
-  for (let i = 1; i <= CONFIRM_RETRIES; i++) {
-    const confirmBtnCandidates = [
-      page.getByRole("button", { name: /confirm|submit|ok/i }).first(),
-      page.locator("button:has-text('Confirm')").first(),
-      page.locator("button:has-text('Submit')").first(),
-      page.locator("button:has-text('OK')").first(),
-    ];
+  // Some versions submit on Enter, so do both
+  try {
+    await codeRes.frame.keyboard.press("Enter");
+    await sleep(300);
+  } catch {}
 
-    let didClick = false;
-    for (const btn of confirmBtnCandidates) {
-      const visible = await btn.isVisible().catch(() => false);
-      if (visible) {
-        console.log("Confirm attempt", i, "for", username);
-        await btn.click({ timeout: 8000 }).catch(() => null);
-        didClick = true;
-        break;
-      }
-    }
-
-    await sleep(CONFIRM_POST_CLICK_SETTLE_MS);
-    await dumpDebugState(page, `after-confirm-attempt-${i}`, { didClick });
-
-    if (didClick) {
-      clicked = true;
-      break;
-    }
-
-    await sleep(CONFIRM_RETRY_DELAY_MS);
-  }
-
+  const clicked = await clickConfirmAnyFrame(page, username);
   if (!clicked) throw new Error("Confirm button not found");
 
   await sleep(CONFIRM_WAIT_MS);
 
-  // Verify outcome (toast and/or pending)
   const verify = await verifyOrderFollowed(page);
   if (!verify.ok) throw new Error(verify.detail);
 
   await dumpDebugState(page, "confirm-verified", { verify });
-
   return { ok: true, detail: verify.detail };
 }
 
@@ -633,7 +679,12 @@ app.get("/debug", (req, res) => {
 
   const files = safeListDir(lastDebugDir);
   const links = files
-    .map((f) => `<li><a href="/debug/files?p=${encodeURIComponent(req.query.p)}&f=${encodeURIComponent(f)}">${escapeHtml(f)}</a></li>`)
+    .map(
+      (f) =>
+        `<li><a href="/debug/files?p=${encodeURIComponent(req.query.p)}&f=${encodeURIComponent(
+          f
+        )}">${escapeHtml(f)}</a></li>`
+    )
     .join("");
 
   res.send(`
@@ -667,15 +718,7 @@ app.get("/debug/files", (req, res) => {
 app.get("/dns-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
-  const hosts = [
-    "dsj006.cc",
-    "dsj12.cc",
-    "dsj91.cc",
-    "dsj96.com",
-    "dsj82.com",
-    "dsj85.com",
-    "api.sendgrid.com",
-  ];
+  const hosts = ["dsj006.cc", "dsj12.cc", "dsj91.cc", "dsj96.com", "dsj82.com", "dsj85.com", "api.sendgrid.com"];
 
   const out = {};
   for (const h of hosts) {
@@ -740,7 +783,7 @@ app.post("/run", async (req, res) => {
   (async () => {
     const startedAt = nowLocal();
 
-    // Email: Started (simple subject)
+    // Started email should show QUEUED, not FAIL
     await sendEmail(
       process.env,
       "T-Bot | Started",
@@ -750,7 +793,7 @@ app.post("/run", async (req, res) => {
         startedAt,
         finishedAt: null,
         chosenSites: [],
-        perAccount: cfg.accounts.map((a) => ({ username: a.username, ok: false, detail: "Queued" })),
+        perAccount: cfg.accounts.map((a) => ({ username: a.username, status: "QUEUED", detail: "Queued" })),
       })
     );
 
@@ -803,7 +846,7 @@ app.post("/run", async (req, res) => {
                 code,
               });
 
-              perAccount.push({ username: acct.username, ok: true, detail: result.detail });
+              perAccount.push({ username: acct.username, status: "SUCCESS", detail: result.detail });
               console.log("SUCCESS:", acct.username, "on", loginUrl);
               success = true;
 
@@ -817,14 +860,14 @@ app.post("/run", async (req, res) => {
           }
 
           if (!success) {
-            perAccount.push({ username: acct.username, ok: false, detail: lastErr || "Unknown failure" });
+            perAccount.push({ username: acct.username, status: "FAIL", detail: lastErr || "Unknown failure" });
           }
         }
       } finally {
         await browser.close().catch(() => null);
       }
 
-      const okCount = perAccount.filter((x) => x.ok).length;
+      const okCount = perAccount.filter((x) => x.status === "SUCCESS").length;
       const failCount = perAccount.length - okCount;
 
       if (failCount > 0) {
@@ -841,20 +884,20 @@ app.post("/run", async (req, res) => {
             perAccount,
           })
         );
+      } else {
+        await sendEmail(
+          process.env,
+          "T-Bot | Complete",
+          buildRunEmailText({
+            phase: "Complete",
+            runId: lastRunId,
+            startedAt,
+            finishedAt: nowLocal(),
+            chosenSites,
+            perAccount,
+          })
+        );
       }
-
-      await sendEmail(
-        process.env,
-        "T-Bot | Complete",
-        buildRunEmailText({
-          phase: "Complete",
-          runId: lastRunId,
-          startedAt,
-          finishedAt: nowLocal(),
-          chosenSites,
-          perAccount,
-        })
-      );
 
       console.log("Bot completed");
     } catch (e) {
@@ -871,7 +914,7 @@ app.post("/run", async (req, res) => {
           chosenSites,
           perAccount: perAccount.length
             ? perAccount
-            : cfg.accounts.map((a) => ({ username: a.username, ok: false, detail: lastError })),
+            : cfg.accounts.map((a) => ({ username: a.username, status: "FAIL", detail: lastError })),
         })
       );
 
@@ -885,3 +928,4 @@ app.post("/run", async (req, res) => {
 app.listen(PORT, () => {
   console.log("Listening on", PORT);
 });
+
