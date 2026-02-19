@@ -58,7 +58,7 @@ async function sendEmail(env, subject, text) {
     const msgId =
       (res && res.headers && (res.headers["x-message-id"] || res.headers["X-Message-Id"])) || null;
 
-    // IMPORTANT: only log these fields (no tracking URLs, no raw response dumps)
+    // Only log these fields (no tracking URLs, no raw response dumps)
     console.log("Email sent:", { status, msgId, to });
 
     return { ok: true, skipped: false, status, msgId, to };
@@ -72,16 +72,21 @@ async function sendEmail(env, subject, text) {
 
 function stripUrls(s) {
   if (!s) return "";
-  // Remove any http/https URLs, including SendGrid tracking links
   return String(s).replace(/https?:\/\/\S+/gi, "").trim();
 }
 
+/**
+ * perAccount items support either:
+ *  - { username, status: "QUEUED"|"SUCCESS"|"FAIL", detail }
+ * or legacy:
+ *  - { username, ok: boolean, detail }
+ */
 function buildRunEmailText({ phase, runId, startedAt, finishedAt, chosenSites, perAccount }) {
-  // perAccount: [{ username, ok, detail }]
   const lines = [];
 
   lines.push(`T-Bot ${phase}`);
   lines.push("");
+
   if (startedAt) lines.push(`Started: ${startedAt}`);
   if (finishedAt) lines.push(`Finished: ${finishedAt}`);
   if (runId) lines.push(`Run: ${runId}`);
@@ -89,17 +94,35 @@ function buildRunEmailText({ phase, runId, startedAt, finishedAt, chosenSites, p
   lines.push("");
 
   if (perAccount && perAccount.length) {
-    const okCount = perAccount.filter((x) => x.ok).length;
-    const failCount = perAccount.length - okCount;
+    const normalized = perAccount.map((a) => {
+      const status =
+        a.status ||
+        (a.ok === true ? "SUCCESS" : a.ok === false ? "FAIL" : "QUEUED");
+      return {
+        username: a.username,
+        status,
+        detail: stripUrls(a.detail || ""),
+      };
+    });
 
-    lines.push(`Summary: ${okCount} success, ${failCount} failed`);
-    lines.push("");
-    lines.push("Per-account status:");
+    if (phase.toLowerCase() === "started") {
+      lines.push(`Summary: ${normalized.length} queued`);
+      lines.push("");
+      lines.push("Per-account status:");
+      for (const a of normalized) {
+        lines.push(`QUEUED: ${a.username}${a.detail ? ` - ${a.detail}` : ""}`);
+      }
+    } else {
+      const okCount = normalized.filter((x) => x.status === "SUCCESS").length;
+      const failCount = normalized.filter((x) => x.status === "FAIL").length;
 
-    for (const a of perAccount) {
-      const status = a.ok ? "SUCCESS" : "FAIL";
-      const detail = stripUrls(a.detail || "");
-      lines.push(`${status}: ${a.username}${detail ? ` - ${detail}` : ""}`);
+      lines.push(`Summary: ${okCount} success, ${failCount} failed`);
+      lines.push("");
+      lines.push("Per-account status:");
+
+      for (const a of normalized) {
+        lines.push(`${a.status}: ${a.username}${a.detail ? ` - ${a.detail}` : ""}`);
+      }
     }
   }
 
@@ -118,3 +141,4 @@ module.exports = {
   stripUrls,
   buildRunEmailText,
 };
+
