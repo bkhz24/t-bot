@@ -58,6 +58,7 @@ async function sendEmail(env, subject, text) {
     const msgId =
       (res && res.headers && (res.headers["x-message-id"] || res.headers["X-Message-Id"])) || null;
 
+    // Only log safe fields (no tracking URLs)
     console.log("Email sent:", { status, msgId, to });
 
     return { ok: true, skipped: false, status, msgId, to };
@@ -74,68 +75,95 @@ function stripUrls(s) {
   return String(s).replace(/https?:\/\/\S+/gi, "").trim();
 }
 
-function summarizeCounts(perAccount) {
-  const queued = perAccount.filter((x) => x.state === "queued").length;
-  const ok = perAccount.filter((x) => x.state === "success").length;
-  const fail = perAccount.filter((x) => x.state === "fail").length;
+function safeSitesLine(chosenSites) {
+  // Do not include clickable URLs in emails. SendGrid will wrap them.
+  // We only include host + pc/h5 label.
+  if (!chosenSites || !chosenSites.length) return "";
+  const labels = [];
+  const seen = new Set();
 
-  const parts = [];
-  if (ok) parts.push(`${ok} success`);
-  if (fail) parts.push(`${fail} failed`);
-  if (queued) parts.push(`${queued} queued`);
+  for (const u of chosenSites) {
+    try {
+      const url = new URL(u);
+      const host = url.host;
+      const flavor = u.includes("/h5/#/") ? "h5" : "pc";
+      const label = `${host} (${flavor})`;
+      if (!seen.has(label)) {
+        seen.add(label);
+        labels.push(label);
+      }
+    } catch {
+      // ignore
+    }
+  }
 
-  return parts.length ? parts.join(", ") : "0";
+  return labels.length ? `Sites: ${labels.join(", ")}` : "";
 }
 
-function buildRunEmailText({
-  phase,
-  runId,
-  startedAt,
-  finishedAt,
-  chosenSites,
-  perAccount,
-  headerNote,
-}) {
-  // perAccount: [{ username, state: "queued"|"success"|"fail", detail }]
+function statusLabel(a) {
+  // a.status can be "QUEUED", "SUCCESS", "FAIL"
+  // If missing, infer from a.ok boolean when appropriate
+  if (a && a.status) return String(a.status).toUpperCase();
+  if (a && a.ok === true) return "SUCCESS";
+  if (a && a.ok === false) return "FAIL";
+  return "INFO";
+}
+
+function buildRunEmailText({ phase, runId, startedAt, finishedAt, chosenSites, perAccount, extraLines }) {
   const lines = [];
 
   lines.push(`T-Bot ${phase}`);
   lines.push("");
 
-  if (headerNote) {
-    lines.push(String(headerNote));
-    lines.push("");
-  }
-
   if (startedAt) lines.push(`Started: ${startedAt}`);
   if (finishedAt) lines.push(`Finished: ${finishedAt}`);
   if (runId) lines.push(`Run: ${runId}`);
-  if (chosenSites && chosenSites.length) lines.push(`Sites: ${chosenSites.join(", ")}`);
+
+  const sitesLine = safeSitesLine(chosenSites);
+  if (sitesLine) lines.push(sitesLine);
+
   lines.push("");
 
   if (perAccount && perAccount.length) {
-    lines.push(`Summary: ${summarizeCounts(perAccount)}`);
+    const okCount = perAccount.filter((x) => x.ok === true).length;
+    const failCount = perAccount.filter((x) => x.ok === false).length;
+    const queuedCount = perAccount.filter((x) => statusLabel(x) === "QUEUED").length;
+
+    // Started email: show queued count only
+    if (phase.toLowerCase() === "started") {
+      lines.push(`Summary: ${queuedCount || perAccount.length} queued`);
+    } else {
+      lines.push(`Summary: ${okCount} success, ${failCount} failed`);
+    }
+
     lines.push("");
     lines.push("Per-account status:");
 
     for (const a of perAccount) {
+      const st = statusLabel(a);
       const detail = stripUrls(a.detail || "");
-
-      if (a.state === "queued") {
-        // Exactly what you asked: email then " - Queued", no QUEUED: prefix
+      // No "QUEUED:" prefix duplication. Format exactly: email - Queued
+      if (st === "QUEUED") {
+        lines.push(`${a.username}${detail ? ` - ${detail}` : " - Queued"}`);
+      } else if (st === "SUCCESS") {
+        lines.push(`SUCCESS: ${a.username}${detail ? ` - ${detail}` : ""}`);
+      } else if (st === "FAIL") {
+        lines.push(`FAIL: ${a.username}${detail ? ` - ${detail}` : ""}`);
+      } else {
         lines.push(`${a.username}${detail ? ` - ${detail}` : ""}`);
-        continue;
       }
-
-      const status = a.state === "success" ? "SUCCESS" : "FAIL";
-      lines.push(`${status}: ${a.username}${detail ? ` - ${detail}` : ""}`);
     }
+  }
+
+  if (extraLines && Array.isArray(extraLines) && extraLines.length) {
+    lines.push("");
+    for (const l of extraLines) lines.push(String(l));
   }
 
   lines.push("");
   lines.push("Notes:");
-  lines.push("- If a site is flaky (HTTP 500 / DNS), preflight will skip it automatically.");
-  lines.push("- This email strips URLs so it stays readable.");
+  lines.push("- This email avoids clickable site URLs so it stays readable.");
+  lines.push("- If a site is flaky (HTTP 500 / DNS / Cloudflare), fallback paths may be used.");
 
   return lines.join("\n");
 }
