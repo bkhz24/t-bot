@@ -111,7 +111,11 @@ function safeJsonParseAccounts() {
 // Login URLs
 // --------------------
 function parseLoginUrls() {
-  const fallback = ["https://dsj006.cc/pc/#/login", "https://dsj12.cc/pc/#/login"];
+  // IMPORTANT: default to H5 login now (since your manual flow is H5)
+  const fallback = [
+    "https://dsj12.cc/h5/#/login",
+    "https://dsj877.cc/h5/#/login"
+  ];
 
   const raw = (LOGIN_URLS_ENV || "").trim();
   if (!raw) return fallback;
@@ -139,15 +143,19 @@ function getBaseAndPrefixFromUrl(anyUrl) {
     if (anyUrl.includes("/h5/")) return { base, prefix: "/h5/#/" };
     if (anyUrl.includes("/pc/")) return { base, prefix: "/pc/#/" };
 
-    return { base, prefix: "/pc/#/" };
+    // Default to H5 if unknown (safer for your flow)
+    return { base, prefix: "/h5/#/" };
   } catch {
     return null;
   }
 }
 
+// ✅ THIS is the critical fix: H5 uses /trade, PC uses /contractTransaction
 function futuresUrlFromAnyUrl(anyUrl) {
   const bp = getBaseAndPrefixFromUrl(anyUrl);
   if (!bp) return null;
+
+  if (bp.prefix.startsWith("/h5/")) return `${bp.base}${bp.prefix}trade`;
   return `${bp.base}${bp.prefix}contractTransaction`;
 }
 
@@ -218,8 +226,6 @@ async function sendEmail(subject, text) {
     return { ok: false, skipped: true, error: "Email not configured" };
   }
   try {
-    // Lazily require so the app still runs if you don't use email in local tests
-    // (but you'll need @sendgrid/mail installed if EMAIL_ENABLED=1 and configured)
     const sgMail = require("@sendgrid/mail");
     sgMail.setApiKey(SENDGRID_API_KEY);
 
@@ -495,7 +501,6 @@ async function logAfterLoginClick(page) {
     }
   })();
 
-  // "login form still visible" = user AND pass fields still visible somewhere
   const userVisible = await isVisibleInAnyFrame(page, USER_SELECTORS);
   const passVisible = await isVisibleInAnyFrame(page, PASS_SELECTORS);
   const loginFormVisible = userVisible && passVisible;
@@ -526,12 +531,10 @@ async function waitForLoginToSettle(page, timeoutMs = 25000) {
     const passVisible = await isVisibleInAnyFrame(page, PASS_SELECTORS);
     const loginFormVisible = userVisible && passVisible;
 
-    // If the login fields are gone, that's the best signal we can use without site-specific selectors.
     if (!loginFormVisible) {
       return { ok: true, url, userVisible, passVisible, reason: "login_fields_hidden" };
     }
 
-    // Some sites keep the hash route as /login briefly; if URL changes away from login, that’s also a hint.
     if (!/\/login\b|#\/login\b/i.test(url) && !(userVisible || passVisible)) {
       return { ok: true, url, userVisible, passVisible, reason: "url_changed_and_fields_gone" };
     }
@@ -550,12 +553,12 @@ const FUTURES_TEXT_PATTERNS = [
   /futures/i,
   /contract/i,
   /contracts/i,
+  /trade/i,
   /合约/i,
   /期货/i
 ];
 
 async function tryClickByRoleOrText(page, regex, preferBottom = false) {
-  // 1) Roles (best when available)
   const roleCandidates = [
     page.getByRole("tab", { name: regex }).first(),
     page.getByRole("link", { name: regex }).first(),
@@ -571,7 +574,6 @@ async function tryClickByRoleOrText(page, regex, preferBottom = false) {
     } catch {}
   }
 
-  // 2) Plain text click (may click a child; still worth trying)
   try {
     const t = page.getByText(regex).first();
     if (await t.isVisible().catch(() => false)) {
@@ -580,7 +582,6 @@ async function tryClickByRoleOrText(page, regex, preferBottom = false) {
     }
   } catch {}
 
-  // 3) DOM scan: choose a visible matching element, optionally preferring bottom-of-screen
   try {
     const result = await page.evaluate(
       ({ source, flags, preferBottom }) => {
@@ -636,7 +637,7 @@ async function tryClickByRoleOrText(page, regex, preferBottom = false) {
         if (!best) return { ok: false };
 
         best.el.click();
-        return { ok: true, text: best.text, yCenter: best.yCenter };
+        return { ok: true, text: best.text || "" };
       },
       { source: regex.source, flags: regex.flags, preferBottom }
     );
@@ -650,7 +651,6 @@ async function tryClickByRoleOrText(page, regex, preferBottom = false) {
 }
 
 async function clickFuturesNavIfPresent(page) {
-  // Try multiple labels/patterns, prefer bottom-of-screen click (mobile tab bar)
   for (const re of FUTURES_TEXT_PATTERNS) {
     const res = await tryClickByRoleOrText(page, re, true);
     if (res.ok) return res;
@@ -659,9 +659,14 @@ async function clickFuturesNavIfPresent(page) {
 }
 
 async function hasFuturesPageSignals(page) {
-  // Signals we’re on /contractTransaction (or inside it) without hardcoding selectors:
   const url = page.url();
+
+  // PC route
   if (/contractTransaction/i.test(url)) return true;
+
+  // ✅ H5 route
+  if (/\/h5\/#\/trade/i.test(url)) return true;
+  if (/#\/trade\b/i.test(url)) return true;
 
   const invitedVisible = await page
     .getByText(/invited\s*me/i)
@@ -677,7 +682,6 @@ async function hasFuturesPageSignals(page) {
 
   if (invitedVisible || positionVisible) return true;
 
-  // Order code input itself is also a signal
   const codeVisible = await isVisibleInAnyFrame(page, ORDER_CODE_SELECTORS);
   return codeVisible;
 }
@@ -694,8 +698,7 @@ async function ensureOnFuturesPage(page, loginUrl) {
     return false;
   }
 
-  // 1) MOBILE-FIRST: if a Futures bottom-tab exists, click it first.
-  // This matches the behavior you described: mobile needs Futures tab navigation before "Invited me" is reachable.
+  // Mobile-first: try Futures/Trade tab click first
   const clicked1 = await clickFuturesNavIfPresent(page);
   if (clicked1.ok) {
     await sleep(1200);
@@ -704,7 +707,7 @@ async function ensureOnFuturesPage(page, loginUrl) {
     }
   }
 
-  // 2) Try direct navigation (works on desktop, sometimes works on mobile too)
+  // Direct navigation
   if (target) {
     await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => null);
     await sleep(1200);
@@ -713,7 +716,7 @@ async function ensureOnFuturesPage(page, loginUrl) {
     }
   }
 
-  // 3) Try Futures tab again (sometimes the tab bar appears only after a route change)
+  // Retry tab click
   const clicked2 = await clickFuturesNavIfPresent(page);
   if (clicked2.ok) {
     await sleep(1200);
@@ -722,7 +725,7 @@ async function ensureOnFuturesPage(page, loginUrl) {
     }
   }
 
-  // 4) Last resort: direct navigation again after tab click
+  // Last direct retry
   if (target) {
     await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => null);
     await sleep(1200);
@@ -836,11 +839,13 @@ async function preflightSites() {
       for (let i = 1; i <= PREFLIGHT_RETRIES; i++) {
         console.log("Preflight checking:", loginUrl, "attempt", i);
 
+        const isMobile = shouldUseMobileContext(loginUrl);
+
         const context = await browser.newContext({
-          viewport: FORCE_MOBILE ? { width: 390, height: 844 } : { width: 1280, height: 720 },
+          viewport: isMobile ? { width: 390, height: 844 } : { width: 1280, height: 720 },
           locale: "en-US",
-          isMobile: FORCE_MOBILE,
-          hasTouch: FORCE_MOBILE
+          isMobile,
+          hasTouch: isMobile
         });
 
         const page = await context.newPage();
@@ -1098,9 +1103,18 @@ app.get("/debug/files", (req, res) => {
 app.get("/dns-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
-  const hosts = ["dsj006.cc", "dsj12.cc", "api.sendgrid.com"];
-  const out = {};
+  // ✅ Added dsj877 + api hosts so we can see Railway DNS problems clearly
+  const hosts = [
+    "dsj12.cc",
+    "dsj877.cc",
+    "api.dsj12.cc",
+    "api.dsj877.cc",
+    "api.dsj006.cc",
+    "api.ddjea.com",
+    "api.sendgrid.com"
+  ];
 
+  const out = {};
   for (const h of hosts) {
     try {
       const addrs = await dns.lookup(h, { all: true });
@@ -1116,9 +1130,17 @@ app.get("/dns-test", async (req, res) => {
 app.get("/net-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
-  const urls = ["https://dsj006.cc/", "https://dsj12.cc/", "https://api.sendgrid.com/"];
-  const results = {};
+  const urls = [
+    "https://dsj12.cc/",
+    "https://dsj877.cc/",
+    "https://api.dsj12.cc/api/app/ping",
+    "https://api.dsj877.cc/api/app/ping",
+    "https://api.dsj006.cc/api/app/ping",
+    "https://api.ddjea.com/api/app/ping",
+    "https://api.sendgrid.com/"
+  ];
 
+  const results = {};
   for (const u of urls) {
     try {
       const r = await simpleGet(u, 15000);
@@ -1148,7 +1170,6 @@ app.post("/run", async (req, res) => {
   lastRunAt = nowLocal();
   lastRunId = crypto.randomBytes(6).toString("hex");
 
-  // Always create a debug dir per run so failure artifacts have a stable place.
   lastDebugDir = `/tmp/debug-${lastRunId}`;
   ensureDir(lastDebugDir);
 
@@ -1157,7 +1178,6 @@ app.post("/run", async (req, res) => {
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.send("Run started. Check logs, /health, and /debug.");
 
-  // Run async
   (async () => {
     const startedAt = nowLocal();
     const subjectPrefix = `T-Bot | Run ${lastRunId}`;
@@ -1176,7 +1196,6 @@ app.post("/run", async (req, res) => {
       console.log("Email configured:", emailConfigured());
       console.log("Preflight enabled:", PREFLIGHT_ENABLED, "loginWaitMs:", PREFLIGHT_LOGIN_WAIT_MS);
 
-      // Choose a stable site set for this entire run
       const pf = await preflightSites();
       if (!pf.ok) {
         throw new Error(`Preflight failed. ${pf.note}`);
@@ -1336,7 +1355,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
     const status = resp ? resp.status() : null;
 
-    // Cloudflare hard fail detection even if status is 200
     const html0 = await page.content().catch(() => "");
     if (isCloudflareErrorHtml(html0)) {
       await dumpDebugStep(page, "cloudflare-login", { loginUrl, username: account.username, status });
@@ -1360,7 +1378,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     for (let attempt = 1; attempt <= 6; attempt++) {
       console.log("Login attempt", attempt, "for", account.username, "on", loginUrl);
 
-      // Reload login page each attempt (fresh state)
       await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => null);
       await sleep(1200);
       await closeOverlays(page);
@@ -1386,28 +1403,21 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       await passField.fill(account.password).catch(() => null);
       await sleep(150);
 
-      // Click login
       const loginBtn = page.getByRole("button", { name: /login|sign in/i }).first();
       if (await loginBtn.isVisible().catch(() => false)) {
         await loginBtn.click({ timeout: 10000 }).catch(() => null);
       } else {
-        // Fallback: Enter in password field
         await passField.press("Enter").catch(() => null);
       }
 
-      // REQUIRED LOGGING: right after clicking Login
       await sleep(450);
       lastAfterClick = await logAfterLoginClick(page);
 
-      // Allow SPA to process
       const settled = await waitForLoginToSettle(page, 25000);
       await dumpDebugStep(page, `after-login-attempt-${attempt}`, { attempt, lastAfterClick, settled });
 
-      if (!settled.ok) {
-        continue;
-      }
+      if (!settled.ok) continue;
 
-      // If the login form is still visible after settle, treat as not logged in
       if ((await isVisibleInAnyFrame(page, USER_SELECTORS)) && (await isVisibleInAnyFrame(page, PASS_SELECTORS))) {
         continue;
       }
@@ -1421,16 +1431,12 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       await fail("login-failed", "Login failed (login form never disappeared)", { lastAfterClick });
     }
 
-    // 4) Ensure we are on Futures page (mobile = click Futures tab first)
+    // 4) Ensure we are on Futures/Trade page
     const fut = await ensureOnFuturesPage(page, loginUrl);
     await dumpDebugStep(page, "after-ensure-futures", { fut });
 
     if (!fut.ok) {
-      await fail(
-        "futures-nav-failed",
-        "Could not reach Futures page (Futures tab + direct URL attempts failed)",
-        { fut }
-      );
+      await fail("futures-nav-failed", "Could not reach Futures/Trade page (nav + direct attempts failed)", { fut });
     }
 
     // 5) Navigate/open the order code flow
@@ -1499,7 +1505,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
     await fail("confirm-verification-failed", lastVerify?.detail || "Confirm verification failed", { lastVerify });
   } catch (e) {
-    // Ensure the failure requirements are met even if a throw happens unexpectedly
     const msg = e?.message || String(e);
     const alreadyCaptured = !!(e && typeof e === "object" && e.__captured);
 
@@ -1521,12 +1526,11 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 }
 
 async function openOrderCodeFlow(page) {
-  // Try in this order, but do not hard-fail if a tab is missing.
   const attempts = [
     { name: "invited_me", regex: /invited\s*me/i },
     { name: "invite", regex: /invite|invitation/i },
     { name: "position_order", regex: /position\s*order/i },
-    // Sometimes the futures page has a nested "Futures" label/toggle
+    { name: "trade", regex: /trade/i },
     { name: "futures", regex: /futures|contract|合约|期货/i }
   ];
 
@@ -1544,7 +1548,6 @@ async function openOrderCodeFlow(page) {
     } catch {}
   }
 
-  // Final: if code box is already there without tabs
   const codeRes2 = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 2500);
   return codeRes2.ok;
 }
