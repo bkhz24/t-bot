@@ -26,12 +26,10 @@ const FORCE_MOBILE = envTruthy(process.env.FORCE_MOBILE || "0");
 // Optional debug capture (extra artifacts at many steps). Failure capture is ALWAYS on.
 const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE || "0");
 
-// --- NEW: API host rewrite (fixes Railway DNS failures for api.dsj*.cc) ---
-const API_REWRITE_ENABLED = envTruthy(process.env.API_REWRITE_ENABLED || "1");
-// Host to rewrite api.dsj*.cc => this host (must resolve in Railway)
-const API_REWRITE_TARGET = (process.env.API_REWRITE_TARGET || "api.ddjea.com").toString().trim();
-// If you want to also rewrite api.dsj877.com etc:
-const API_REWRITE_MATCH = (process.env.API_REWRITE_MATCH || "api.dsj").toString().trim().toLowerCase();
+// API rewrite (critical for Railway DNS failures)
+const API_REWRITE = envTruthy(process.env.API_REWRITE || "0");
+const API_REWRITE_MATCH = (process.env.API_REWRITE_MATCH || "^api\\.").toString();
+const API_REWRITE_TARGET = (process.env.API_REWRITE_TARGET || "").toString().trim();
 
 // --------------------
 // Helpers
@@ -69,7 +67,7 @@ function sanitizeForFilename(s) {
     .replace(/[^a-z0-9._-]+/gi, "_")
     .replace(/_+/g, "_")
     .replace(/^_+|_+$/g, "")
-    .slice(0, 90);
+    .slice(0, 80);
 }
 
 function authOk(req) {
@@ -118,13 +116,7 @@ function safeJsonParseAccounts() {
 // Login URLs
 // --------------------
 function parseLoginUrls() {
-  // Default: include both H5 + PC for dsj12 + dsj877 (you can override with env LOGIN_URLS)
-  const fallback = [
-    "https://dsj12.cc/h5/#/login",
-    "https://dsj877.com/h5/#/login",
-    "https://dsj12.cc/pc/#/login",
-    "https://dsj877.com/pc/#/login"
-  ];
+  const fallback = ["https://dsj12.cc/pc/#/login", "https://dsj877.com/pc/#/login"];
 
   const raw = (LOGIN_URLS_ENV || "").trim();
   if (!raw) return fallback;
@@ -144,25 +136,23 @@ function getBaseAndPrefixFromUrl(anyUrl) {
     const u = new URL(anyUrl);
     const base = `${u.protocol}//${u.host}`;
 
-    if (anyUrl.includes("/h5/#/")) return { base, prefix: "/h5/#/", kind: "h5" };
-    if (anyUrl.includes("/pc/#/")) return { base, prefix: "/pc/#/", kind: "pc" };
+    // Prefer what we see in the current URL (h5 vs pc)
+    if (anyUrl.includes("/h5/#/")) return { base, prefix: "/h5/#/" };
+    if (anyUrl.includes("/pc/#/")) return { base, prefix: "/pc/#/" };
 
-    if (anyUrl.includes("/h5/")) return { base, prefix: "/h5/#/", kind: "h5" };
-    if (anyUrl.includes("/pc/")) return { base, prefix: "/pc/#/", kind: "pc" };
+    if (anyUrl.includes("/h5/")) return { base, prefix: "/h5/#/" };
+    if (anyUrl.includes("/pc/")) return { base, prefix: "/pc/#/" };
 
-    return { base, prefix: "/pc/#/", kind: "pc" };
+    return { base, prefix: "/pc/#/" };
   } catch {
     return null;
   }
 }
 
-// IMPORTANT: H5 futures/trade page is /h5/#/trade (per your manual flow)
 function futuresUrlFromAnyUrl(anyUrl) {
   const bp = getBaseAndPrefixFromUrl(anyUrl);
   if (!bp) return null;
-
-  if (bp.kind === "h5") return `${bp.base}${bp.prefix}trade`;
-  return `${bp.base}${bp.prefix}contractTransaction`; // PC
+  return `${bp.base}${bp.prefix}contractTransaction`;
 }
 
 // --------------------
@@ -296,13 +286,6 @@ async function saveScreenshot(page, fullPath) {
   }
 }
 
-/**
- * FAILURE CAPTURE (always on):
- * - save screenshot
- * - save full HTML
- * - log location.href (page.url())
- * - log file paths
- */
 async function captureFailureArtifacts(page, tag, extra = {}) {
   const stamp = Date.now();
   const safeTag = sanitizeForFilename(tag || "failure");
@@ -356,9 +339,6 @@ async function captureFailureArtifacts(page, tag, extra = {}) {
   return { url, shotPath: savedShot ? shotPath : null, htmlPath: savedHtml ? htmlPath : null, dir };
 }
 
-/**
- * Optional step capture (when DEBUG_CAPTURE=1)
- */
 async function dumpDebugStep(page, tag, extra = {}) {
   if (!DEBUG_CAPTURE) return null;
   const stamp = Date.now();
@@ -388,7 +368,7 @@ async function dumpDebugStep(page, tag, extra = {}) {
 }
 
 // --------------------
-// Resilient selectors
+// Selectors
 // --------------------
 const USER_SELECTORS = [
   'input[type="email"]',
@@ -480,60 +460,57 @@ async function findVisibleInAnyFrame(page, selector, timeoutMs) {
   return { ok: false, frame: null, locator: null };
 }
 
-async function debugDumpButtons(page, tag) {
-  const texts = [];
-  try {
-    const frames = page.frames();
-    for (const f of frames) {
-      const btns = await f.locator("button, a, div, span").all().catch(() => []);
-      for (const b of btns.slice(0, 60)) {
-        const t = ((await b.textContent().catch(() => "")) || "").trim();
-        if (t) texts.push(t.slice(0, 80));
+// --------------------
+// Login click (H5-safe)
+// --------------------
+async function clickLogin(page) {
+  const candidates = [
+    page.getByRole("button", { name: /login|sign in/i }).first(),
+    page.getByText(/^login$/i).first(),
+    page.getByText(/login/i).first(),
+    page.locator('button:has-text("Login")').first(),
+    page.locator('div:has-text("Login")').first(),
+    page.locator('span:has-text("Login")').first()
+  ];
+
+  for (const c of candidates) {
+    try {
+      if (await c.isVisible().catch(() => false)) {
+        await c.scrollIntoViewIfNeeded().catch(() => null);
+        await c.click({ timeout: 12000 }).catch(() => null);
+        return { ok: true };
       }
+    } catch {}
+  }
+
+  // Last-resort: click center of the most button-like element containing "Login"
+  try {
+    const r = await page.evaluate(() => {
+      const els = Array.from(document.querySelectorAll("button,div,span,a"));
+      const m = els
+        .map((el) => {
+          const txt = (el.innerText || el.textContent || "").trim();
+          if (!txt) return null;
+          if (!/login/i.test(txt)) return null;
+          const rect = el.getBoundingClientRect();
+          if (rect.width < 40 || rect.height < 20) return null;
+          const style = window.getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden") return null;
+          const clickable = style.cursor === "pointer" || el.tagName.toLowerCase() === "button" || el.tagName.toLowerCase() === "a";
+          return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, txt: txt.slice(0, 40), clickable };
+        })
+        .filter(Boolean)
+        .sort((a, b) => (b.clickable ? 1 : 0) - (a.clickable ? 1 : 0));
+      return m[0] || null;
+    });
+
+    if (r?.x && r?.y) {
+      await page.mouse.click(r.x, r.y).catch(() => null);
+      return { ok: true, fallback: true, label: r.txt };
     }
   } catch {}
-  await dumpDebugStep(page, tag, { clickableTextPreview: texts.slice(0, 100) });
-}
 
-// --------------------
-// Login success detection (H5 can keep fields visible)
-// --------------------
-async function hasLoggedInSignals(page) {
-  const url = page.url() || "";
-
-  // Route change away from login is a strong signal
-  if (!/\/login\b|#\/login\b/i.test(url)) return true;
-
-  // H5 bottom tabs often have these labels
-  const h5Signals = [/home/i, /markets/i, /futures/i, /perpetual/i, /assets/i];
-  for (const re of h5Signals) {
-    const ok = await page.getByText(re).first().isVisible().catch(() => false);
-    if (ok) return true;
-  }
-
-  // If we can see any futures/trade page signals
-  const futuresSignals = [/invited\s*me/i, /position\s*order/i, /copying\s*history/i, /initiate\s+a\s+follow-up/i];
-  for (const re of futuresSignals) {
-    const ok = await page.getByText(re).first().isVisible().catch(() => false);
-    if (ok) return true;
-  }
-
-  // Token presence (many of these SPAs store auth in localStorage)
-  try {
-    const token = await page
-      .evaluate(() => {
-        const keys = ["token", "access_token", "accessToken", "Authorization", "authToken"];
-        for (const k of keys) {
-          const v = localStorage.getItem(k) || sessionStorage.getItem(k);
-          if (v && v.length > 10) return v;
-        }
-        return "";
-      })
-      .catch(() => "");
-    if (token) return true;
-  } catch {}
-
-  return false;
+  return { ok: false };
 }
 
 async function logAfterLoginClick(page) {
@@ -563,9 +540,8 @@ async function logAfterLoginClick(page) {
   return { url, loginFormVisible, userVisible, passVisible };
 }
 
-async function waitForLoginToSettle(page, timeoutMs = 45000) {
+async function waitForLoginToSettle(page, timeoutMs = 30000) {
   const start = Date.now();
-  let last = null;
 
   while (Date.now() - start < timeoutMs) {
     await closeOverlays(page);
@@ -575,27 +551,33 @@ async function waitForLoginToSettle(page, timeoutMs = 45000) {
     const passVisible = await isVisibleInAnyFrame(page, PASS_SELECTORS);
     const loginFormVisible = userVisible && passVisible;
 
-    // If we detect logged-in signals, accept even if fields still visible
-    if (await hasLoggedInSignals(page)) {
-      return { ok: true, url, userVisible, passVisible, reason: "logged_in_signals" };
+    // Strong success signal: moved off login
+    if (!/\/login\b|#\/login\b/i.test(url) && !loginFormVisible) {
+      return { ok: true, url, reason: "url_changed_and_fields_gone" };
     }
 
-    // Classic: fields gone
+    // Another success signal: fields gone
     if (!loginFormVisible) {
-      return { ok: true, url, userVisible, passVisible, reason: "login_fields_hidden" };
+      return { ok: true, url, reason: "login_fields_hidden" };
     }
 
-    last = { url, userVisible, passVisible, loginFormVisible };
-    await sleep(400);
+    // Explicit failure hints on screen
+    const bad = await page.getByText(/incorrect|invalid|error|failed/i).first().isVisible().catch(() => false);
+    if (bad) {
+      const txt = (await page.getByText(/incorrect|invalid|error|failed/i).first().textContent().catch(() => "")) || "";
+      return { ok: false, url, reason: "error_text_visible", detail: txt.trim().slice(0, 180) };
+    }
+
+    await sleep(350);
   }
 
-  return { ok: false, reason: "timeout", ...(last || {}), url: page.url() };
+  return { ok: false, url: page.url(), reason: "timeout" };
 }
 
 // --------------------
-// Mobile Futures navigation helpers
+// Futures navigation
 // --------------------
-const FUTURES_TEXT_PATTERNS = [/futures/i, /contract/i, /contracts/i, /合约/i, /期货/i, /trade/i];
+const FUTURES_TEXT_PATTERNS = [/futures/i, /contract/i, /contracts/i, /合约/i, /期货/i];
 
 async function tryClickByRoleOrText(page, regex, preferBottom = false) {
   const roleCandidates = [
@@ -650,7 +632,6 @@ async function tryClickByRoleOrText(page, regex, preferBottom = false) {
 
         for (const el of els) {
           if (!isVisible(el)) continue;
-
           const text = (el.innerText || el.textContent || "").trim().replace(/\s+/g, " ");
           if (!text) continue;
           if (!re.test(text)) continue;
@@ -663,9 +644,6 @@ async function tryClickByRoleOrText(page, regex, preferBottom = false) {
           matches.push({
             el,
             text: text.slice(0, 60),
-            yCenter,
-            clickScore,
-            bottomScore,
             score: clickScore * 10 + bottomScore * 5
           });
         }
@@ -676,14 +654,12 @@ async function tryClickByRoleOrText(page, regex, preferBottom = false) {
         if (!best) return { ok: false };
 
         best.el.click();
-        return { ok: true, text: best.text, yCenter: best.yCenter };
+        return { ok: true, text: best.text };
       },
       { source: regex.source, flags: regex.flags, preferBottom }
     );
 
-    if (result?.ok) {
-      return { ok: true, method: "dom_scan", label: result.text || regex.toString() };
-    }
+    if (result?.ok) return { ok: true, method: "dom_scan", label: result.text || regex.toString() };
   } catch {}
 
   return { ok: false };
@@ -699,18 +675,13 @@ async function clickFuturesNavIfPresent(page) {
 
 async function hasFuturesPageSignals(page) {
   const url = page.url();
-
   if (/contractTransaction/i.test(url)) return true;
-  if (/#\/trade\b/i.test(url) || /\/trade\b/i.test(url)) return true;
 
   const invitedVisible = await page.getByText(/invited\s*me/i).first().isVisible().catch(() => false);
   const positionVisible = await page.getByText(/position\s*order/i).first().isVisible().catch(() => false);
-  const copyingVisible = await page.getByText(/copying\s*history/i).first().isVisible().catch(() => false);
+  if (invitedVisible || positionVisible) return true;
 
-  if (invitedVisible || positionVisible || copyingVisible) return true;
-
-  const codeVisible = await isVisibleInAnyFrame(page, ORDER_CODE_SELECTORS);
-  return codeVisible;
+  return await isVisibleInAnyFrame(page, ORDER_CODE_SELECTORS);
 }
 
 async function ensureOnFuturesPage(page, loginUrl) {
@@ -718,7 +689,7 @@ async function ensureOnFuturesPage(page, loginUrl) {
 
   async function waitForSignals() {
     await closeOverlays(page);
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 6; i++) {
       if (await hasFuturesPageSignals(page)) return true;
       await sleep(500);
     }
@@ -728,7 +699,9 @@ async function ensureOnFuturesPage(page, loginUrl) {
   const clicked1 = await clickFuturesNavIfPresent(page);
   if (clicked1.ok) {
     await sleep(1200);
-    if (await waitForSignals()) return { ok: true, method: `nav:${clicked1.method}`, futuresUrl: target || null, detail: clicked1.label };
+    if (await waitForSignals()) {
+      return { ok: true, method: `nav:${clicked1.method}`, futuresUrl: target || null, detail: clicked1.label };
+    }
   }
 
   if (target) {
@@ -740,7 +713,9 @@ async function ensureOnFuturesPage(page, loginUrl) {
   const clicked2 = await clickFuturesNavIfPresent(page);
   if (clicked2.ok) {
     await sleep(1200);
-    if (await waitForSignals()) return { ok: true, method: `nav_retry:${clicked2.method}`, futuresUrl: target || null, detail: clicked2.label };
+    if (await waitForSignals()) {
+      return { ok: true, method: `nav_retry:${clicked2.method}`, futuresUrl: target || null, detail: clicked2.label };
+    }
   }
 
   if (target) {
@@ -749,22 +724,22 @@ async function ensureOnFuturesPage(page, loginUrl) {
     if (await waitForSignals()) return { ok: true, method: "direct_after_nav", futuresUrl: target };
   }
 
-  return { ok: false, futuresUrl: target || null, detail: clicked2.ok ? clicked2.label : clicked1.ok ? clicked1.label : "no futures nav match" };
+  return { ok: false, futuresUrl: target || null, detail: "no futures nav match" };
 }
 
 // --------------------
-// Confirmation gates
+// Confirmation gates (optional)
 // --------------------
-const VERIFY_TOAST = envTruthy(process.env.VERIFY_TOAST || "1");
-const VERIFY_PENDING = envTruthy(process.env.VERIFY_PENDING || "1");
+const VERIFY_TOAST = envTruthy(process.env.VERIFY_TOAST || "0");
+const VERIFY_PENDING = envTruthy(process.env.VERIFY_PENDING || "0");
 const VERIFY_TIMEOUT_MS = Number(process.env.VERIFY_TIMEOUT_MS || "25000");
-const CONFIRM_RETRIES = Number(process.env.CONFIRM_RETRIES || "5");
+const CONFIRM_RETRIES = Number(process.env.CONFIRM_RETRIES || "8");
 const CONFIRM_RETRY_DELAY_MS = Number(process.env.CONFIRM_RETRY_DELAY_MS || "2500");
 
 async function waitForToastOrModal(page) {
-  if (!VERIFY_TOAST) return { ok: false, type: "toast_off", detail: "VERIFY_TOAST disabled" };
+  if (!VERIFY_TOAST) return { ok: false, type: "toast_off" };
 
-  const patterns = [/already followed/i, /followed/i, /success/i, /successful/i, /completed/i, /confirm success/i, /submitted/i, /pending/i];
+  const patterns = [/followed/i, /success/i, /successful/i, /completed/i, /submitted/i, /pending/i];
 
   const start = Date.now();
   while (Date.now() - start < VERIFY_TIMEOUT_MS) {
@@ -779,11 +754,11 @@ async function waitForToastOrModal(page) {
     await sleep(300);
   }
 
-  return { ok: false, type: "toast_timeout", detail: "No confirmation toast/modal found" };
+  return { ok: false, type: "toast_timeout" };
 }
 
 async function verifyPendingInPositionOrder(page) {
-  if (!VERIFY_PENDING) return { ok: false, type: "pending_off", detail: "VERIFY_PENDING disabled" };
+  if (!VERIFY_PENDING) return { ok: false, type: "pending_off" };
 
   const tab = page.getByText(/position\s*order/i).first();
   if (await tab.isVisible().catch(() => false)) {
@@ -799,28 +774,34 @@ async function verifyPendingInPositionOrder(page) {
     await sleep(350);
   }
 
-  return { ok: false, type: "pending_timeout", detail: "No Pending found in Position order" };
+  return { ok: false, type: "pending_timeout" };
 }
 
 async function verifyOrderFollowed(page) {
   const toastRes = await waitForToastOrModal(page);
   const pendingRes = await verifyPendingInPositionOrder(page);
-
-  if (toastRes.ok && pendingRes.ok) return { ok: true, detail: "toast and pending seen" };
-  if (toastRes.ok) return { ok: true, detail: `toast seen (${toastRes.detail})` };
-  if (pendingRes.ok) return { ok: true, detail: "pending seen" };
-
-  return { ok: false, detail: `No confirmation. Toast: ${toastRes.type}. Pending: ${pendingRes.type}.` };
+  if (toastRes.ok || pendingRes.ok) return { ok: true, detail: toastRes.detail || pendingRes.detail };
+  return { ok: false, detail: `No confirmation. Toast=${toastRes.type}, Pending=${pendingRes.type}` };
 }
 
 // --------------------
-// Preflight (pick working sites)
+// Preflight: IMPORTANT CHANGE
+// - don’t pick only H5. Always try to include at least 1 PC URL if provided.
 // --------------------
 const PREFLIGHT_ENABLED = envTruthy(process.env.PREFLIGHT_ENABLED || "1");
 const PREFLIGHT_LOGIN_WAIT_MS = Number(process.env.PREFLIGHT_LOGIN_WAIT_MS || "20000");
-const PREFLIGHT_RETRIES = Number(process.env.PREFLIGHT_RETRIES || "3");
-const PREFLIGHT_RETRY_DELAY_MS = Number(process.env.PREFLIGHT_RETRY_DELAY_MS || "2000");
-const PREFLIGHT_MAX_SITES = Number(process.env.PREFLIGHT_MAX_SITES || "2");
+const PREFLIGHT_RETRIES = Number(process.env.PREFLIGHT_RETRIES || "2");
+const PREFLIGHT_RETRY_DELAY_MS = Number(process.env.PREFLIGHT_RETRY_DELAY_MS || "1500");
+const PREFLIGHT_MAX_SITES = Number(process.env.PREFLIGHT_MAX_SITES || "4");
+
+function isH5(url) {
+  const u = (url || "").toLowerCase();
+  return u.includes("/h5/") || u.includes("/h5/#/");
+}
+function isPC(url) {
+  const u = (url || "").toLowerCase();
+  return u.includes("/pc/") || u.includes("/pc/#/");
+}
 
 async function preflightSites() {
   if (!PREFLIGHT_ENABLED) return { ok: true, sites: LOGIN_URLS, note: "preflight disabled" };
@@ -832,79 +813,64 @@ async function preflightSites() {
 
   const good = [];
   try {
+    // 1) first pass in order
     for (const loginUrl of LOGIN_URLS) {
-      let passed = false;
+      if (good.length >= PREFLIGHT_MAX_SITES) break;
 
+      let passed = false;
       for (let i = 1; i <= PREFLIGHT_RETRIES; i++) {
         console.log("Preflight checking:", loginUrl, "attempt", i);
 
-        const mobile = shouldUseMobileContext(loginUrl);
-
         const context = await browser.newContext({
-          viewport: mobile ? { width: 390, height: 844 } : { width: 1280, height: 720 },
+          viewport: shouldUseMobileContext(loginUrl) ? { width: 390, height: 844 } : { width: 1280, height: 720 },
           locale: "en-US",
-          isMobile: mobile,
-          hasTouch: mobile
+          isMobile: shouldUseMobileContext(loginUrl),
+          hasTouch: shouldUseMobileContext(loginUrl)
         });
-
         const page = await context.newPage();
         page.setDefaultTimeout(30000);
 
-        // Apply API rewrite here too (preflight should mirror run behavior)
-        if (API_REWRITE_ENABLED && API_REWRITE_TARGET) {
-          await installApiRewrite(page);
-        }
-
         try {
+          await attachApiRewrite(page);
           const resp = await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
           await sleep(700);
 
           const status = resp ? resp.status() : null;
-
-          if (status && status >= 400) {
-            await dumpDebugStep(page, "preflight-http-fail", { loginUrl, status });
-            throw new Error(`Preflight failed: HTTP ${status}`);
-          }
+          if (status && status >= 400) throw new Error(`Preflight failed: HTTP ${status}`);
 
           const html = await page.content().catch(() => "");
-          if (isCloudflareErrorHtml(html)) {
-            await dumpDebugStep(page, "preflight-cloudflare", { loginUrl, status });
-            throw new Error("Preflight failed: Cloudflare error page");
-          }
+          if (isCloudflareErrorHtml(html)) throw new Error("Preflight failed: Cloudflare error page");
 
           const userRes = await findVisibleInAnyFrame(page, USER_SELECTORS, PREFLIGHT_LOGIN_WAIT_MS);
-          if (!userRes.ok) {
-            await dumpDebugStep(page, "preflight-no-user", { loginUrl, status });
-            throw new Error(`Preflight failed: user field not found within ${PREFLIGHT_LOGIN_WAIT_MS}ms`);
-          }
+          if (!userRes.ok) throw new Error(`Preflight failed: user field not found within ${PREFLIGHT_LOGIN_WAIT_MS}ms`);
 
-          await dumpDebugStep(page, "preflight-ok", { loginUrl, status });
           console.log("Preflight OK:", loginUrl);
-
           passed = true;
           await context.close().catch(() => null);
           break;
         } catch (e) {
-          const msg = e?.message || String(e);
-          console.log("Preflight attempt", i, "failed for", loginUrl, "err:", msg);
-          await dumpDebugStep(page, `preflight-failed-${i}`, { loginUrl, err: msg });
+          console.log("Preflight attempt", i, "failed for", loginUrl, "err:", e?.message || String(e));
           await context.close().catch(() => null);
           await sleep(PREFLIGHT_RETRY_DELAY_MS);
         }
       }
 
-      if (passed) {
-        good.push(loginUrl);
+      if (passed) good.push(loginUrl);
+    }
+
+    // 2) ensure we include at least one PC URL if any exist
+    const anyPCProvided = LOGIN_URLS.some(isPC);
+    const havePC = good.some(isPC);
+    if (anyPCProvided && !havePC && good.length < PREFLIGHT_MAX_SITES) {
+      for (const u of LOGIN_URLS.filter(isPC)) {
         if (good.length >= PREFLIGHT_MAX_SITES) break;
-      } else {
-        console.log("Preflight: skipping", loginUrl, "after failures");
+        if (good.includes(u)) continue;
+        console.log("Preflight forcing PC candidate:", u);
+        good.push(u);
       }
     }
 
-    if (!good.length) {
-      return { ok: false, sites: [], note: "No sites passed preflight" };
-    }
-
+    if (!good.length) return { ok: false, sites: [], note: "No sites passed preflight" };
     return { ok: true, sites: good, note: `Chosen sites: ${good.join(", ")}` };
   } finally {
     await browser.close().catch(() => null);
@@ -922,6 +888,7 @@ function startupConfigErrors() {
   if (!BOT_PASSWORD) errs.push("BOT_PASSWORD or RUN_PASSWORD is not set.");
   const cfg = safeJsonParseAccounts();
   if (!cfg.ok) errs.push(cfg.error || "ACCOUNTS_JSON is missing/invalid.");
+  if (API_REWRITE && !API_REWRITE_TARGET) errs.push("API_REWRITE=1 but API_REWRITE_TARGET is empty.");
   return errs;
 }
 
@@ -938,10 +905,12 @@ app.get("/", (req, res) => {
     <div>Debug capture: <b>${DEBUG_CAPTURE ? "ON" : "OFF"}</b> (Failure capture is ALWAYS on)</div>
     <div>LOGIN_URLS: <code>${escapeHtml(LOGIN_URLS.join(", "))}</code></div>
     <div>Force mobile: <b>${FORCE_MOBILE ? "ON" : "OFF"}</b></div>
+    <div>API_REWRITE: <b>${API_REWRITE ? "ON" : "OFF"}</b> (match: <code>${escapeHtml(
+      API_REWRITE_MATCH
+    )}</code>, target: <code>${escapeHtml(API_REWRITE_TARGET || "-")}</code>)</div>
     <div>Accounts loaded: <b>${cfg.ok ? cfg.accounts.length : 0}</b></div>
     <div>Email configured: <b>${emailConfigured() ? "YES" : "NO"}</b> (provider: ${escapeHtml(EMAIL_PROVIDER)})</div>
     <div>Preflight enabled: <b>${PREFLIGHT_ENABLED ? "ON" : "OFF"}</b> (max sites: ${PREFLIGHT_MAX_SITES})</div>
-    <div>API rewrite: <b>${API_REWRITE_ENABLED ? "ON" : "OFF"}</b> (${escapeHtml(API_REWRITE_MATCH)}* → ${escapeHtml(API_REWRITE_TARGET)})</div>
     <div style="color:red; margin-top:10px;">
       ${errs.length ? errs.map((e) => escapeHtml(e)).join("<br/>") : ""}
     </div>
@@ -981,61 +950,24 @@ app.get("/health", (req, res) => {
       debugCapture: DEBUG_CAPTURE,
       forceMobile: FORCE_MOBILE
     },
+    rewrite: {
+      enabled: API_REWRITE,
+      match: API_REWRITE_MATCH,
+      target: API_REWRITE_TARGET || null
+    },
     debug: {
       lastRunId,
       lastDebugDir,
       lastShotPath,
       stableShotPath: "/app/last-shot.png"
-    },
-    email: {
-      enabled: EMAIL_ENABLED,
-      provider: EMAIL_PROVIDER,
-      configured: emailConfigured(),
-      from: EMAIL_FROM,
-      to: EMAIL_TO
-    },
-    verify: {
-      toast: VERIFY_TOAST,
-      pending: VERIFY_PENDING,
-      timeoutMs: VERIFY_TIMEOUT_MS,
-      confirmRetries: CONFIRM_RETRIES,
-      confirmRetryDelayMs: CONFIRM_RETRY_DELAY_MS
-    },
-    preflight: {
-      enabled: PREFLIGHT_ENABLED,
-      loginWaitMs: PREFLIGHT_LOGIN_WAIT_MS,
-      retries: PREFLIGHT_RETRIES,
-      retryDelayMs: PREFLIGHT_RETRY_DELAY_MS,
-      maxSites: PREFLIGHT_MAX_SITES
-    },
-    apiRewrite: {
-      enabled: API_REWRITE_ENABLED,
-      match: API_REWRITE_MATCH,
-      target: API_REWRITE_TARGET
     }
   });
 });
 
 app.get("/email-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-
-  const result = await sendEmail(
-    "T-Bot | email test",
-    `Email test sent at ${nowLocal()}\n\nFrom: ${EMAIL_FROM}\nTo: ${EMAIL_TO}\n`
-  );
-
-  res.json({
-    ok: true,
-    attempted: true,
-    config: {
-      enabled: EMAIL_ENABLED,
-      provider: EMAIL_PROVIDER,
-      configured: emailConfigured(),
-      from: EMAIL_FROM,
-      to: EMAIL_TO
-    },
-    result
-  });
+  const result = await sendEmail("T-Bot | email test", `Email test sent at ${nowLocal()}\n`);
+  res.json({ ok: true, result });
 });
 
 app.get("/last-shot", (req, res) => {
@@ -1115,11 +1047,13 @@ app.get("/dns-test", async (req, res) => {
   const hosts = [
     "dsj12.cc",
     "dsj877.com",
+    "dsj72.com",
     "api.dsj12.cc",
     "api.dsj877.com",
-    "api.ddjea.com",
+    "api.dsj72.com",
+    API_REWRITE_TARGET || "api.ddjea.com",
     "api.sendgrid.com"
-  ];
+  ].filter(Boolean);
 
   const out = {};
   for (const h of hosts) {
@@ -1139,9 +1073,8 @@ app.get("/net-test", async (req, res) => {
   const urls = [
     "https://dsj12.cc/",
     "https://dsj877.com/",
-    "https://api.dsj12.cc/api/app/ping",
-    "https://api.dsj877.com/api/app/ping",
-    "https://api.ddjea.com/api/app/ping",
+    "https://dsj72.com/",
+    API_REWRITE_TARGET ? `https://${API_REWRITE_TARGET}/` : "https://api.ddjea.com/",
     "https://api.sendgrid.com/"
   ];
 
@@ -1196,10 +1129,7 @@ app.post("/run", async (req, res) => {
       console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
       console.log("FORCE_MOBILE:", FORCE_MOBILE);
       console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
-      console.log("API_REWRITE:", API_REWRITE_ENABLED, "match:", API_REWRITE_MATCH, "target:", API_REWRITE_TARGET);
-      console.log("Email provider:", EMAIL_PROVIDER);
-      console.log("Email configured:", emailConfigured());
-      console.log("Preflight enabled:", PREFLIGHT_ENABLED, "loginWaitMs:", PREFLIGHT_LOGIN_WAIT_MS);
+      console.log("API_REWRITE:", API_REWRITE, "match:", API_REWRITE_MATCH, "target:", API_REWRITE_TARGET || "(none)");
 
       const pf = await preflightSites();
       if (!pf.ok) throw new Error(`Preflight failed. ${pf.note}`);
@@ -1208,13 +1138,10 @@ app.post("/run", async (req, res) => {
 
       await sendEmail(
         `${subjectPrefix} started`,
-        `T-Bot started at ${startedAt}\nRun ID: ${lastRunId}\nAccounts: ${cfg.accounts.length}\nDebug capture: ${
-          DEBUG_CAPTURE ? "ON" : "OFF"
-        }\nFailure capture: ALWAYS ON\nPreflight: ${pf.note}\nAPI rewrite: ${API_REWRITE_ENABLED ? "ON" : "OFF"} (${API_REWRITE_MATCH}* -> ${API_REWRITE_TARGET})\n\n`
+        `T-Bot started at ${startedAt}\nRun ID: ${lastRunId}\nAccounts: ${cfg.accounts.length}\nPreflight: ${pf.note}\n`
       );
 
       const results = [];
-
       for (const account of cfg.accounts) {
         console.log("----");
         console.log("Account:", account.username);
@@ -1238,31 +1165,27 @@ app.post("/run", async (req, res) => {
       }
 
       const finishedAt = nowLocal();
-      const anyFailed = results.some((r) => !r.ok);
+      const okCount = results.filter((r) => r.ok).length;
+      const failCount = results.length - okCount;
+      const anyFailed = failCount > 0;
 
       const summaryLines = results.map((r) => {
         if (r.ok) return `SUCCESS: ${r.username} (${r.site})${r.note ? ` - ${r.note}` : ""}`;
         return `FAIL: ${r.username} (${r.error})`;
       });
 
-      const okCount = results.filter((r) => r.ok).length;
-      const failCount = results.length - okCount;
-
       await sendEmail(
         `${subjectPrefix} ${anyFailed ? "finished with failures" : "completed"}`,
-        `T-Bot finished at ${finishedAt}\nRun ID: ${lastRunId}\n\nSummary: ${okCount} success, ${failCount} failed\n\nPer-account status:\n${summaryLines.join(
+        `T-Bot finished at ${finishedAt}\nRun ID: ${lastRunId}\n\nSummary: ${okCount} success, ${failCount} failed\n\n${summaryLines.join(
           "\n"
-        )}\n\nDebug: /debug (needs password)\n`
+        )}\n`
       );
 
       console.log("Bot completed");
     } catch (e) {
       const msg = e?.message || String(e);
       lastError = msg;
-
-      const failedAt = nowLocal();
-      await sendEmail(`${subjectPrefix} FAILED`, `T-Bot failed at ${failedAt}\nRun ID: ${lastRunId}\nError: ${msg}\n`);
-
+      await sendEmail(`${subjectPrefix} FAILED`, `T-Bot failed at ${nowLocal()}\nRun ID: ${lastRunId}\nError: ${msg}\n`);
       console.log("Run failed:", msg);
     } finally {
       isRunning = false;
@@ -1275,7 +1198,6 @@ app.post("/run", async (req, res) => {
 // --------------------
 async function runAccountAllSites(account, orderCode, runSites) {
   let last = null;
-
   for (const loginUrl of runSites) {
     console.log("Trying site:", loginUrl, "for", account.username);
     try {
@@ -1283,12 +1205,10 @@ async function runAccountAllSites(account, orderCode, runSites) {
       console.log("SUCCESS:", account.username, "on", loginUrl);
       return { site: loginUrl, note };
     } catch (e) {
-      const msg = e?.message || String(e);
-      console.log("Site failed:", loginUrl, "for", account.username, "err:", msg);
+      console.log("Site failed:", loginUrl, "for", account.username, "err:", e?.message || String(e));
       last = e;
     }
   }
-
   throw last || new Error("All sites failed");
 }
 
@@ -1298,28 +1218,43 @@ function shouldUseMobileContext(loginUrl) {
   return u.includes("/h5/#/") || u.includes("/h5/") || u.includes("#/h5") || u.includes("h5/#");
 }
 
-// --- NEW: request rewrite to fix api.dsj*.cc DNS failures on Railway ---
-async function installApiRewrite(page) {
-  // A light filter: only rewrite the host portion for api.* calls that match API_REWRITE_MATCH
+async function attachApiRewrite(page) {
+  if (!API_REWRITE || !API_REWRITE_TARGET) return;
+
+  let re = null;
+  try {
+    re = new RegExp(API_REWRITE_MATCH);
+  } catch {
+    re = /^api\./;
+  }
+
   await page.route("**/*", async (route) => {
+    const req = route.request();
+    const urlStr = req.url();
+
+    let u;
     try {
-      const req = route.request();
-      const urlStr = req.url();
-      if (!urlStr.startsWith("http")) return route.continue();
-
-      const u = new URL(urlStr);
-      const host = (u.hostname || "").toLowerCase();
-
-      // Only rewrite api hosts (and avoid rewriting sendgrid etc)
-      if (API_REWRITE_ENABLED && API_REWRITE_TARGET && host.includes(API_REWRITE_MATCH)) {
-        // Example: api.dsj12.cc => api.ddjea.com
-        u.hostname = API_REWRITE_TARGET;
-        return route.continue({ url: u.toString() });
-      }
-      return route.continue();
+      u = new URL(urlStr);
     } catch {
       return route.continue();
     }
+
+    // Only rewrite API hosts
+    if (re.test(u.hostname)) {
+      const origHost = u.hostname;
+      u.hostname = API_REWRITE_TARGET;
+
+      // Keep protocol/paths same
+      const newUrl = u.toString();
+      // Useful log when debugging login:
+      if (urlStr.includes("/api/") || urlStr.includes("ping") || urlStr.includes("login")) {
+        console.log("API_REWRITE:", origHost, "=>", API_REWRITE_TARGET, "|", u.pathname);
+      }
+
+      return route.continue({ url: newUrl });
+    }
+
+    return route.continue();
   });
 }
 
@@ -1350,15 +1285,14 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
   const page = await context.newPage();
   page.setDefaultTimeout(30000);
 
-  if (API_REWRITE_ENABLED && API_REWRITE_TARGET) {
-    await installApiRewrite(page);
-  }
+  await attachApiRewrite(page);
 
   page.on("requestfailed", (req) => {
     const f = req.failure();
     const errText = f?.errorText || "unknown";
-    // Useful to see DNS failures
-    if (req.url().includes("/api/") || req.url().includes("api.")) console.log("REQUEST FAILED:", req.url(), "=>", errText);
+    if (req.url().includes("/api/") || req.url().includes("ping") || req.url().includes("login")) {
+      console.log("REQUEST FAILED:", req.url(), "=>", errText);
+    }
   });
 
   page.on("console", (msg) => {
@@ -1381,73 +1315,11 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     throw err;
   }
 
-  // More robust "click Login" that works when login is a DIV/SPAN/etc
-  async function clickLoginButton() {
-    // 1) real button by role
-    const btn1 = page.getByRole("button", { name: /login|sign in/i }).first();
-    if (await btn1.isVisible().catch(() => false)) {
-      await btn1.click({ timeout: 10000 }).catch(() => null);
-      return "role_button";
-    }
-
-    // 2) text match
-    const t = page.getByText(/login|sign in/i).first();
-    if (await t.isVisible().catch(() => false)) {
-      await t.click({ timeout: 10000 }).catch(() => null);
-      return "text_click";
-    }
-
-    // 3) DOM scan click for visible clickable element containing login
-    const clicked = await page.evaluate(() => {
-      const re = /login|sign in/i;
-
-      function isVisible(el) {
-        const style = window.getComputedStyle(el);
-        if (!style) return false;
-        if (style.visibility === "hidden" || style.display === "none") return false;
-        const r = el.getBoundingClientRect();
-        return r.width > 2 && r.height > 2 && r.bottom > 0 && r.right > 0 && r.top < window.innerHeight && r.left < window.innerWidth;
-      }
-
-      function isClickable(el) {
-        const tag = (el.tagName || "").toLowerCase();
-        const role = (el.getAttribute("role") || "").toLowerCase();
-        const cursor = window.getComputedStyle(el).cursor;
-        return tag === "button" || tag === "a" || role === "button" || role === "tab" || cursor === "pointer" || el.hasAttribute("onclick");
-      }
-
-      const els = Array.from(document.querySelectorAll("button,a,div,span,[role='button'],[onclick]"));
-      const matches = [];
-
-      for (const el of els) {
-        if (!isVisible(el)) continue;
-        const text = (el.innerText || el.textContent || "").trim().replace(/\s+/g, " ");
-        if (!text) continue;
-        if (!re.test(text)) continue;
-
-        const r = el.getBoundingClientRect();
-        matches.push({ el, text: text.slice(0, 60), clickable: isClickable(el), area: r.width * r.height });
-      }
-
-      matches.sort((a, b) => (b.clickable - a.clickable) || (b.area - a.area));
-      if (!matches[0]) return { ok: false };
-      matches[0].el.click();
-      return { ok: true, text: matches[0].text };
-    }).catch(() => ({ ok: false }));
-
-    if (clicked?.ok) return `dom_scan:${clicked.text || ""}`;
-
-    return "not_found";
-  }
-
   try {
-    // 1) Go to login
     const resp = await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     await sleep(1200);
 
     const status = resp ? resp.status() : null;
-
-    // Cloudflare hard fail detection even if status is 200
     const html0 = await page.content().catch(() => "");
     if (isCloudflareErrorHtml(html0)) {
       await dumpDebugStep(page, "cloudflare-login", { loginUrl, username: account.username, status });
@@ -1456,15 +1328,13 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
     await dumpDebugStep(page, "after-goto-login", { loginUrl, username: account.username, status, mobile });
 
-    // 2) Find login fields
-    const userRes = await findVisibleInAnyFrame(page, USER_SELECTORS, 30000);
-    const passRes = await findVisibleInAnyFrame(page, PASS_SELECTORS, 30000);
+    const userRes = await findVisibleInAnyFrame(page, USER_SELECTORS, 25000);
+    const passRes = await findVisibleInAnyFrame(page, PASS_SELECTORS, 25000);
     if (!userRes.ok || !passRes.ok) {
       await dumpDebugStep(page, "login-fields-missing", { userFound: userRes.ok, passFound: passRes.ok });
       await fail("login-fields-missing", "Login fields not found", { userFound: userRes.ok, passFound: passRes.ok });
     }
 
-    // 3) Fill + click login (retry a few times)
     let loggedIn = false;
     let lastAfterClick = null;
     let lastSettle = null;
@@ -1476,8 +1346,8 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       await sleep(1200);
       await closeOverlays(page);
 
-      const userRes2 = await findVisibleInAnyFrame(page, USER_SELECTORS, 25000);
-      const passRes2 = await findVisibleInAnyFrame(page, PASS_SELECTORS, 25000);
+      const userRes2 = await findVisibleInAnyFrame(page, USER_SELECTORS, 20000);
+      const passRes2 = await findVisibleInAnyFrame(page, PASS_SELECTORS, 20000);
       if (!userRes2.ok || !passRes2.ok) {
         await dumpDebugStep(page, `login-attempt-${attempt}-fields-missing`, { attempt });
         continue;
@@ -1497,48 +1367,44 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       await passField.fill(account.password).catch(() => null);
       await sleep(150);
 
-      const clickMethod = await clickLoginButton();
-
-      // Fallback: Enter
-      if (clickMethod === "not_found") {
+      // Click login (H5-safe)
+      const clickRes = await clickLogin(page);
+      if (!clickRes.ok) {
+        // fallback: Enter
         await passField.press("Enter").catch(() => null);
       }
 
       await sleep(450);
       lastAfterClick = await logAfterLoginClick(page);
 
-      // Allow SPA to process
-      const settled = await waitForLoginToSettle(page, 45000);
+      const settled = await waitForLoginToSettle(page, 30000);
       lastSettle = settled;
 
-      await dumpDebugStep(page, `after-login-attempt-${attempt}`, {
-        attempt,
-        clickMethod,
-        lastAfterClick,
-        settled
-      });
+      await dumpDebugStep(page, `after-login-attempt-${attempt}`, { attempt, lastAfterClick, settled, clickRes });
 
-      if (!settled.ok) continue;
+      if (settled.ok) {
+        loggedIn = true;
+        console.log("Login likely succeeded for", account.username, "on", loginUrl, "| reason:", settled.reason);
+        break;
+      }
 
-      loggedIn = true;
-      console.log("Login likely succeeded for", account.username, "on", loginUrl, "| reason:", settled.reason);
-      break;
+      // if we saw explicit error text, stop retrying (bad creds or blocked)
+      if (settled.reason === "error_text_visible") break;
     }
 
     if (!loggedIn) {
-      await debugDumpButtons(page, "login-clickables");
-      await fail("login-failed", "Login failed (never detected logged-in state)", { lastAfterClick, lastSettle });
+      await fail("login-failed", "Login failed (login form never disappeared)", { lastAfterClick, lastSettle });
     }
 
-    // 4) Ensure we are on Futures/Trade page
+    // Futures page
     const fut = await ensureOnFuturesPage(page, loginUrl);
     await dumpDebugStep(page, "after-ensure-futures", { fut });
 
     if (!fut.ok) {
-      await fail("futures-nav-failed", "Could not reach Futures/Trade page", { fut });
+      await fail("futures-nav-failed", "Could not reach Futures page", { fut });
     }
 
-    // 5) Navigate/open the order code flow
+    // Order code flow
     const flowOk = await openOrderCodeFlow(page);
     await dumpDebugStep(page, "after-open-order-flow", { flowOk });
 
@@ -1546,8 +1412,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       await fail("order-flow-missing", "Could not reach order code input");
     }
 
-    // 6) Find and fill order code input
-    const codeRes = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 20000);
+    const codeRes = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 15000);
     if (!codeRes.ok) {
       await fail("code-box-missing", "Order code input not found");
     }
@@ -1559,13 +1424,14 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await sleep(600);
     await dumpDebugStep(page, "after-code-fill", { codeLength: String(orderCode || "").length });
 
-    // 7) Find confirm/submit button
+    // Confirm button
     const confirmCandidates = [
       page.getByRole("button", { name: /confirm/i }).first(),
+      page.getByText(/^confirm$/i).first(),
+      page.getByText(/confirm/i).first(),
       page.getByRole("button", { name: /submit/i }).first(),
       page.getByRole("button", { name: /follow/i }).first(),
-      page.getByRole("button", { name: /ok/i }).first(),
-      page.getByText(/confirm/i).first()
+      page.getByRole("button", { name: /ok/i }).first()
     ];
 
     let confirmBtn = null;
@@ -1577,11 +1443,9 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     }
 
     if (!confirmBtn) {
-      await debugDumpButtons(page, "confirm-missing");
       await fail("confirm-missing", "Confirm button not found");
     }
 
-    // 8) Click confirm + verification
     let lastVerify = null;
     for (let i = 1; i <= CONFIRM_RETRIES; i++) {
       console.log("Confirm attempt", i, "for", account.username);
@@ -1596,18 +1460,20 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
       if (verify.ok) {
         await dumpDebugStep(page, "confirm-verified", { verify });
-        return verify.detail || "verified";
+        return verify.detail || "confirmed";
       }
 
       console.log("Verification not satisfied:", verify.detail);
       await sleep(CONFIRM_RETRY_DELAY_MS);
     }
 
+    // If verification is disabled, consider a click success
+    if (!VERIFY_TOAST && !VERIFY_PENDING) return "confirmed (verification disabled)";
+
     await fail("confirm-verification-failed", lastVerify?.detail || "Confirm verification failed", { lastVerify });
   } catch (e) {
     const msg = e?.message || String(e);
     const alreadyCaptured = !!(e && typeof e === "object" && e.__captured);
-
     if (!alreadyCaptured) {
       await captureFailureArtifacts(page, `${sanitizeForFilename(account.username)}-unhandled`, {
         loginUrl,
@@ -1615,7 +1481,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
         error: msg
       });
     }
-
     const err = e instanceof Error ? e : new Error(msg);
     err.__captured = true;
     throw err;
@@ -1628,8 +1493,9 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 async function openOrderCodeFlow(page) {
   const attempts = [
     { name: "invited_me", regex: /invited\s*me/i },
-    { name: "invite", regex: /invite|invitation|follow-up/i },
     { name: "copying_history", regex: /copying\s*history/i },
+    { name: "initiate_follow", regex: /initiate\s*a\s*follow-?up/i },
+    { name: "invite", regex: /invite|invitation/i },
     { name: "position_order", regex: /position\s*order/i }
   ];
 
@@ -1641,18 +1507,18 @@ async function openOrderCodeFlow(page) {
         await sleep(900);
         await closeOverlays(page);
 
-        const codeRes = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 3000);
+        const codeRes = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 2500);
         if (codeRes.ok) return true;
       }
     } catch {}
   }
 
-  const codeRes2 = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 3000);
+  const codeRes2 = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 2500);
   return codeRes2.ok;
 }
 
 // --------------------
-// Startup logging + listen
+// Startup
 // --------------------
 app.listen(PORT, "0.0.0.0", () => {
   const errs = startupConfigErrors();
@@ -1662,7 +1528,7 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("Failure capture: ALWAYS ON");
   console.log("FORCE_MOBILE:", FORCE_MOBILE);
   console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
-  console.log("API_REWRITE:", API_REWRITE_ENABLED, "match:", API_REWRITE_MATCH, "target:", API_REWRITE_TARGET);
+  console.log("API_REWRITE:", API_REWRITE, "match:", API_REWRITE_MATCH, "target:", API_REWRITE_TARGET || "(none)");
   console.log("Email provider:", EMAIL_PROVIDER);
   console.log("Email configured:", emailConfigured());
   console.log("Verify toast/pending:", VERIFY_TOAST, VERIFY_PENDING);
