@@ -11,36 +11,28 @@ const { chromium } = require("playwright");
 
 const PORT = Number(process.env.PORT || 8080);
 
-// Support both BOT_PASSWORD and RUN_PASSWORD
 const BOT_PASSWORD = (process.env.BOT_PASSWORD || process.env.RUN_PASSWORD || "").toString();
-
-// Accounts are supplied as JSON array: [{ "username": "...", "password": "..." }, ...]
 const ACCOUNTS_JSON = (process.env.ACCOUNTS_JSON || "").toString();
-
-// Optional: LOGIN_URLS override (comma-separated)
 const LOGIN_URLS_ENV = (process.env.LOGIN_URLS || "").toString();
 
-// Optional: force mobile emulation even for /pc URLs
 const FORCE_MOBILE = envTruthy(process.env.FORCE_MOBILE || "0");
-
-// Optional debug capture (extra artifacts at many steps). Failure capture is ALWAYS on.
 const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE || "0");
 
-// API rewrite (critical for Railway DNS failures)
+// 🔥 NEW: independent capture toggles
+const TRACE_CAPTURE = envTruthy(process.env.TRACE_CAPTURE || "1"); // default ON
+const HAR_CAPTURE = envTruthy(process.env.HAR_CAPTURE || "1");     // default ON
+
+// API rewrite
 const API_REWRITE = envTruthy(process.env.API_REWRITE || "0");
 const API_REWRITE_MATCH = (process.env.API_REWRITE_MATCH || "^api\\.").toString();
 const API_REWRITE_TARGET = (process.env.API_REWRITE_TARGET || "").toString().trim();
 
-// --------------------
-// Helpers
-// --------------------
 const DEFAULT_TZ = (process.env.TZ || "America/Denver").toString();
 
 function envTruthy(v) {
   const s = (v || "").toString().trim().toLowerCase();
   return s === "1" || s === "true" || s === "yes" || s === "on";
 }
-
 function nowLocal() {
   try {
     return new Date().toLocaleString("en-US", { timeZone: DEFAULT_TZ, timeZoneName: "short" });
@@ -48,11 +40,9 @@ function nowLocal() {
     return new Date().toISOString();
   }
 }
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
-
 function escapeHtml(s) {
   return String(s ?? "")
     .replaceAll("&", "&amp;")
@@ -61,7 +51,6 @@ function escapeHtml(s) {
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
 }
-
 function sanitizeForFilename(s) {
   return String(s ?? "")
     .replace(/[^a-z0-9._-]+/gi, "_")
@@ -69,189 +58,81 @@ function sanitizeForFilename(s) {
     .replace(/^_+|_+$/g, "")
     .slice(0, 80);
 }
-
 function authOk(req) {
   const p = (req.query.p || "").toString();
   return !!BOT_PASSWORD && p === BOT_PASSWORD;
 }
-
 function ensureDir(dir) {
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-  } catch {}
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
 }
-
 function safeListDir(dir) {
-  try {
-    return fs.readdirSync(dir).filter((x) => !x.includes(".."));
-  } catch {
-    return [];
-  }
+  try { return fs.readdirSync(dir).filter((x) => !x.includes("..")); } catch { return []; }
 }
-
 function safeJsonParseAccounts() {
-  if (!ACCOUNTS_JSON) {
-    return { ok: false, accounts: [], error: "ACCOUNTS_JSON not set" };
-  }
+  if (!ACCOUNTS_JSON) return { ok: false, accounts: [], error: "ACCOUNTS_JSON not set" };
   try {
     const parsed = JSON.parse(ACCOUNTS_JSON);
-    if (!Array.isArray(parsed)) {
-      return { ok: false, accounts: [], error: "ACCOUNTS_JSON must be a JSON array" };
-    }
-    const cleaned = parsed.map((a) => ({
-      username: String(a?.username || "").trim(),
-      password: String(a?.password || "")
-    }));
+    if (!Array.isArray(parsed)) return { ok: false, accounts: [], error: "ACCOUNTS_JSON must be a JSON array" };
+    const cleaned = parsed.map((a) => ({ username: String(a?.username || "").trim(), password: String(a?.password || "") }));
     const bad = cleaned.find((a) => !a.username || !a.password);
-    if (bad) {
-      return { ok: false, accounts: [], error: "Each account must include username + password" };
-    }
+    if (bad) return { ok: false, accounts: [], error: "Each account must include username + password" };
     return { ok: true, accounts: cleaned, error: null };
   } catch (e) {
     return { ok: false, accounts: [], error: `ACCOUNTS_JSON invalid JSON: ${e?.message || String(e)}` };
   }
 }
 
-// --------------------
-// Login URLs
-// --------------------
 function parseLoginUrls() {
   const fallback = ["https://dsj12.cc/pc/#/login", "https://dsj877.com/pc/#/login"];
-
   const raw = (LOGIN_URLS_ENV || "").trim();
   if (!raw) return fallback;
-
-  const list = raw
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean);
-
+  const list = raw.split(",").map((x) => x.trim()).filter(Boolean);
   return list.length ? list : fallback;
 }
-
 let LOGIN_URLS = parseLoginUrls();
 
 function getBaseAndPrefixFromUrl(anyUrl) {
   try {
     const u = new URL(anyUrl);
     const base = `${u.protocol}//${u.host}`;
-
-    // Prefer what we see in the current URL (h5 vs pc)
     if (anyUrl.includes("/h5/#/")) return { base, prefix: "/h5/#/" };
     if (anyUrl.includes("/pc/#/")) return { base, prefix: "/pc/#/" };
-
     if (anyUrl.includes("/h5/")) return { base, prefix: "/h5/#/" };
     if (anyUrl.includes("/pc/")) return { base, prefix: "/pc/#/" };
-
     return { base, prefix: "/pc/#/" };
   } catch {
     return null;
   }
 }
-
 function futuresUrlFromAnyUrl(anyUrl) {
   const bp = getBaseAndPrefixFromUrl(anyUrl);
   if (!bp) return null;
   return `${bp.base}${bp.prefix}contractTransaction`;
 }
 
-// --------------------
-// Minimal HTTP fetch (no extra deps)
-// --------------------
 function simpleGet(url, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
     let u;
-    try {
-      u = new URL(url);
-    } catch (e) {
-      reject(new Error(`Bad URL: ${url}`));
-      return;
-    }
-
+    try { u = new URL(url); } catch { return reject(new Error(`Bad URL: ${url}`)); }
     const lib = u.protocol === "https:" ? https : http;
     const req = lib.request(
-      {
-        method: "GET",
-        hostname: u.hostname,
-        port: u.port || (u.protocol === "https:" ? 443 : 80),
-        path: u.pathname + u.search,
-        headers: {
-          "User-Agent": "T-Bot/1.0",
-          Accept: "text/html,application/json;q=0.9,*/*;q=0.8"
-        }
-      },
+      { method: "GET", hostname: u.hostname, port: u.port || (u.protocol === "https:" ? 443 : 80), path: u.pathname + u.search,
+        headers: { "User-Agent": "T-Bot/1.0", Accept: "text/html,application/json;q=0.9,*/*;q=0.8" } },
       (res) => {
         const chunks = [];
         res.on("data", (d) => chunks.push(d));
-        res.on("end", () => {
-          const body = Buffer.concat(chunks).toString("utf8");
-          resolve({ status: res.statusCode || 0, body });
-        });
+        res.on("end", () => resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks).toString("utf8") }));
       }
     );
-
     req.on("error", reject);
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error(`Timeout after ${timeoutMs}ms`));
-    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`Timeout after ${timeoutMs}ms`)));
     req.end();
   });
 }
 
-// --------------------
-// Email config (SendGrid Web API) - optional
-// --------------------
-const EMAIL_ENABLED = envTruthy(process.env.EMAIL_ENABLED || "1");
-const EMAIL_PROVIDER = (process.env.EMAIL_PROVIDER || "sendgrid").toString().trim().toLowerCase();
-const SENDGRID_API_KEY = (process.env.SENDGRID_API_KEY || "").toString();
-const EMAIL_FROM = (process.env.EMAIL_FROM || "").toString().trim();
-const EMAIL_FROM_NAME = (process.env.EMAIL_FROM_NAME || "T-Bot").toString().trim();
-const EMAIL_TO = (process.env.EMAIL_TO || "").toString().trim();
-const EMAIL_ACCOUNT_FAIL_ALERTS = envTruthy(process.env.EMAIL_ACCOUNT_FAIL_ALERTS || "1");
-const EMAIL_MAX_FAIL_ALERTS = Number(process.env.EMAIL_MAX_FAIL_ALERTS || "2");
-
-function emailConfigured() {
-  if (!EMAIL_ENABLED) return false;
-  if (EMAIL_PROVIDER !== "sendgrid") return false;
-  return !!(SENDGRID_API_KEY && EMAIL_FROM && EMAIL_TO);
-}
-
-async function sendEmail(subject, text) {
-  if (!emailConfigured()) {
-    console.log("Email not configured, skipping send:", subject);
-    return { ok: false, skipped: true, error: "Email not configured" };
-  }
-  try {
-    const sgMail = require("@sendgrid/mail");
-    sgMail.setApiKey(SENDGRID_API_KEY);
-
-    const msg = {
-      to: EMAIL_TO.split(",").map((s) => s.trim()).filter(Boolean),
-      from: { email: EMAIL_FROM, name: EMAIL_FROM_NAME },
-      subject,
-      text
-    };
-
-    const [res] = await sgMail.send(msg);
-    const status = res?.statusCode ?? null;
-    const msgId = (res?.headers?.["x-message-id"] || res?.headers?.["X-Message-Id"]) ?? null;
-    console.log("Email sent:", { status, msgId, to: msg.to, subject });
-    return { ok: true, skipped: false, status, msgId, to: msg.to };
-  } catch (e) {
-    const body = e?.response?.body ?? null;
-    const errText = body ? JSON.stringify(body) : e?.message ? e.message : String(e);
-    console.log("Email failed (SendGrid API):", errText, "|", subject);
-    return { ok: false, skipped: false, error: errText };
-  }
-}
-
-// --------------------
-// Run state
-// --------------------
 let isRunning = false;
 let lastRunAt = null;
 let lastError = null;
-
 let lastShotPath = null;
 let lastRunId = null;
 let lastDebugDir = null;
@@ -266,14 +147,9 @@ function writePlaceholderLastShot() {
     fs.writeFileSync("/app/last-shot.png", placeholder);
   } catch {}
 }
-
 async function tryCopyToStableLastShot(srcPath) {
-  try {
-    ensureDir("/app");
-    fs.copyFileSync(srcPath, "/app/last-shot.png");
-  } catch {}
+  try { ensureDir("/app"); fs.copyFileSync(srcPath, "/app/last-shot.png"); } catch {}
 }
-
 async function saveScreenshot(page, fullPath) {
   try {
     await page.screenshot({ path: fullPath, fullPage: true });
@@ -285,7 +161,6 @@ async function saveScreenshot(page, fullPath) {
     return false;
   }
 }
-
 async function captureFailureArtifacts(page, tag, extra = {}) {
   const stamp = Date.now();
   const safeTag = sanitizeForFilename(tag || "failure");
@@ -293,43 +168,27 @@ async function captureFailureArtifacts(page, tag, extra = {}) {
   ensureDir(dir);
 
   let url = "";
-  try {
-    url = page?.url?.() || "";
-  } catch {}
+  try { url = page?.url?.() || ""; } catch {}
   if (!url) {
-    try {
-      url = await page.evaluate(() => location.href).catch(() => "");
-    } catch {}
+    try { url = await page.evaluate(() => location.href).catch(() => ""); } catch {}
   }
 
   const shotPath = path.join(dir, `${safeTag}-${stamp}.png`);
   const htmlPath = path.join(dir, `${safeTag}-${stamp}.html`);
-  const urlPath = path.join(dir, `${safeTag}-${stamp}.url.txt`);
   const extraPath = path.join(dir, `${safeTag}-${stamp}.extra.json`);
 
   let savedShot = false;
   let savedHtml = false;
 
-  try {
-    if (page) savedShot = await saveScreenshot(page, shotPath);
-  } catch {}
-
+  try { if (page) savedShot = await saveScreenshot(page, shotPath); } catch {}
   try {
     if (page) {
       const html = await page.content().catch(() => "");
       fs.writeFileSync(htmlPath, html || "");
       savedHtml = true;
     }
-  } catch (e) {
-    console.log("HTML dump failed:", e?.message || String(e));
-  }
-
-  try {
-    fs.writeFileSync(urlPath, String(url || ""));
   } catch {}
-  try {
-    fs.writeFileSync(extraPath, JSON.stringify({ ...extra, url }, null, 2));
-  } catch {}
+  try { fs.writeFileSync(extraPath, JSON.stringify({ ...extra, url }, null, 2)); } catch {}
 
   console.log("FAILURE URL:", url || "(unknown)");
   console.log("FAILURE screenshot saved:", savedShot ? shotPath : "(screenshot failed)");
@@ -338,7 +197,6 @@ async function captureFailureArtifacts(page, tag, extra = {}) {
 
   return { url, shotPath: savedShot ? shotPath : null, htmlPath: savedHtml ? htmlPath : null, dir };
 }
-
 async function dumpDebugStep(page, tag, extra = {}) {
   if (!DEBUG_CAPTURE) return null;
   const stamp = Date.now();
@@ -347,78 +205,33 @@ async function dumpDebugStep(page, tag, extra = {}) {
   ensureDir(dir);
 
   const base = path.join(dir, `${safeTag}-${stamp}`);
-  try {
-    fs.writeFileSync(`${base}.url.txt`, String(page.url() || ""));
-  } catch {}
-  try {
-    const title = await page.title().catch(() => "");
-    fs.writeFileSync(`${base}.title.txt`, title || "");
-  } catch {}
-  try {
-    const html = await page.content().catch(() => "");
-    fs.writeFileSync(`${base}.html`, html || "");
-  } catch {}
-  try {
-    fs.writeFileSync(`${base}.extra.json`, JSON.stringify(extra, null, 2));
-  } catch {}
-  try {
-    await saveScreenshot(page, `${base}.png`);
-  } catch {}
+  try { fs.writeFileSync(`${base}.url.txt`, String(page.url() || "")); } catch {}
+  try { fs.writeFileSync(`${base}.extra.json`, JSON.stringify(extra, null, 2)); } catch {}
+  try { await saveScreenshot(page, `${base}.png`); } catch {}
   return base;
 }
 
-// --------------------
-// Selectors
-// --------------------
 const USER_SELECTORS = [
-  'input[type="email"]',
-  'input[type="text"]',
-  'input[type="tel"]',
-  'input[name*="user" i]',
-  'input[name*="email" i]',
-  'input[name*="account" i]',
-  'input[placeholder*="email" i]',
-  'input[placeholder*="mail" i]',
-  'input[placeholder*="account" i]',
-  'input[placeholder*="phone" i]',
-  'input[placeholder*="mobile" i]'
+  'input[type="email"]','input[type="text"]','input[type="tel"]',
+  'input[name*="user" i]','input[name*="email" i]','input[name*="account" i]',
+  'input[placeholder*="email" i]','input[placeholder*="mail" i]','input[placeholder*="account" i]',
+  'input[placeholder*="phone" i]','input[placeholder*="mobile" i]'
 ].join(", ");
-
 const PASS_SELECTORS = [
-  'input[type="password"]',
-  'input[name*="pass" i]',
-  'input[placeholder*="password" i]'
-].join(", ");
-
-const ORDER_CODE_SELECTORS = [
-  'input[placeholder*="order code" i]',
-  'input[placeholder*="order" i]',
-  'input[placeholder*="invite" i]',
-  'input[placeholder*="Please enter" i]',
-  'input[placeholder*="code" i]',
-  'input[name*="code" i]'
+  'input[type="password"]','input[name*="pass" i]','input[placeholder*="password" i]'
 ].join(", ");
 
 function isCloudflareErrorHtml(html) {
   const s = (html || "").toLowerCase();
   if (!s) return false;
-  if (s.includes("cloudflare") && s.includes("cf-error-details")) return true;
-  if (s.includes("error 1101")) return true;
-  if (s.includes("worker threw exception")) return true;
-  return false;
+  return (s.includes("cloudflare") && s.includes("cf-error-details")) || s.includes("error 1101") || s.includes("worker threw exception");
 }
-
 async function closeOverlays(page) {
   const candidates = [
     page.getByRole("button", { name: /close|cancel|dismiss|i understand|got it|ok|agree/i }),
     page.locator('[aria-label*="close" i]'),
-    page.locator('button:has-text("×")'),
-    page.locator(".close"),
-    page.locator(".modal-close"),
-    page.locator(".ant-modal-close"),
-    page.locator(".el-dialog__headerbtn")
+    page.locator(".ant-modal-close")
   ];
-
   for (const c of candidates) {
     try {
       const btn = c.first();
@@ -429,7 +242,6 @@ async function closeOverlays(page) {
     } catch {}
   }
 }
-
 async function isVisibleInAnyFrame(page, selector) {
   for (const f of page.frames()) {
     try {
@@ -439,40 +251,29 @@ async function isVisibleInAnyFrame(page, selector) {
   }
   return false;
 }
-
 async function findVisibleInAnyFrame(page, selector, timeoutMs) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     await closeOverlays(page);
-
-    const frames = page.frames();
-    for (const f of frames) {
+    for (const f of page.frames()) {
       try {
         const loc = f.locator(selector).first();
-        if (await loc.isVisible().catch(() => false)) {
-          return { ok: true, frame: f, locator: loc };
-        }
+        if (await loc.isVisible().catch(() => false)) return { ok: true, frame: f, locator: loc };
       } catch {}
     }
-
     await sleep(250);
   }
   return { ok: false, frame: null, locator: null };
 }
 
-// --------------------
-// Login click (H5-safe)
-// --------------------
 async function clickLogin(page) {
   const candidates = [
     page.getByRole("button", { name: /login|sign in/i }).first(),
     page.getByText(/^login$/i).first(),
-    page.getByText(/login/i).first(),
     page.locator('button:has-text("Login")').first(),
     page.locator('div:has-text("Login")').first(),
     page.locator('span:has-text("Login")').first()
   ];
-
   for (const c of candidates) {
     try {
       if (await c.isVisible().catch(() => false)) {
@@ -482,86 +283,30 @@ async function clickLogin(page) {
       }
     } catch {}
   }
-
-  // Last-resort: click center of the most button-like element containing "Login"
-  try {
-    const r = await page.evaluate(() => {
-      const els = Array.from(document.querySelectorAll("button,div,span,a"));
-      const m = els
-        .map((el) => {
-          const txt = (el.innerText || el.textContent || "").trim();
-          if (!txt) return null;
-          if (!/login/i.test(txt)) return null;
-          const rect = el.getBoundingClientRect();
-          if (rect.width < 40 || rect.height < 20) return null;
-          const style = window.getComputedStyle(el);
-          if (style.display === "none" || style.visibility === "hidden") return null;
-          const clickable = style.cursor === "pointer" || el.tagName.toLowerCase() === "button" || el.tagName.toLowerCase() === "a";
-          return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, txt: txt.slice(0, 40), clickable };
-        })
-        .filter(Boolean)
-        .sort((a, b) => (b.clickable ? 1 : 0) - (a.clickable ? 1 : 0));
-      return m[0] || null;
-    });
-
-    if (r?.x && r?.y) {
-      await page.mouse.click(r.x, r.y).catch(() => null);
-      return { ok: true, fallback: true, label: r.txt };
-    }
-  } catch {}
-
   return { ok: false };
 }
 
 async function logAfterLoginClick(page) {
-  const url = (() => {
-    try {
-      return page.url();
-    } catch {
-      return "";
-    }
-  })();
-
+  const url = page.url();
   const userVisible = await isVisibleInAnyFrame(page, USER_SELECTORS);
   const passVisible = await isVisibleInAnyFrame(page, PASS_SELECTORS);
   const loginFormVisible = userVisible && passVisible;
 
-  console.log(
-    "AFTER LOGIN CLICK | url:",
-    url,
-    "| loginFormVisible:",
-    loginFormVisible,
-    "| userVisible:",
-    userVisible,
-    "| passVisible:",
-    passVisible
-  );
-
+  console.log("AFTER LOGIN CLICK | url:", url, "| loginFormVisible:", loginFormVisible, "| userVisible:", userVisible, "| passVisible:", passVisible);
   return { url, loginFormVisible, userVisible, passVisible };
 }
-
 async function waitForLoginToSettle(page, timeoutMs = 30000) {
   const start = Date.now();
-
   while (Date.now() - start < timeoutMs) {
     await closeOverlays(page);
-
     const url = page.url();
     const userVisible = await isVisibleInAnyFrame(page, USER_SELECTORS);
     const passVisible = await isVisibleInAnyFrame(page, PASS_SELECTORS);
     const loginFormVisible = userVisible && passVisible;
 
-    // Strong success signal: moved off login
-    if (!/\/login\b|#\/login\b/i.test(url) && !loginFormVisible) {
-      return { ok: true, url, reason: "url_changed_and_fields_gone" };
-    }
+    if (!/\/login\b|#\/login\b/i.test(url) && !loginFormVisible) return { ok: true, url, reason: "url_changed_and_fields_gone" };
+    if (!loginFormVisible) return { ok: true, url, reason: "login_fields_hidden" };
 
-    // Another success signal: fields gone
-    if (!loginFormVisible) {
-      return { ok: true, url, reason: "login_fields_hidden" };
-    }
-
-    // Explicit failure hints on screen
     const bad = await page.getByText(/incorrect|invalid|error|failed/i).first().isVisible().catch(() => false);
     if (bad) {
       const txt = (await page.getByText(/incorrect|invalid|error|failed/i).first().textContent().catch(() => "")) || "";
@@ -570,316 +315,39 @@ async function waitForLoginToSettle(page, timeoutMs = 30000) {
 
     await sleep(350);
   }
-
   return { ok: false, url: page.url(), reason: "timeout" };
 }
 
-// --------------------
-// Futures navigation
-// --------------------
-const FUTURES_TEXT_PATTERNS = [/futures/i, /contract/i, /contracts/i, /合约/i, /期货/i];
+function shouldUseMobileContext(loginUrl) {
+  if (FORCE_MOBILE) return true;
+  const u = (loginUrl || "").toLowerCase();
+  return u.includes("/h5/#/") || u.includes("/h5/");
+}
 
-async function tryClickByRoleOrText(page, regex, preferBottom = false) {
-  const roleCandidates = [
-    page.getByRole("tab", { name: regex }).first(),
-    page.getByRole("link", { name: regex }).first(),
-    page.getByRole("button", { name: regex }).first()
-  ];
+async function attachApiRewrite(page) {
+  if (!API_REWRITE || !API_REWRITE_TARGET) return;
+  let re;
+  try { re = new RegExp(API_REWRITE_MATCH); } catch { re = /^api\./; }
 
-  for (const loc of roleCandidates) {
-    try {
-      if (await loc.isVisible().catch(() => false)) {
-        await loc.click({ timeout: 8000 }).catch(() => null);
-        return { ok: true, method: "role", label: regex.toString() };
+  await page.route("**/*", async (route) => {
+    const req = route.request();
+    const urlStr = req.url();
+    let u;
+    try { u = new URL(urlStr); } catch { return route.continue(); }
+
+    if (re.test(u.hostname)) {
+      const origHost = u.hostname;
+      u.hostname = API_REWRITE_TARGET;
+      const newUrl = u.toString();
+      if (/login|ping|\/api\//i.test(urlStr)) {
+        console.log("API_REWRITE:", origHost, "=>", API_REWRITE_TARGET, "|", u.pathname);
       }
-    } catch {}
-  }
-
-  try {
-    const t = page.getByText(regex).first();
-    if (await t.isVisible().catch(() => false)) {
-      await t.click({ timeout: 8000 }).catch(() => null);
-      return { ok: true, method: "text", label: regex.toString() };
+      return route.continue({ url: newUrl });
     }
-  } catch {}
-
-  try {
-    const result = await page.evaluate(
-      ({ source, flags, preferBottom }) => {
-        const re = new RegExp(source, flags);
-
-        function isVisible(el) {
-          const style = window.getComputedStyle(el);
-          if (!style) return false;
-          if (style.visibility === "hidden" || style.display === "none" || style.opacity === "0") return false;
-          const r = el.getBoundingClientRect();
-          if (r.width < 2 || r.height < 2) return false;
-          if (r.bottom < 0 || r.right < 0) return false;
-          if (r.top > window.innerHeight || r.left > window.innerWidth) return false;
-          return true;
-        }
-
-        function isClickable(el) {
-          const tag = (el.tagName || "").toLowerCase();
-          const role = (el.getAttribute("role") || "").toLowerCase();
-          const hasOnclick = typeof el.onclick === "function" || el.hasAttribute("onclick");
-          const cursor = window.getComputedStyle(el).cursor;
-          return tag === "a" || tag === "button" || role === "tab" || role === "button" || hasOnclick || cursor === "pointer";
-        }
-
-        const els = Array.from(document.querySelectorAll("a,button,[role='tab'],[role='button'],[onclick],div,span,li"));
-        const matches = [];
-
-        for (const el of els) {
-          if (!isVisible(el)) continue;
-          const text = (el.innerText || el.textContent || "").trim().replace(/\s+/g, " ");
-          if (!text) continue;
-          if (!re.test(text)) continue;
-
-          const r = el.getBoundingClientRect();
-          const yCenter = r.top + r.height / 2;
-          const bottomScore = preferBottom ? yCenter / window.innerHeight : 0;
-          const clickScore = isClickable(el) ? 1 : 0;
-
-          matches.push({
-            el,
-            text: text.slice(0, 60),
-            score: clickScore * 10 + bottomScore * 5
-          });
-        }
-
-        matches.sort((a, b) => b.score - a.score);
-
-        const best = matches[0];
-        if (!best) return { ok: false };
-
-        best.el.click();
-        return { ok: true, text: best.text };
-      },
-      { source: regex.source, flags: regex.flags, preferBottom }
-    );
-
-    if (result?.ok) return { ok: true, method: "dom_scan", label: result.text || regex.toString() };
-  } catch {}
-
-  return { ok: false };
-}
-
-async function clickFuturesNavIfPresent(page) {
-  for (const re of FUTURES_TEXT_PATTERNS) {
-    const res = await tryClickByRoleOrText(page, re, true);
-    if (res.ok) return res;
-  }
-  return { ok: false };
-}
-
-async function hasFuturesPageSignals(page) {
-  const url = page.url();
-  if (/contractTransaction/i.test(url)) return true;
-
-  const invitedVisible = await page.getByText(/invited\s*me/i).first().isVisible().catch(() => false);
-  const positionVisible = await page.getByText(/position\s*order/i).first().isVisible().catch(() => false);
-  if (invitedVisible || positionVisible) return true;
-
-  return await isVisibleInAnyFrame(page, ORDER_CODE_SELECTORS);
-}
-
-async function ensureOnFuturesPage(page, loginUrl) {
-  const target = futuresUrlFromAnyUrl(page.url() || loginUrl);
-
-  async function waitForSignals() {
-    await closeOverlays(page);
-    for (let i = 0; i < 6; i++) {
-      if (await hasFuturesPageSignals(page)) return true;
-      await sleep(500);
-    }
-    return false;
-  }
-
-  const clicked1 = await clickFuturesNavIfPresent(page);
-  if (clicked1.ok) {
-    await sleep(1200);
-    if (await waitForSignals()) {
-      return { ok: true, method: `nav:${clicked1.method}`, futuresUrl: target || null, detail: clicked1.label };
-    }
-  }
-
-  if (target) {
-    await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => null);
-    await sleep(1200);
-    if (await waitForSignals()) return { ok: true, method: "direct", futuresUrl: target };
-  }
-
-  const clicked2 = await clickFuturesNavIfPresent(page);
-  if (clicked2.ok) {
-    await sleep(1200);
-    if (await waitForSignals()) {
-      return { ok: true, method: `nav_retry:${clicked2.method}`, futuresUrl: target || null, detail: clicked2.label };
-    }
-  }
-
-  if (target) {
-    await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => null);
-    await sleep(1200);
-    if (await waitForSignals()) return { ok: true, method: "direct_after_nav", futuresUrl: target };
-  }
-
-  return { ok: false, futuresUrl: target || null, detail: "no futures nav match" };
-}
-
-// --------------------
-// Confirmation gates (optional)
-// --------------------
-const VERIFY_TOAST = envTruthy(process.env.VERIFY_TOAST || "0");
-const VERIFY_PENDING = envTruthy(process.env.VERIFY_PENDING || "0");
-const VERIFY_TIMEOUT_MS = Number(process.env.VERIFY_TIMEOUT_MS || "25000");
-const CONFIRM_RETRIES = Number(process.env.CONFIRM_RETRIES || "8");
-const CONFIRM_RETRY_DELAY_MS = Number(process.env.CONFIRM_RETRY_DELAY_MS || "2500");
-
-async function waitForToastOrModal(page) {
-  if (!VERIFY_TOAST) return { ok: false, type: "toast_off" };
-
-  const patterns = [/followed/i, /success/i, /successful/i, /completed/i, /submitted/i, /pending/i];
-
-  const start = Date.now();
-  while (Date.now() - start < VERIFY_TIMEOUT_MS) {
-    for (const re of patterns) {
-      const loc = page.getByText(re).first();
-      const visible = await loc.isVisible().catch(() => false);
-      if (visible) {
-        const txt = (await loc.textContent().catch(() => "")) || "";
-        return { ok: true, type: "toast", detail: txt.trim().slice(0, 180) || re.toString() };
-      }
-    }
-    await sleep(300);
-  }
-
-  return { ok: false, type: "toast_timeout" };
-}
-
-async function verifyPendingInPositionOrder(page) {
-  if (!VERIFY_PENDING) return { ok: false, type: "pending_off" };
-
-  const tab = page.getByText(/position\s*order/i).first();
-  if (await tab.isVisible().catch(() => false)) {
-    await tab.click({ timeout: 8000 }).catch(() => null);
-    await sleep(900);
-  }
-
-  const pending = page.getByText(/pending/i).first();
-  const start = Date.now();
-  while (Date.now() - start < VERIFY_TIMEOUT_MS) {
-    const ok = await pending.isVisible().catch(() => false);
-    if (ok) return { ok: true, type: "pending", detail: "Pending found in Position order" };
-    await sleep(350);
-  }
-
-  return { ok: false, type: "pending_timeout" };
-}
-
-async function verifyOrderFollowed(page) {
-  const toastRes = await waitForToastOrModal(page);
-  const pendingRes = await verifyPendingInPositionOrder(page);
-  if (toastRes.ok || pendingRes.ok) return { ok: true, detail: toastRes.detail || pendingRes.detail };
-  return { ok: false, detail: `No confirmation. Toast=${toastRes.type}, Pending=${pendingRes.type}` };
-}
-
-// --------------------
-// Preflight: IMPORTANT CHANGE
-// - don’t pick only H5. Always try to include at least 1 PC URL if provided.
-// --------------------
-const PREFLIGHT_ENABLED = envTruthy(process.env.PREFLIGHT_ENABLED || "1");
-const PREFLIGHT_LOGIN_WAIT_MS = Number(process.env.PREFLIGHT_LOGIN_WAIT_MS || "20000");
-const PREFLIGHT_RETRIES = Number(process.env.PREFLIGHT_RETRIES || "2");
-const PREFLIGHT_RETRY_DELAY_MS = Number(process.env.PREFLIGHT_RETRY_DELAY_MS || "1500");
-const PREFLIGHT_MAX_SITES = Number(process.env.PREFLIGHT_MAX_SITES || "4");
-
-function isH5(url) {
-  const u = (url || "").toLowerCase();
-  return u.includes("/h5/") || u.includes("/h5/#/");
-}
-function isPC(url) {
-  const u = (url || "").toLowerCase();
-  return u.includes("/pc/") || u.includes("/pc/#/");
-}
-
-async function preflightSites() {
-  if (!PREFLIGHT_ENABLED) return { ok: true, sites: LOGIN_URLS, note: "preflight disabled" };
-
-  const browser = await chromium.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+    return route.continue();
   });
-
-  const good = [];
-  try {
-    // 1) first pass in order
-    for (const loginUrl of LOGIN_URLS) {
-      if (good.length >= PREFLIGHT_MAX_SITES) break;
-
-      let passed = false;
-      for (let i = 1; i <= PREFLIGHT_RETRIES; i++) {
-        console.log("Preflight checking:", loginUrl, "attempt", i);
-
-        const context = await browser.newContext({
-          viewport: shouldUseMobileContext(loginUrl) ? { width: 390, height: 844 } : { width: 1280, height: 720 },
-          locale: "en-US",
-          isMobile: shouldUseMobileContext(loginUrl),
-          hasTouch: shouldUseMobileContext(loginUrl)
-        });
-        const page = await context.newPage();
-        page.setDefaultTimeout(30000);
-
-        try {
-          await attachApiRewrite(page);
-          const resp = await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-          await sleep(700);
-
-          const status = resp ? resp.status() : null;
-          if (status && status >= 400) throw new Error(`Preflight failed: HTTP ${status}`);
-
-          const html = await page.content().catch(() => "");
-          if (isCloudflareErrorHtml(html)) throw new Error("Preflight failed: Cloudflare error page");
-
-          const userRes = await findVisibleInAnyFrame(page, USER_SELECTORS, PREFLIGHT_LOGIN_WAIT_MS);
-          if (!userRes.ok) throw new Error(`Preflight failed: user field not found within ${PREFLIGHT_LOGIN_WAIT_MS}ms`);
-
-          console.log("Preflight OK:", loginUrl);
-          passed = true;
-          await context.close().catch(() => null);
-          break;
-        } catch (e) {
-          console.log("Preflight attempt", i, "failed for", loginUrl, "err:", e?.message || String(e));
-          await context.close().catch(() => null);
-          await sleep(PREFLIGHT_RETRY_DELAY_MS);
-        }
-      }
-
-      if (passed) good.push(loginUrl);
-    }
-
-    // 2) ensure we include at least one PC URL if any exist
-    const anyPCProvided = LOGIN_URLS.some(isPC);
-    const havePC = good.some(isPC);
-    if (anyPCProvided && !havePC && good.length < PREFLIGHT_MAX_SITES) {
-      for (const u of LOGIN_URLS.filter(isPC)) {
-        if (good.length >= PREFLIGHT_MAX_SITES) break;
-        if (good.includes(u)) continue;
-        console.log("Preflight forcing PC candidate:", u);
-        good.push(u);
-      }
-    }
-
-    if (!good.length) return { ok: false, sites: [], note: "No sites passed preflight" };
-    return { ok: true, sites: good, note: `Chosen sites: ${good.join(", ")}` };
-  } finally {
-    await browser.close().catch(() => null);
-  }
 }
 
-// --------------------
-// Express app
-// --------------------
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 
@@ -892,48 +360,6 @@ function startupConfigErrors() {
   return errs;
 }
 
-app.get("/", (req, res) => {
-  const cfg = safeJsonParseAccounts();
-  const errs = startupConfigErrors();
-
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(`
-    <h2>T-Bot</h2>
-    <div>Running: <b>${isRunning ? "YES" : "NO"}</b></div>
-    <div>Last run: ${lastRunAt ? escapeHtml(lastRunAt) : "-"}</div>
-    <div>Last error: ${lastError ? escapeHtml(lastError) : "-"}</div>
-    <div>Debug capture: <b>${DEBUG_CAPTURE ? "ON" : "OFF"}</b> (Failure capture is ALWAYS on)</div>
-    <div>LOGIN_URLS: <code>${escapeHtml(LOGIN_URLS.join(", "))}</code></div>
-    <div>Force mobile: <b>${FORCE_MOBILE ? "ON" : "OFF"}</b></div>
-    <div>API_REWRITE: <b>${API_REWRITE ? "ON" : "OFF"}</b> (match: <code>${escapeHtml(
-      API_REWRITE_MATCH
-    )}</code>, target: <code>${escapeHtml(API_REWRITE_TARGET || "-")}</code>)</div>
-    <div>Accounts loaded: <b>${cfg.ok ? cfg.accounts.length : 0}</b></div>
-    <div>Email configured: <b>${emailConfigured() ? "YES" : "NO"}</b> (provider: ${escapeHtml(EMAIL_PROVIDER)})</div>
-    <div>Preflight enabled: <b>${PREFLIGHT_ENABLED ? "ON" : "OFF"}</b> (max sites: ${PREFLIGHT_MAX_SITES})</div>
-    <div style="color:red; margin-top:10px;">
-      ${errs.length ? errs.map((e) => escapeHtml(e)).join("<br/>") : ""}
-    </div>
-
-    <form method="POST" action="/run" style="margin-top:12px;">
-      <input name="p" placeholder="Password" type="password" required />
-      <br/><br/>
-      <input name="code" placeholder="Paste order code" required />
-      <br/><br/>
-      <button type="submit">Run Bot</button>
-    </form>
-
-    <div style="margin-top:12px;">
-      Health: <a href="/health">/health</a>
-      | Last screenshot: <a href="/last-shot?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/last-shot</a>
-      | Debug: <a href="/debug?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/debug</a>
-      | DNS test: <a href="/dns-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/dns-test</a>
-      | Net test: <a href="/net-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/net-test</a>
-      | Email test: <a href="/email-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/email-test</a>
-    </div>
-  `);
-});
-
 app.get("/health", (req, res) => {
   const cfg = safeJsonParseAccounts();
   res.json({
@@ -942,82 +368,28 @@ app.get("/health", (req, res) => {
     lastRun: lastRunAt,
     lastError,
     config: {
-      botPasswordSet: !!BOT_PASSWORD,
-      accountsOk: cfg.ok,
-      accountsCount: cfg.ok ? cfg.accounts.length : 0,
-      accountsError: cfg.error || null,
-      loginUrls: LOGIN_URLS,
       debugCapture: DEBUG_CAPTURE,
-      forceMobile: FORCE_MOBILE
+      traceCapture: TRACE_CAPTURE,
+      harCapture: HAR_CAPTURE,
+      forceMobile: FORCE_MOBILE,
+      loginUrls: LOGIN_URLS
     },
-    rewrite: {
-      enabled: API_REWRITE,
-      match: API_REWRITE_MATCH,
-      target: API_REWRITE_TARGET || null
-    },
-    debug: {
-      lastRunId,
-      lastDebugDir,
-      lastShotPath,
-      stableShotPath: "/app/last-shot.png"
-    }
+    rewrite: { enabled: API_REWRITE, match: API_REWRITE_MATCH, target: API_REWRITE_TARGET || null },
+    debug: { lastRunId, lastDebugDir, lastShotPath, stableShotPath: "/app/last-shot.png" }
   });
-});
-
-app.get("/email-test", async (req, res) => {
-  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-  const result = await sendEmail("T-Bot | email test", `Email test sent at ${nowLocal()}\n`);
-  res.json({ ok: true, result });
-});
-
-app.get("/last-shot", (req, res) => {
-  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-
-  const stable = "/app/last-shot.png";
-  if (fs.existsSync(stable)) {
-    res.setHeader("Content-Type", "image/png");
-    fs.createReadStream(stable).pipe(res);
-    return;
-  }
-  if (lastShotPath && fs.existsSync(lastShotPath)) {
-    res.setHeader("Content-Type", "image/png");
-    fs.createReadStream(lastShotPath).pipe(res);
-    return;
-  }
-  res.send("No screenshot captured yet.");
 });
 
 app.get("/debug", (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  if (!lastDebugDir) {
-    res.send(`<h3>Debug</h3><div>No debug directory yet. Run the bot once.</div>`);
-    return;
-  }
-
+  if (!lastDebugDir) return res.send(`<h3>Debug</h3><div>No debug directory yet. Run the bot once.</div>`);
   const files = safeListDir(lastDebugDir);
-  const links = files
-    .map((f) => {
-      const safeF = encodeURIComponent(f);
-      return `<li><a href="/debug/files?p=${encodeURIComponent(BOT_PASSWORD)}&f=${safeF}">${escapeHtml(f)}</a></li>`;
-    })
-    .join("");
-
-  res.send(`
-    <h3>Debug</h3>
-    <div>Failure capture: <b>ALWAYS ON</b></div>
-    <div>Debug capture: <b>${DEBUG_CAPTURE ? "ON" : "OFF"}</b></div>
-    <div>Last run ID: <code>${escapeHtml(lastRunId || "-")}</code></div>
-    <div>Last debug dir: <code>${escapeHtml(lastDebugDir)}</code></div>
-    <hr/>
-    <ul>${links}</ul>
-  `);
+  const links = files.map((f) => `<li><a href="/debug/files?p=${encodeURIComponent(BOT_PASSWORD)}&f=${encodeURIComponent(f)}">${escapeHtml(f)}</a></li>`).join("");
+  res.send(`<h3>Debug</h3><div>Last run ID: <code>${escapeHtml(lastRunId || "-")}</code></div><div>Dir: <code>${escapeHtml(lastDebugDir)}</code></div><hr/><ul>${links}</ul>`);
 });
 
 app.get("/debug/files", (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-
   const f = (req.query.f || "").toString();
   if (!lastDebugDir) return res.status(404).send("No debug dir.");
   if (!f) return res.status(400).send("Missing f=");
@@ -1028,64 +400,33 @@ app.get("/debug/files", (req, res) => {
   if (!full.startsWith(base)) return res.status(400).send("Bad path.");
   if (!fs.existsSync(full)) return res.status(404).send("Not found.");
 
-  if (full.endsWith(".html") || full.endsWith(".txt") || full.endsWith(".json")) {
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  } else if (full.endsWith(".png")) {
-    res.setHeader("Content-Type", "image/png");
-  } else if (full.endsWith(".har")) {
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
-  } else {
-    res.setHeader("Content-Type", "application/octet-stream");
-  }
+  if (/\.(html|txt|json)$/i.test(full)) res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  else if (/\.png$/i.test(full)) res.setHeader("Content-Type", "image/png");
+  else if (/\.har$/i.test(full)) res.setHeader("Content-Type", "application/json; charset=utf-8");
+  else if (/\.zip$/i.test(full)) res.setHeader("Content-Type", "application/zip");
+  else res.setHeader("Content-Type", "application/octet-stream");
 
   fs.createReadStream(full).pipe(res);
 });
 
 app.get("/dns-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-
-  const hosts = [
-    "dsj12.cc",
-    "dsj877.com",
-    "dsj72.com",
-    "api.dsj12.cc",
-    "api.dsj877.com",
-    "api.dsj72.com",
-    API_REWRITE_TARGET || "api.ddjea.com",
-    "api.sendgrid.com"
-  ].filter(Boolean);
-
+  const hosts = ["dsj12.cc", "dsj877.com", "api.dsj12.cc", "api.dsj877.com", API_REWRITE_TARGET || "api.ddjea.com"].filter(Boolean);
   const out = {};
   for (const h of hosts) {
-    try {
-      const addrs = await dns.lookup(h, { all: true });
-      out[h] = { ok: true, addrs };
-    } catch (e) {
-      out[h] = { ok: false, error: e?.message || String(e) };
-    }
+    try { out[h] = { ok: true, addrs: await dns.lookup(h, { all: true }) }; }
+    catch (e) { out[h] = { ok: false, error: e?.message || String(e) }; }
   }
   res.json(out);
 });
 
 app.get("/net-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-
-  const urls = [
-    "https://dsj12.cc/",
-    "https://dsj877.com/",
-    "https://dsj72.com/",
-    API_REWRITE_TARGET ? `https://${API_REWRITE_TARGET}/` : "https://api.ddjea.com/",
-    "https://api.sendgrid.com/"
-  ];
-
+  const urls = ["https://dsj12.cc/", "https://dsj877.com/", API_REWRITE_TARGET ? `https://${API_REWRITE_TARGET}/` : "https://api.ddjea.com/"];
   const results = {};
   for (const u of urls) {
-    try {
-      const r = await simpleGet(u, 15000);
-      results[u] = { ok: true, status: r.status, bodyPreview: (r.body || "").slice(0, 240) };
-    } catch (e) {
-      results[u] = { ok: false, error: e?.message || String(e) };
-    }
+    try { results[u] = { ok: true, ...(await simpleGet(u, 15000)) }; }
+    catch (e) { results[u] = { ok: false, error: e?.message || String(e) }; }
   }
   res.json(results);
 });
@@ -1106,156 +447,30 @@ app.post("/run", async (req, res) => {
   lastError = null;
   lastRunAt = nowLocal();
   lastRunId = crypto.randomBytes(6).toString("hex");
-
   lastDebugDir = `/tmp/debug-${lastRunId}`;
   ensureDir(lastDebugDir);
-
   writePlaceholderLastShot();
 
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.send("Run started. Check logs, /health, and /debug.");
 
   (async () => {
-    const startedAt = nowLocal();
-    const subjectPrefix = `T-Bot | Run ${lastRunId}`;
-    let failAlertsSent = 0;
-
     try {
-      console.log("Bot started");
-      console.log("Run ID:", lastRunId);
-      console.log("Started:", startedAt);
-      console.log("Accounts loaded:", cfg.accounts.length);
-      console.log("Order code length:", code.length);
-      console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
-      console.log("FORCE_MOBILE:", FORCE_MOBILE);
-      console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
-      console.log("API_REWRITE:", API_REWRITE, "match:", API_REWRITE_MATCH, "target:", API_REWRITE_TARGET || "(none)");
-
-      const pf = await preflightSites();
-      if (!pf.ok) throw new Error(`Preflight failed. ${pf.note}`);
-      const runSites = pf.sites;
-      console.log("Chosen sites for this run:", runSites.join(", "));
-
-      await sendEmail(
-        `${subjectPrefix} started`,
-        `T-Bot started at ${startedAt}\nRun ID: ${lastRunId}\nAccounts: ${cfg.accounts.length}\nPreflight: ${pf.note}\n`
-      );
-
-      const results = [];
       for (const account of cfg.accounts) {
-        console.log("----");
-        console.log("Account:", account.username);
-
-        try {
-          const used = await runAccountAllSites(account, code, runSites);
-          results.push({ username: account.username, ok: true, site: used.site, note: used.note });
-        } catch (e) {
-          const msg = e?.message || String(e);
-          results.push({ username: account.username, ok: false, error: msg });
-          lastError = `Account failed ${account.username}: ${msg}`;
-
-          if (EMAIL_ACCOUNT_FAIL_ALERTS && failAlertsSent < EMAIL_MAX_FAIL_ALERTS) {
-            failAlertsSent += 1;
-            await sendEmail(
-              `${subjectPrefix} account FAILED: ${account.username}`,
-              `Account failed: ${account.username}\nRun ID: ${lastRunId}\nTime: ${nowLocal()}\n\nError:\n${msg}\n\nDebug: /debug (needs password)\n`
-            );
-          }
-        }
+        await runAccountOnFirstSite(account, code);
       }
-
-      const finishedAt = nowLocal();
-      const okCount = results.filter((r) => r.ok).length;
-      const failCount = results.length - okCount;
-      const anyFailed = failCount > 0;
-
-      const summaryLines = results.map((r) => {
-        if (r.ok) return `SUCCESS: ${r.username} (${r.site})${r.note ? ` - ${r.note}` : ""}`;
-        return `FAIL: ${r.username} (${r.error})`;
-      });
-
-      await sendEmail(
-        `${subjectPrefix} ${anyFailed ? "finished with failures" : "completed"}`,
-        `T-Bot finished at ${finishedAt}\nRun ID: ${lastRunId}\n\nSummary: ${okCount} success, ${failCount} failed\n\n${summaryLines.join(
-          "\n"
-        )}\n`
-      );
-
-      console.log("Bot completed");
     } catch (e) {
-      const msg = e?.message || String(e);
-      lastError = msg;
-      await sendEmail(`${subjectPrefix} FAILED`, `T-Bot failed at ${nowLocal()}\nRun ID: ${lastRunId}\nError: ${msg}\n`);
-      console.log("Run failed:", msg);
+      lastError = e?.message || String(e);
+      console.log("Run failed:", lastError);
     } finally {
       isRunning = false;
     }
   })();
 });
 
-// --------------------
-// Playwright core
-// --------------------
-async function runAccountAllSites(account, orderCode, runSites) {
-  let last = null;
-  for (const loginUrl of runSites) {
-    console.log("Trying site:", loginUrl, "for", account.username);
-    try {
-      const note = await runAccountOnSite(account, orderCode, loginUrl);
-      console.log("SUCCESS:", account.username, "on", loginUrl);
-      return { site: loginUrl, note };
-    } catch (e) {
-      console.log("Site failed:", loginUrl, "for", account.username, "err:", e?.message || String(e));
-      last = e;
-    }
-  }
-  throw last || new Error("All sites failed");
-}
-
-function shouldUseMobileContext(loginUrl) {
-  if (FORCE_MOBILE) return true;
-  const u = (loginUrl || "").toLowerCase();
-  return u.includes("/h5/#/") || u.includes("/h5/") || u.includes("#/h5") || u.includes("h5/#");
-}
-
-async function attachApiRewrite(page) {
-  if (!API_REWRITE || !API_REWRITE_TARGET) return;
-
-  let re = null;
-  try {
-    re = new RegExp(API_REWRITE_MATCH);
-  } catch {
-    re = /^api\./;
-  }
-
-  await page.route("**/*", async (route) => {
-    const req = route.request();
-    const urlStr = req.url();
-
-    let u;
-    try {
-      u = new URL(urlStr);
-    } catch {
-      return route.continue();
-    }
-
-    // Only rewrite API hosts
-    if (re.test(u.hostname)) {
-      const origHost = u.hostname;
-      u.hostname = API_REWRITE_TARGET;
-
-      // Keep protocol/paths same
-      const newUrl = u.toString();
-      // Useful log when debugging login:
-      if (urlStr.includes("/api/") || urlStr.includes("ping") || urlStr.includes("login")) {
-        console.log("API_REWRITE:", origHost, "=>", API_REWRITE_TARGET, "|", u.pathname);
-      }
-
-      return route.continue({ url: newUrl });
-    }
-
-    return route.continue();
-  });
+async function runAccountOnFirstSite(account, orderCode) {
+  const loginUrl = LOGIN_URLS[0];
+  return await runAccountOnSite(account, orderCode, loginUrl);
 }
 
 async function runAccountOnSite(account, orderCode, loginUrl) {
@@ -1267,7 +482,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
   });
 
   const harPath =
-    DEBUG_CAPTURE && lastDebugDir
+    HAR_CAPTURE && lastDebugDir
       ? path.join(lastDebugDir, `har-${sanitizeForFilename(account.username)}-${Date.now()}.har`)
       : null;
 
@@ -1285,255 +500,90 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
   const page = await context.newPage();
   page.setDefaultTimeout(30000);
 
+  // ✅ Trace capture: start early
+  let tracePath = null;
+  if (TRACE_CAPTURE && lastDebugDir) {
+    tracePath = path.join(lastDebugDir, `trace-${sanitizeForFilename(account.username)}-${Date.now()}.zip`);
+    await context.tracing.start({ screenshots: true, snapshots: true, sources: true }).catch(() => null);
+  }
+
   await attachApiRewrite(page);
 
+  // ✅ Key logging we need
+  page.on("request", (req) => {
+    const u = req.url();
+    if (/login|ping|\/api\//i.test(u)) console.log("REQ:", req.method(), u);
+  });
+  page.on("response", async (resp) => {
+    const u = resp.url();
+    if (/login|ping|\/api\//i.test(u)) console.log("RES:", resp.status(), u);
+  });
   page.on("requestfailed", (req) => {
     const f = req.failure();
-    const errText = f?.errorText || "unknown";
-    if (req.url().includes("/api/") || req.url().includes("ping") || req.url().includes("login")) {
-      console.log("REQUEST FAILED:", req.url(), "=>", errText);
-    }
-  });
-
-  page.on("console", (msg) => {
-    if (msg.type() === "error") console.log("PAGE CONSOLE: error", msg.text());
-  });
-
-  page.on("pageerror", (err) => {
-    console.log("PAGE ERROR:", err?.message || String(err));
+    const u = req.url();
+    if (/login|ping|\/api\//i.test(u)) console.log("REQ FAILED:", u, "=>", f?.errorText || "unknown");
   });
 
   async function fail(tag, message, extra = {}) {
-    await captureFailureArtifacts(page, `${sanitizeForFilename(account.username)}-${tag}`, {
-      loginUrl,
-      username: account.username,
-      message,
-      ...extra
-    });
-    const err = new Error(message);
-    err.__captured = true;
-    throw err;
+    await captureFailureArtifacts(page, `${sanitizeForFilename(account.username)}-${tag}`, { loginUrl, ...extra });
+    throw new Error(message);
   }
 
   try {
     const resp = await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await sleep(1200);
+    await sleep(1000);
 
     const status = resp ? resp.status() : null;
     const html0 = await page.content().catch(() => "");
-    if (isCloudflareErrorHtml(html0)) {
-      await dumpDebugStep(page, "cloudflare-login", { loginUrl, username: account.username, status });
-      await fail("cloudflare", "Cloudflare error page on login", { status });
-    }
-
-    await dumpDebugStep(page, "after-goto-login", { loginUrl, username: account.username, status, mobile });
+    if (isCloudflareErrorHtml(html0)) await fail("cloudflare", "Cloudflare error page on login", { status });
 
     const userRes = await findVisibleInAnyFrame(page, USER_SELECTORS, 25000);
     const passRes = await findVisibleInAnyFrame(page, PASS_SELECTORS, 25000);
-    if (!userRes.ok || !passRes.ok) {
-      await dumpDebugStep(page, "login-fields-missing", { userFound: userRes.ok, passFound: passRes.ok });
-      await fail("login-fields-missing", "Login fields not found", { userFound: userRes.ok, passFound: passRes.ok });
-    }
+    if (!userRes.ok || !passRes.ok) await fail("login-fields-missing", "Login fields not found", { userFound: userRes.ok, passFound: passRes.ok });
 
-    let loggedIn = false;
-    let lastAfterClick = null;
-    let lastSettle = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const userField = userRes.locator;
+      const passField = passRes.locator;
 
-    for (let attempt = 1; attempt <= 6; attempt++) {
-      console.log("Login attempt", attempt, "for", account.username, "on", loginUrl);
-
-      await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => null);
-      await sleep(1200);
-      await closeOverlays(page);
-
-      const userRes2 = await findVisibleInAnyFrame(page, USER_SELECTORS, 20000);
-      const passRes2 = await findVisibleInAnyFrame(page, PASS_SELECTORS, 20000);
-      if (!userRes2.ok || !passRes2.ok) {
-        await dumpDebugStep(page, `login-attempt-${attempt}-fields-missing`, { attempt });
-        continue;
-      }
-
-      const userField = userRes2.locator;
-      const passField = passRes2.locator;
-
-      await userField.fill("").catch(() => null);
-      await passField.fill("").catch(() => null);
-
-      await userField.click({ timeout: 5000 }).catch(() => null);
       await userField.fill(account.username).catch(() => null);
-      await sleep(150);
-
-      await passField.click({ timeout: 5000 }).catch(() => null);
       await passField.fill(account.password).catch(() => null);
-      await sleep(150);
 
-      // Click login (H5-safe)
       const clickRes = await clickLogin(page);
-      if (!clickRes.ok) {
-        // fallback: Enter
-        await passField.press("Enter").catch(() => null);
-      }
+      if (!clickRes.ok) await passField.press("Enter").catch(() => null);
 
       await sleep(450);
-      lastAfterClick = await logAfterLoginClick(page);
-
+      const lastAfterClick = await logAfterLoginClick(page);
       const settled = await waitForLoginToSettle(page, 30000);
-      lastSettle = settled;
 
       await dumpDebugStep(page, `after-login-attempt-${attempt}`, { attempt, lastAfterClick, settled, clickRes });
 
-      if (settled.ok) {
-        loggedIn = true;
-        console.log("Login likely succeeded for", account.username, "on", loginUrl, "| reason:", settled.reason);
-        break;
-      }
-
-      // if we saw explicit error text, stop retrying (bad creds or blocked)
-      if (settled.reason === "error_text_visible") break;
+      if (settled.ok) break;
+      if (attempt === 3) await fail("login-failed", "Login failed (stayed on login)", { attempt, lastAfterClick, settled });
     }
 
-    if (!loggedIn) {
-      await fail("login-failed", "Login failed (login form never disappeared)", { lastAfterClick, lastSettle });
-    }
-
-    // Futures page
-    const fut = await ensureOnFuturesPage(page, loginUrl);
-    await dumpDebugStep(page, "after-ensure-futures", { fut });
-
-    if (!fut.ok) {
-      await fail("futures-nav-failed", "Could not reach Futures page", { fut });
-    }
-
-    // Order code flow
-    const flowOk = await openOrderCodeFlow(page);
-    await dumpDebugStep(page, "after-open-order-flow", { flowOk });
-
-    if (!flowOk) {
-      await fail("order-flow-missing", "Could not reach order code input");
-    }
-
-    const codeRes = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 15000);
-    if (!codeRes.ok) {
-      await fail("code-box-missing", "Order code input not found");
-    }
-
-    const codeBox = codeRes.locator;
-    await codeBox.scrollIntoViewIfNeeded().catch(() => null);
-    await codeBox.click().catch(() => null);
-    await codeBox.fill(orderCode).catch(() => null);
-    await sleep(600);
-    await dumpDebugStep(page, "after-code-fill", { codeLength: String(orderCode || "").length });
-
-    // Confirm button
-    const confirmCandidates = [
-      page.getByRole("button", { name: /confirm/i }).first(),
-      page.getByText(/^confirm$/i).first(),
-      page.getByText(/confirm/i).first(),
-      page.getByRole("button", { name: /submit/i }).first(),
-      page.getByRole("button", { name: /follow/i }).first(),
-      page.getByRole("button", { name: /ok/i }).first()
-    ];
-
-    let confirmBtn = null;
-    for (const b of confirmCandidates) {
-      if (await b.isVisible().catch(() => false)) {
-        confirmBtn = b;
-        break;
-      }
-    }
-
-    if (!confirmBtn) {
-      await fail("confirm-missing", "Confirm button not found");
-    }
-
-    let lastVerify = null;
-    for (let i = 1; i <= CONFIRM_RETRIES; i++) {
-      console.log("Confirm attempt", i, "for", account.username);
-
-      await confirmBtn.scrollIntoViewIfNeeded().catch(() => null);
-      await confirmBtn.click({ timeout: 10000 }).catch(() => null);
-      await sleep(1200);
-      await dumpDebugStep(page, `after-confirm-attempt-${i}`, {});
-
-      const verify = await verifyOrderFollowed(page);
-      lastVerify = verify;
-
-      if (verify.ok) {
-        await dumpDebugStep(page, "confirm-verified", { verify });
-        return verify.detail || "confirmed";
-      }
-
-      console.log("Verification not satisfied:", verify.detail);
-      await sleep(CONFIRM_RETRY_DELAY_MS);
-    }
-
-    // If verification is disabled, consider a click success
-    if (!VERIFY_TOAST && !VERIFY_PENDING) return "confirmed (verification disabled)";
-
-    await fail("confirm-verification-failed", lastVerify?.detail || "Confirm verification failed", { lastVerify });
-  } catch (e) {
-    const msg = e?.message || String(e);
-    const alreadyCaptured = !!(e && typeof e === "object" && e.__captured);
-    if (!alreadyCaptured) {
-      await captureFailureArtifacts(page, `${sanitizeForFilename(account.username)}-unhandled`, {
-        loginUrl,
-        username: account.username,
-        error: msg
-      });
-    }
-    const err = e instanceof Error ? e : new Error(msg);
-    err.__captured = true;
-    throw err;
+    // If we got here, login moved or fields disappeared — good.
+    return true;
   } finally {
+    // ✅ stop trace on exit (success OR fail)
+    if (TRACE_CAPTURE && tracePath) {
+      await context.tracing.stop({ path: tracePath }).catch(() => null);
+      console.log("TRACE SAVED:", tracePath);
+    }
     await context.close().catch(() => null);
     await browser.close().catch(() => null);
   }
 }
 
-async function openOrderCodeFlow(page) {
-  const attempts = [
-    { name: "invited_me", regex: /invited\s*me/i },
-    { name: "copying_history", regex: /copying\s*history/i },
-    { name: "initiate_follow", regex: /initiate\s*a\s*follow-?up/i },
-    { name: "invite", regex: /invite|invitation/i },
-    { name: "position_order", regex: /position\s*order/i }
-  ];
-
-  for (const a of attempts) {
-    try {
-      const loc = page.getByText(a.regex).first();
-      if (await loc.isVisible().catch(() => false)) {
-        await loc.click({ timeout: 8000 }).catch(() => null);
-        await sleep(900);
-        await closeOverlays(page);
-
-        const codeRes = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 2500);
-        if (codeRes.ok) return true;
-      }
-    } catch {}
-  }
-
-  const codeRes2 = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 2500);
-  return codeRes2.ok;
-}
-
-// --------------------
-// Startup
-// --------------------
 app.listen(PORT, "0.0.0.0", () => {
   const errs = startupConfigErrors();
   console.log("Starting Container");
   console.log("Listening on", PORT);
   console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
-  console.log("Failure capture: ALWAYS ON");
+  console.log("TRACE_CAPTURE:", TRACE_CAPTURE);
+  console.log("HAR_CAPTURE:", HAR_CAPTURE);
   console.log("FORCE_MOBILE:", FORCE_MOBILE);
   console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
   console.log("API_REWRITE:", API_REWRITE, "match:", API_REWRITE_MATCH, "target:", API_REWRITE_TARGET || "(none)");
-  console.log("Email provider:", EMAIL_PROVIDER);
-  console.log("Email configured:", emailConfigured());
-  console.log("Verify toast/pending:", VERIFY_TOAST, VERIFY_PENDING);
-  console.log("Confirm retries:", CONFIRM_RETRIES);
-  console.log("Preflight enabled:", PREFLIGHT_ENABLED, "loginWaitMs:", PREFLIGHT_LOGIN_WAIT_MS);
   if (errs.length) console.log("CONFIG ERRORS:", errs);
   writePlaceholderLastShot();
 });
