@@ -62,10 +62,7 @@ const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE || "0");
 // Email config (SendGrid Web API)
 // --------------------
 const EMAIL_ENABLED = envTruthy(process.env.EMAIL_ENABLED || "1");
-const EMAIL_PROVIDER = (process.env.EMAIL_PROVIDER || "sendgrid")
-  .toString()
-  .trim()
-  .toLowerCase();
+const EMAIL_PROVIDER = (process.env.EMAIL_PROVIDER || "sendgrid").toString().trim().toLowerCase();
 
 const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || "";
 const EMAIL_FROM = (process.env.EMAIL_FROM || "").toString().trim(); // must match verified sender
@@ -118,8 +115,7 @@ async function sendEmail(subject, text) {
     const [res] = await sgMail.send(msg);
     const status = res && res.statusCode ? res.statusCode : null;
     const msgId =
-      (res && res.headers && (res.headers["x-message-id"] || res.headers["X-Message-Id"])) ||
-      null;
+      (res && res.headers && (res.headers["x-message-id"] || res.headers["X-Message-Id"])) || null;
 
     console.log("Email sent:", { status, msgId, to: msg.to });
     return { ok: true, skipped: false, status, msgId, to: msg.to };
@@ -135,7 +131,10 @@ async function sendEmail(subject, text) {
 // Login URLs
 // --------------------
 function parseLoginUrls() {
-  const fallback = ["https://dsj006.cc/pc/#/login", "https://dsj12.cc/pc/#/login"];
+  const fallback = [
+    "https://dsj006.cc/pc/#/login",
+    "https://dsj12.cc/pc/#/login"
+  ];
 
   const raw = (LOGIN_URLS_ENV || "").trim();
   if (!raw) return fallback;
@@ -150,10 +149,6 @@ function parseLoginUrls() {
 
 let LOGIN_URLS = parseLoginUrls();
 
-function isMobileLoginUrl(loginUrl) {
-  return /\/h5\/#\//i.test(loginUrl);
-}
-
 function futuresUrlFromLoginUrl(loginUrl) {
   try {
     const u = new URL(loginUrl);
@@ -164,6 +159,11 @@ function futuresUrlFromLoginUrl(loginUrl) {
   } catch {
     return null;
   }
+}
+
+function isH5Url(url) {
+  const s = (url || "").toLowerCase();
+  return s.includes("/h5/") || s.includes("h5/#") || s.includes("/h5/#/");
 }
 
 function safeJsonParseAccounts() {
@@ -244,11 +244,6 @@ async function dumpDebugState(page, tag, extra = {}) {
 
     try {
       fs.writeFileSync(`${base}.url.txt`, String(page.url() || ""));
-    } catch {}
-
-    try {
-      const href = await page.evaluate(() => location.href).catch(() => "");
-      fs.writeFileSync(`${base}.href.txt`, String(href || ""));
     } catch {}
 
     try {
@@ -366,70 +361,48 @@ async function debugDumpButtons(page, tag) {
     const texts = [];
     for (const f of frames) {
       const btns = await f.locator("button").all().catch(() => []);
-      for (const b of btns.slice(0, 40)) {
+      for (const b of btns.slice(0, 30)) {
         const t = (await b.textContent().catch(() => "")) || "";
         const trimmed = t.trim();
-        if (trimmed) texts.push(trimmed.slice(0, 120));
+        if (trimmed) texts.push(trimmed.slice(0, 80));
       }
     }
-    await dumpDebugState(page, tag, { buttonTextPreview: texts.slice(0, 80) });
+    await dumpDebugState(page, tag, { buttonTextPreview: texts.slice(0, 60) });
   } catch {
     await dumpDebugState(page, tag, {});
   }
 }
 
-async function logPostLoginState(page, label) {
-  const url = page.url();
-  const href = await page.evaluate(() => location.href).catch(() => "");
-  const userVisible = await page.locator(USER_SELECTORS).first().isVisible().catch(() => false);
-  const passVisible = await page.locator(PASS_SELECTORS).first().isVisible().catch(() => false);
-  const stillLoginForm = userVisible || passVisible;
-
-  console.log(`[${label}] URL:`, url);
-  console.log(`[${label}] location.href:`, href);
-  console.log(`[${label}] still sees login form:`, stillLoginForm);
-
-  return { url, href, stillLoginForm };
-}
-
 // --------------------
-// Mobile Futures nav click (bottom middle tab)
+// NEW: Tap bottom-middle (to hit Futures in H5 bottom nav)
 // --------------------
-async function clickMobileFuturesBottomTab(page) {
-  // We want "Futures" on the bottom nav. Mobile UI varies, so we try multiple patterns.
-  const candidates = [
-    page.getByRole("tab", { name: /futures/i }).first(),
-    page.getByRole("button", { name: /futures/i }).first(),
-    page.getByRole("link", { name: /futures/i }).first(),
-    page.locator("text=/^futures$/i").first(),
-    page.locator("text=/futures/i").first()
-  ];
-
-  for (const c of candidates) {
+async function tapBottomMiddle(page, tries = 3) {
+  for (let i = 1; i <= tries; i++) {
     try {
-      if (await c.isVisible().catch(() => false)) {
-        await c.click({ timeout: 8000 }).catch(() => null);
-        await sleep(1200);
-        await closeOverlays(page);
-        console.log("Clicked mobile Futures tab.");
-        return true;
+      const vp = page.viewportSize();
+      let w = vp?.width;
+      let h = vp?.height;
+
+      if (!w || !h) {
+        const wh = await page.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
+        w = wh.w;
+        h = wh.h;
       }
+
+      const x = Math.floor(w * 0.50);
+      const y = Math.floor(h * 0.92);
+
+      console.log(`BOTTOM-MIDDLE TAP attempt ${i}: x=${x} y=${y} (w=${w} h=${h})`);
+      await page.mouse.click(x, y, { delay: 30 }).catch(() => null);
+      await sleep(900);
+      await closeOverlays(page);
+
+      const invited = await page.locator("text=/invited\\s*me/i").first().isVisible().catch(() => false);
+      const position = await page.locator("text=/position\\s*order/i").first().isVisible().catch(() => false);
+      if (invited || position) return true;
     } catch {}
   }
-
-  console.log("Mobile Futures tab not found/visible to click.");
   return false;
-}
-
-async function ensureMobileFuturesFlow(page, loginUrl) {
-  if (!isMobileLoginUrl(loginUrl)) return;
-
-  // If Invited me isn't present yet, clicking Futures often loads the correct page.
-  const invitedVisible = await page.locator("text=/invited\\s*me/i").first().isVisible().catch(() => false);
-  if (invitedVisible) return;
-
-  console.log("Mobile flow: Invited me not visible yet. Trying to click bottom Futures tab.");
-  await clickMobileFuturesBottomTab(page);
 }
 
 // --------------------
@@ -518,13 +491,19 @@ async function preflightSites() {
       for (let i = 1; i <= PREFLIGHT_RETRIES; i++) {
         console.log("Preflight checking:", loginUrl, "attempt", i);
 
-        const isMobile = isMobileLoginUrl(loginUrl);
+        // Use mobile viewport for h5, desktop for pc
+        const mobile = isH5Url(loginUrl);
+
         const context = await browser.newContext({
-          viewport: isMobile ? { width: 390, height: 844 } : { width: 1280, height: 720 },
+          viewport: mobile ? { width: 390, height: 844 } : { width: 1280, height: 720 },
           locale: "en-US",
-          isMobile: isMobile,
-          hasTouch: isMobile
+          isMobile: mobile,
+          hasTouch: mobile,
+          userAgent: mobile
+            ? "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+            : undefined
         });
+
         const page = await context.newPage();
 
         try {
@@ -550,24 +529,15 @@ async function preflightSites() {
             throw new Error(`locator.waitFor: Timeout ${PREFLIGHT_LOGIN_WAIT_MS}ms exceeded.`);
           }
 
-          await dumpDebugState(page, "preflight-ok", { loginUrl, status });
+          await dumpDebugState(page, "preflight-ok", { loginUrl, status, mobile });
           console.log("Preflight OK:", loginUrl);
+
           passed = true;
           await context.close().catch(() => null);
           break;
         } catch (e) {
-          console.log(
-            "Preflight attempt",
-            i,
-            "failed for",
-            loginUrl,
-            "err:",
-            e && e.message ? e.message : String(e)
-          );
-          await dumpDebugState(page, `preflight-failed-${i}`, {
-            loginUrl,
-            err: e && e.message ? e.message : String(e)
-          });
+          console.log("Preflight attempt", i, "failed for", loginUrl, "err:", e && e.message ? e.message : String(e));
+          await dumpDebugState(page, `preflight-failed-${i}`, { loginUrl, err: e && e.message ? e.message : String(e) });
           await context.close().catch(() => null);
           await sleep(PREFLIGHT_RETRY_DELAY_MS);
         }
@@ -764,7 +734,15 @@ app.get("/debug/files", (req, res) => {
 app.get("/dns-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
-  const hosts = ["dsj006.cc", "dsj12.cc", "dsj91.cc", "dsj96.com", "dsj82.com", "dsj85.com", "api.sendgrid.com"];
+  const hosts = [
+    "dsj006.cc",
+    "dsj12.cc",
+    "dsj91.cc",
+    "dsj96.com",
+    "dsj82.com",
+    "dsj85.com",
+    "api.sendgrid.com"
+  ];
 
   const out = {};
   for (const h of hosts) {
@@ -843,9 +821,7 @@ app.post("/run", async (req, res) => {
       console.log("Preflight enabled:", PREFLIGHT_ENABLED, "loginWaitMs:", PREFLIGHT_LOGIN_WAIT_MS);
 
       const pf = await preflightSites();
-      if (!pf.ok) {
-        throw new Error(`Preflight failed. ${pf.note}`);
-      }
+      if (!pf.ok) throw new Error(`Preflight failed. ${pf.note}`);
       const runSites = pf.sites;
       console.log("Chosen sites for this run:", runSites.join(", "));
 
@@ -853,7 +829,7 @@ app.post("/run", async (req, res) => {
         `${subjectPrefix} started`,
         `T-Bot started at ${startedAt}\nRun ID: ${lastRunId}\nAccounts: ${cfg.accounts.length}\nDebug capture: ${
           DEBUG_CAPTURE ? "ON" : "OFF"
-        }\nPreflight: ${pf.note}\n\nYou will get a completion email with per-account results.\n`
+        }\nPreflight: ${pf.note}\n`
       );
 
       const results = [];
@@ -936,23 +912,24 @@ async function runAccountAllSites(account, orderCode, runSites) {
 }
 
 async function runAccountOnSite(account, orderCode, loginUrl) {
+  const mobile = isH5Url(loginUrl);
+
   const browser = await chromium.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
   });
 
   const harPath =
-    DEBUG_CAPTURE && lastDebugDir
-      ? path.join(lastDebugDir, `har-${sanitize(account.username)}-${Date.now()}.har`)
-      : null;
-
-  const mobile = isMobileLoginUrl(loginUrl);
+    DEBUG_CAPTURE && lastDebugDir ? path.join(lastDebugDir, `har-${sanitize(account.username)}-${Date.now()}.har`) : null;
 
   const context = await browser.newContext({
     viewport: mobile ? { width: 390, height: 844 } : { width: 1280, height: 720 },
     locale: "en-US",
     isMobile: mobile,
     hasTouch: mobile,
+    userAgent: mobile
+      ? "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+      : undefined,
     recordHar: harPath ? { path: harPath, content: "embed" } : undefined
   });
 
@@ -983,12 +960,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       throw new Error("Cloudflare error page on login");
     }
 
-    await dumpDebugState(page, "after-goto", {
-      loginUrl,
-      username: account.username,
-      status: resp ? resp.status() : null,
-      mobile
-    });
+    await dumpDebugState(page, "after-goto", { loginUrl, username: account.username, status: resp ? resp.status() : null, mobile });
 
     const userRes = await findVisibleInAnyFrame(page, USER_SELECTORS, 25000);
     const passRes = await findVisibleInAnyFrame(page, PASS_SELECTORS, 25000);
@@ -1032,32 +1004,19 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       const loginBtn = page.getByRole("button", { name: /login|sign in/i }).first();
       if (await loginBtn.isVisible().catch(() => false)) {
         await loginBtn.click({ timeout: 10000 }).catch(() => null);
-
-        // LOG #1: right after clicking Login
-        await sleep(800);
-        await logPostLoginState(page, `after-login-click-attempt-${attempt}`);
       } else {
         await passField.press("Enter").catch(() => null);
-
-        // LOG #1: right after pressing Enter
-        await sleep(800);
-        await logPostLoginState(page, `after-login-enter-attempt-${attempt}`);
       }
 
-      await sleep(1200);
-      await dumpDebugState(page, `after-login-attempt-${attempt}`, { attempt, mobile });
+      await sleep(1800);
+      await dumpDebugState(page, `after-login-attempt-${attempt}`, { attempt });
 
-      // Confirm login by checking futures page for tabs
       const fu = futuresUrlFromLoginUrl(loginUrl);
       if (fu) {
         await page.goto(fu, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => null);
         await sleep(1500);
         await closeOverlays(page);
-
-        // Mobile tweak: if invited isn't visible, click bottom Futures tab
-        await ensureMobileFuturesFlow(page, loginUrl);
-
-        await dumpDebugState(page, "after-futures-direct", { futuresUrl: fu, mobile });
+        await dumpDebugState(page, "after-futures-direct", { futuresUrl: fu });
 
         const hasInvited = await page.locator("text=/invited\\s*me/i").first().isVisible().catch(() => false);
         const hasPositionOrder = await page.locator("text=/position\\s*order/i").first().isVisible().catch(() => false);
@@ -1074,10 +1033,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     }
 
     if (!loggedIn) {
-      // LOG #2: on failure, capture location + save debug state
-      const href = await page.evaluate(() => location.href).catch(() => "");
-      console.log("LOGIN FAILED. location.href:", href);
-      await dumpDebugState(page, "login-failed", { loginUrl, href, mobile });
+      await dumpDebugState(page, "login-failed", { loginUrl });
       throw new Error("Login failed");
     }
 
@@ -1088,24 +1044,20 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await sleep(1500);
     await closeOverlays(page);
 
-    // Mobile tweak: click bottom Futures if that’s required to reveal Invited me / flow
-    await ensureMobileFuturesFlow(page, loginUrl);
+    // ✅ NEW: tap bottom-middle to hit Futures tab (H5 bottom nav)
+    const tappedBottomMiddle = await tapBottomMiddle(page, 3);
 
-    await dumpDebugState(page, "after-futures", { futuresUrl, mobile });
+    await dumpDebugState(page, "after-futures", { futuresUrl, tappedBottomMiddle });
 
     const flowOk = await openOrderCodeFlow(page);
     if (!flowOk) {
-      const href = await page.evaluate(() => location.href).catch(() => "");
-      console.log("ORDER FLOW MISSING. location.href:", href);
-      await dumpDebugState(page, "order-flow-missing", { href, mobile });
+      await dumpDebugState(page, "order-flow-missing", {});
       throw new Error("Could not reach order code input");
     }
 
     const codeRes = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 15000);
     if (!codeRes.ok) {
-      const href = await page.evaluate(() => location.href).catch(() => "");
-      console.log("ORDER CODE INPUT NOT FOUND. location.href:", href);
-      await dumpDebugState(page, "code-box-missing", { href, mobile });
+      await dumpDebugState(page, "code-box-missing", {});
       throw new Error("Order code input not found");
     }
 
@@ -1114,7 +1066,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await codeBox.click().catch(() => null);
     await codeBox.fill(orderCode).catch(() => null);
     await sleep(600);
-    await dumpDebugState(page, "after-code", { codeLength: String(orderCode || "").length, mobile });
+    await dumpDebugState(page, "after-code", { codeLength: String(orderCode || "").length });
 
     const confirmCandidates = [
       page.getByRole("button", { name: /confirm/i }),
@@ -1145,13 +1097,13 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       await confirmBtn.scrollIntoViewIfNeeded().catch(() => null);
       await confirmBtn.click({ timeout: 10000 }).catch(() => null);
       await sleep(1200);
-      await dumpDebugState(page, `after-confirm-attempt-${i}`, { mobile });
+      await dumpDebugState(page, `after-confirm-attempt-${i}`, {});
 
       const verify = await verifyOrderFollowed(page);
       lastVerify = verify;
 
       if (verify.ok) {
-        await dumpDebugState(page, "confirm-verified", { verify, mobile });
+        await dumpDebugState(page, "confirm-verified", { verify });
         return verify.detail || "verified";
       }
 
@@ -1159,13 +1111,8 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       await sleep(CONFIRM_RETRY_DELAY_MS);
     }
 
-    await dumpDebugState(page, "confirm-verification-failed", { lastVerify, mobile });
+    await dumpDebugState(page, "confirm-verification-failed", { lastVerify });
     throw new Error(lastVerify && lastVerify.detail ? lastVerify.detail : "Confirm verification failed");
-  } catch (e) {
-    const href = await page.evaluate(() => location.href).catch(() => "");
-    console.log("RUN FAILED. location.href:", href);
-    await dumpDebugState(page, "run-failed", { href, err: e && e.message ? e.message : String(e), mobile });
-    throw e;
   } finally {
     await context.close().catch(() => null);
     await browser.close().catch(() => null);
@@ -1208,13 +1155,6 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("Verify toast/pending:", VERIFY_TOAST, VERIFY_PENDING);
   console.log("Confirm retries:", CONFIRM_RETRIES);
   console.log("Preflight enabled:", PREFLIGHT_ENABLED, "loginWaitMs:", PREFLIGHT_LOGIN_WAIT_MS);
-  console.log(
-    "Preflight retries:",
-    PREFLIGHT_RETRIES,
-    "retryDelayMs:",
-    PREFLIGHT_RETRY_DELAY_MS,
-    "maxSites:",
-    PREFLIGHT_MAX_SITES
-  );
+  console.log("Preflight retries:", PREFLIGHT_RETRIES, "retryDelayMs:", PREFLIGHT_RETRY_DELAY_MS, "maxSites:", PREFLIGHT_MAX_SITES);
   writePlaceholderLastShot();
 });
