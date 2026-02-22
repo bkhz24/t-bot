@@ -26,6 +26,13 @@ const FORCE_MOBILE = envTruthy(process.env.FORCE_MOBILE || "0");
 // Optional debug capture (extra artifacts at many steps). Failure capture is ALWAYS on.
 const DEBUG_CAPTURE = envTruthy(process.env.DEBUG_CAPTURE || "0");
 
+// --- NEW: API host rewrite (fixes Railway DNS failures for api.dsj*.cc) ---
+const API_REWRITE_ENABLED = envTruthy(process.env.API_REWRITE_ENABLED || "1");
+// Host to rewrite api.dsj*.cc => this host (must resolve in Railway)
+const API_REWRITE_TARGET = (process.env.API_REWRITE_TARGET || "api.ddjea.com").toString().trim();
+// If you want to also rewrite api.dsj877.com etc:
+const API_REWRITE_MATCH = (process.env.API_REWRITE_MATCH || "api.dsj").toString().trim().toLowerCase();
+
 // --------------------
 // Helpers
 // --------------------
@@ -62,7 +69,7 @@ function sanitizeForFilename(s) {
     .replace(/[^a-z0-9._-]+/gi, "_")
     .replace(/_+/g, "_")
     .replace(/^_+|_+$/g, "")
-    .slice(0, 80);
+    .slice(0, 90);
 }
 
 function authOk(req) {
@@ -111,10 +118,12 @@ function safeJsonParseAccounts() {
 // Login URLs
 // --------------------
 function parseLoginUrls() {
-  // IMPORTANT: default to H5 login now (since your manual flow is H5)
+  // Default: include both H5 + PC for dsj12 + dsj877 (you can override with env LOGIN_URLS)
   const fallback = [
     "https://dsj12.cc/h5/#/login",
-    "https://dsj877.cc/h5/#/login"
+    "https://dsj877.com/h5/#/login",
+    "https://dsj12.cc/pc/#/login",
+    "https://dsj877.com/pc/#/login"
   ];
 
   const raw = (LOGIN_URLS_ENV || "").trim();
@@ -135,28 +144,25 @@ function getBaseAndPrefixFromUrl(anyUrl) {
     const u = new URL(anyUrl);
     const base = `${u.protocol}//${u.host}`;
 
-    // Prefer what we see in the current URL (h5 vs pc)
-    if (anyUrl.includes("/h5/#/")) return { base, prefix: "/h5/#/" };
-    if (anyUrl.includes("/pc/#/")) return { base, prefix: "/pc/#/" };
+    if (anyUrl.includes("/h5/#/")) return { base, prefix: "/h5/#/", kind: "h5" };
+    if (anyUrl.includes("/pc/#/")) return { base, prefix: "/pc/#/", kind: "pc" };
 
-    // Fall back to path hints
-    if (anyUrl.includes("/h5/")) return { base, prefix: "/h5/#/" };
-    if (anyUrl.includes("/pc/")) return { base, prefix: "/pc/#/" };
+    if (anyUrl.includes("/h5/")) return { base, prefix: "/h5/#/", kind: "h5" };
+    if (anyUrl.includes("/pc/")) return { base, prefix: "/pc/#/", kind: "pc" };
 
-    // Default to H5 if unknown (safer for your flow)
-    return { base, prefix: "/h5/#/" };
+    return { base, prefix: "/pc/#/", kind: "pc" };
   } catch {
     return null;
   }
 }
 
-// ✅ THIS is the critical fix: H5 uses /trade, PC uses /contractTransaction
+// IMPORTANT: H5 futures/trade page is /h5/#/trade (per your manual flow)
 function futuresUrlFromAnyUrl(anyUrl) {
   const bp = getBaseAndPrefixFromUrl(anyUrl);
   if (!bp) return null;
 
-  if (bp.prefix.startsWith("/h5/")) return `${bp.base}${bp.prefix}trade`;
-  return `${bp.base}${bp.prefix}contractTransaction`;
+  if (bp.kind === "h5") return `${bp.base}${bp.prefix}trade`;
+  return `${bp.base}${bp.prefix}contractTransaction`; // PC
 }
 
 // --------------------
@@ -479,19 +485,57 @@ async function debugDumpButtons(page, tag) {
   try {
     const frames = page.frames();
     for (const f of frames) {
-      const btns = await f.locator("button").all().catch(() => []);
-      for (const b of btns.slice(0, 40)) {
+      const btns = await f.locator("button, a, div, span").all().catch(() => []);
+      for (const b of btns.slice(0, 60)) {
         const t = ((await b.textContent().catch(() => "")) || "").trim();
         if (t) texts.push(t.slice(0, 80));
       }
     }
   } catch {}
-  await dumpDebugStep(page, tag, { buttonTextPreview: texts.slice(0, 80) });
+  await dumpDebugStep(page, tag, { clickableTextPreview: texts.slice(0, 100) });
 }
 
 // --------------------
-// Required logging: after clicking Login
+// Login success detection (H5 can keep fields visible)
 // --------------------
+async function hasLoggedInSignals(page) {
+  const url = page.url() || "";
+
+  // Route change away from login is a strong signal
+  if (!/\/login\b|#\/login\b/i.test(url)) return true;
+
+  // H5 bottom tabs often have these labels
+  const h5Signals = [/home/i, /markets/i, /futures/i, /perpetual/i, /assets/i];
+  for (const re of h5Signals) {
+    const ok = await page.getByText(re).first().isVisible().catch(() => false);
+    if (ok) return true;
+  }
+
+  // If we can see any futures/trade page signals
+  const futuresSignals = [/invited\s*me/i, /position\s*order/i, /copying\s*history/i, /initiate\s+a\s+follow-up/i];
+  for (const re of futuresSignals) {
+    const ok = await page.getByText(re).first().isVisible().catch(() => false);
+    if (ok) return true;
+  }
+
+  // Token presence (many of these SPAs store auth in localStorage)
+  try {
+    const token = await page
+      .evaluate(() => {
+        const keys = ["token", "access_token", "accessToken", "Authorization", "authToken"];
+        for (const k of keys) {
+          const v = localStorage.getItem(k) || sessionStorage.getItem(k);
+          if (v && v.length > 10) return v;
+        }
+        return "";
+      })
+      .catch(() => "");
+    if (token) return true;
+  } catch {}
+
+  return false;
+}
+
 async function logAfterLoginClick(page) {
   const url = (() => {
     try {
@@ -519,7 +563,7 @@ async function logAfterLoginClick(page) {
   return { url, loginFormVisible, userVisible, passVisible };
 }
 
-async function waitForLoginToSettle(page, timeoutMs = 25000) {
+async function waitForLoginToSettle(page, timeoutMs = 45000) {
   const start = Date.now();
   let last = null;
 
@@ -531,16 +575,18 @@ async function waitForLoginToSettle(page, timeoutMs = 25000) {
     const passVisible = await isVisibleInAnyFrame(page, PASS_SELECTORS);
     const loginFormVisible = userVisible && passVisible;
 
+    // If we detect logged-in signals, accept even if fields still visible
+    if (await hasLoggedInSignals(page)) {
+      return { ok: true, url, userVisible, passVisible, reason: "logged_in_signals" };
+    }
+
+    // Classic: fields gone
     if (!loginFormVisible) {
       return { ok: true, url, userVisible, passVisible, reason: "login_fields_hidden" };
     }
 
-    if (!/\/login\b|#\/login\b/i.test(url) && !(userVisible || passVisible)) {
-      return { ok: true, url, userVisible, passVisible, reason: "url_changed_and_fields_gone" };
-    }
-
     last = { url, userVisible, passVisible, loginFormVisible };
-    await sleep(350);
+    await sleep(400);
   }
 
   return { ok: false, reason: "timeout", ...(last || {}), url: page.url() };
@@ -549,14 +595,7 @@ async function waitForLoginToSettle(page, timeoutMs = 25000) {
 // --------------------
 // Mobile Futures navigation helpers
 // --------------------
-const FUTURES_TEXT_PATTERNS = [
-  /futures/i,
-  /contract/i,
-  /contracts/i,
-  /trade/i,
-  /合约/i,
-  /期货/i
-];
+const FUTURES_TEXT_PATTERNS = [/futures/i, /contract/i, /contracts/i, /合约/i, /期货/i, /trade/i];
 
 async function tryClickByRoleOrText(page, regex, preferBottom = false) {
   const roleCandidates = [
@@ -637,7 +676,7 @@ async function tryClickByRoleOrText(page, regex, preferBottom = false) {
         if (!best) return { ok: false };
 
         best.el.click();
-        return { ok: true, text: best.text || "" };
+        return { ok: true, text: best.text, yCenter: best.yCenter };
       },
       { source: regex.source, flags: regex.flags, preferBottom }
     );
@@ -661,26 +700,14 @@ async function clickFuturesNavIfPresent(page) {
 async function hasFuturesPageSignals(page) {
   const url = page.url();
 
-  // PC route
   if (/contractTransaction/i.test(url)) return true;
+  if (/#\/trade\b/i.test(url) || /\/trade\b/i.test(url)) return true;
 
-  // ✅ H5 route
-  if (/\/h5\/#\/trade/i.test(url)) return true;
-  if (/#\/trade\b/i.test(url)) return true;
+  const invitedVisible = await page.getByText(/invited\s*me/i).first().isVisible().catch(() => false);
+  const positionVisible = await page.getByText(/position\s*order/i).first().isVisible().catch(() => false);
+  const copyingVisible = await page.getByText(/copying\s*history/i).first().isVisible().catch(() => false);
 
-  const invitedVisible = await page
-    .getByText(/invited\s*me/i)
-    .first()
-    .isVisible()
-    .catch(() => false);
-
-  const positionVisible = await page
-    .getByText(/position\s*order/i)
-    .first()
-    .isVisible()
-    .catch(() => false);
-
-  if (invitedVisible || positionVisible) return true;
+  if (invitedVisible || positionVisible || copyingVisible) return true;
 
   const codeVisible = await isVisibleInAnyFrame(page, ORDER_CODE_SELECTORS);
   return codeVisible;
@@ -691,54 +718,38 @@ async function ensureOnFuturesPage(page, loginUrl) {
 
   async function waitForSignals() {
     await closeOverlays(page);
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 8; i++) {
       if (await hasFuturesPageSignals(page)) return true;
       await sleep(500);
     }
     return false;
   }
 
-  // Mobile-first: try Futures/Trade tab click first
   const clicked1 = await clickFuturesNavIfPresent(page);
   if (clicked1.ok) {
     await sleep(1200);
-    if (await waitForSignals()) {
-      return { ok: true, method: `nav:${clicked1.method}`, futuresUrl: target || null, detail: clicked1.label };
-    }
+    if (await waitForSignals()) return { ok: true, method: `nav:${clicked1.method}`, futuresUrl: target || null, detail: clicked1.label };
   }
 
-  // Direct navigation
   if (target) {
     await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => null);
     await sleep(1200);
-    if (await waitForSignals()) {
-      return { ok: true, method: "direct", futuresUrl: target };
-    }
+    if (await waitForSignals()) return { ok: true, method: "direct", futuresUrl: target };
   }
 
-  // Retry tab click
   const clicked2 = await clickFuturesNavIfPresent(page);
   if (clicked2.ok) {
     await sleep(1200);
-    if (await waitForSignals()) {
-      return { ok: true, method: `nav_retry:${clicked2.method}`, futuresUrl: target || null, detail: clicked2.label };
-    }
+    if (await waitForSignals()) return { ok: true, method: `nav_retry:${clicked2.method}`, futuresUrl: target || null, detail: clicked2.label };
   }
 
-  // Last direct retry
   if (target) {
     await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => null);
     await sleep(1200);
-    if (await waitForSignals()) {
-      return { ok: true, method: "direct_after_nav", futuresUrl: target };
-    }
+    if (await waitForSignals()) return { ok: true, method: "direct_after_nav", futuresUrl: target };
   }
 
-  return {
-    ok: false,
-    futuresUrl: target || null,
-    detail: clicked2.ok ? clicked2.label : clicked1.ok ? clicked1.label : "no futures nav match"
-  };
+  return { ok: false, futuresUrl: target || null, detail: clicked2.ok ? clicked2.label : clicked1.ok ? clicked1.label : "no futures nav match" };
 }
 
 // --------------------
@@ -753,16 +764,7 @@ const CONFIRM_RETRY_DELAY_MS = Number(process.env.CONFIRM_RETRY_DELAY_MS || "250
 async function waitForToastOrModal(page) {
   if (!VERIFY_TOAST) return { ok: false, type: "toast_off", detail: "VERIFY_TOAST disabled" };
 
-  const patterns = [
-    /already followed/i,
-    /followed/i,
-    /success/i,
-    /successful/i,
-    /completed/i,
-    /confirm success/i,
-    /submitted/i,
-    /pending/i
-  ];
+  const patterns = [/already followed/i, /followed/i, /success/i, /successful/i, /completed/i, /confirm success/i, /submitted/i, /pending/i];
 
   const start = Date.now();
   while (Date.now() - start < VERIFY_TIMEOUT_MS) {
@@ -808,10 +810,7 @@ async function verifyOrderFollowed(page) {
   if (toastRes.ok) return { ok: true, detail: `toast seen (${toastRes.detail})` };
   if (pendingRes.ok) return { ok: true, detail: "pending seen" };
 
-  return {
-    ok: false,
-    detail: `No confirmation. Toast: ${toastRes.type}. Pending: ${pendingRes.type}.`
-  };
+  return { ok: false, detail: `No confirmation. Toast: ${toastRes.type}. Pending: ${pendingRes.type}.` };
 }
 
 // --------------------
@@ -839,17 +838,22 @@ async function preflightSites() {
       for (let i = 1; i <= PREFLIGHT_RETRIES; i++) {
         console.log("Preflight checking:", loginUrl, "attempt", i);
 
-        const isMobile = shouldUseMobileContext(loginUrl);
+        const mobile = shouldUseMobileContext(loginUrl);
 
         const context = await browser.newContext({
-          viewport: isMobile ? { width: 390, height: 844 } : { width: 1280, height: 720 },
+          viewport: mobile ? { width: 390, height: 844 } : { width: 1280, height: 720 },
           locale: "en-US",
-          isMobile,
-          hasTouch: isMobile
+          isMobile: mobile,
+          hasTouch: mobile
         });
 
         const page = await context.newPage();
         page.setDefaultTimeout(30000);
+
+        // Apply API rewrite here too (preflight should mirror run behavior)
+        if (API_REWRITE_ENABLED && API_REWRITE_TARGET) {
+          await installApiRewrite(page);
+        }
 
         try {
           const resp = await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
@@ -937,6 +941,7 @@ app.get("/", (req, res) => {
     <div>Accounts loaded: <b>${cfg.ok ? cfg.accounts.length : 0}</b></div>
     <div>Email configured: <b>${emailConfigured() ? "YES" : "NO"}</b> (provider: ${escapeHtml(EMAIL_PROVIDER)})</div>
     <div>Preflight enabled: <b>${PREFLIGHT_ENABLED ? "ON" : "OFF"}</b> (max sites: ${PREFLIGHT_MAX_SITES})</div>
+    <div>API rewrite: <b>${API_REWRITE_ENABLED ? "ON" : "OFF"}</b> (${escapeHtml(API_REWRITE_MATCH)}* → ${escapeHtml(API_REWRITE_TARGET)})</div>
     <div style="color:red; margin-top:10px;">
       ${errs.length ? errs.map((e) => escapeHtml(e)).join("<br/>") : ""}
     </div>
@@ -1002,6 +1007,11 @@ app.get("/health", (req, res) => {
       retries: PREFLIGHT_RETRIES,
       retryDelayMs: PREFLIGHT_RETRY_DELAY_MS,
       maxSites: PREFLIGHT_MAX_SITES
+    },
+    apiRewrite: {
+      enabled: API_REWRITE_ENABLED,
+      match: API_REWRITE_MATCH,
+      target: API_REWRITE_TARGET
     }
   });
 });
@@ -1084,7 +1094,6 @@ app.get("/debug/files", (req, res) => {
   const full = path.resolve(lastDebugDir, f);
   const base = path.resolve(lastDebugDir);
   if (!full.startsWith(base)) return res.status(400).send("Bad path.");
-
   if (!fs.existsSync(full)) return res.status(404).send("Not found.");
 
   if (full.endsWith(".html") || full.endsWith(".txt") || full.endsWith(".json")) {
@@ -1103,13 +1112,11 @@ app.get("/debug/files", (req, res) => {
 app.get("/dns-test", async (req, res) => {
   if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
 
-  // ✅ Added dsj877 + api hosts so we can see Railway DNS problems clearly
   const hosts = [
     "dsj12.cc",
-    "dsj877.cc",
+    "dsj877.com",
     "api.dsj12.cc",
-    "api.dsj877.cc",
-    "api.dsj006.cc",
+    "api.dsj877.com",
     "api.ddjea.com",
     "api.sendgrid.com"
   ];
@@ -1123,7 +1130,6 @@ app.get("/dns-test", async (req, res) => {
       out[h] = { ok: false, error: e?.message || String(e) };
     }
   }
-
   res.json(out);
 });
 
@@ -1132,10 +1138,9 @@ app.get("/net-test", async (req, res) => {
 
   const urls = [
     "https://dsj12.cc/",
-    "https://dsj877.cc/",
+    "https://dsj877.com/",
     "https://api.dsj12.cc/api/app/ping",
-    "https://api.dsj877.cc/api/app/ping",
-    "https://api.dsj006.cc/api/app/ping",
+    "https://api.dsj877.com/api/app/ping",
     "https://api.ddjea.com/api/app/ping",
     "https://api.sendgrid.com/"
   ];
@@ -1149,7 +1154,6 @@ app.get("/net-test", async (req, res) => {
       results[u] = { ok: false, error: e?.message || String(e) };
     }
   }
-
   res.json(results);
 });
 
@@ -1192,14 +1196,13 @@ app.post("/run", async (req, res) => {
       console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
       console.log("FORCE_MOBILE:", FORCE_MOBILE);
       console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
+      console.log("API_REWRITE:", API_REWRITE_ENABLED, "match:", API_REWRITE_MATCH, "target:", API_REWRITE_TARGET);
       console.log("Email provider:", EMAIL_PROVIDER);
       console.log("Email configured:", emailConfigured());
       console.log("Preflight enabled:", PREFLIGHT_ENABLED, "loginWaitMs:", PREFLIGHT_LOGIN_WAIT_MS);
 
       const pf = await preflightSites();
-      if (!pf.ok) {
-        throw new Error(`Preflight failed. ${pf.note}`);
-      }
+      if (!pf.ok) throw new Error(`Preflight failed. ${pf.note}`);
       const runSites = pf.sites;
       console.log("Chosen sites for this run:", runSites.join(", "));
 
@@ -1207,7 +1210,7 @@ app.post("/run", async (req, res) => {
         `${subjectPrefix} started`,
         `T-Bot started at ${startedAt}\nRun ID: ${lastRunId}\nAccounts: ${cfg.accounts.length}\nDebug capture: ${
           DEBUG_CAPTURE ? "ON" : "OFF"
-        }\nFailure capture: ALWAYS ON\nPreflight: ${pf.note}\n\nYou will get a completion email with per-account results.\n`
+        }\nFailure capture: ALWAYS ON\nPreflight: ${pf.note}\nAPI rewrite: ${API_REWRITE_ENABLED ? "ON" : "OFF"} (${API_REWRITE_MATCH}* -> ${API_REWRITE_TARGET})\n\n`
       );
 
       const results = [];
@@ -1295,6 +1298,31 @@ function shouldUseMobileContext(loginUrl) {
   return u.includes("/h5/#/") || u.includes("/h5/") || u.includes("#/h5") || u.includes("h5/#");
 }
 
+// --- NEW: request rewrite to fix api.dsj*.cc DNS failures on Railway ---
+async function installApiRewrite(page) {
+  // A light filter: only rewrite the host portion for api.* calls that match API_REWRITE_MATCH
+  await page.route("**/*", async (route) => {
+    try {
+      const req = route.request();
+      const urlStr = req.url();
+      if (!urlStr.startsWith("http")) return route.continue();
+
+      const u = new URL(urlStr);
+      const host = (u.hostname || "").toLowerCase();
+
+      // Only rewrite api hosts (and avoid rewriting sendgrid etc)
+      if (API_REWRITE_ENABLED && API_REWRITE_TARGET && host.includes(API_REWRITE_MATCH)) {
+        // Example: api.dsj12.cc => api.ddjea.com
+        u.hostname = API_REWRITE_TARGET;
+        return route.continue({ url: u.toString() });
+      }
+      return route.continue();
+    } catch {
+      return route.continue();
+    }
+  });
+}
+
 async function runAccountOnSite(account, orderCode, loginUrl) {
   const mobile = shouldUseMobileContext(loginUrl);
 
@@ -1322,10 +1350,15 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
   const page = await context.newPage();
   page.setDefaultTimeout(30000);
 
+  if (API_REWRITE_ENABLED && API_REWRITE_TARGET) {
+    await installApiRewrite(page);
+  }
+
   page.on("requestfailed", (req) => {
     const f = req.failure();
     const errText = f?.errorText || "unknown";
-    if (req.url().includes("/api/")) console.log("REQUEST FAILED:", req.url(), "=>", errText);
+    // Useful to see DNS failures
+    if (req.url().includes("/api/") || req.url().includes("api.")) console.log("REQUEST FAILED:", req.url(), "=>", errText);
   });
 
   page.on("console", (msg) => {
@@ -1348,6 +1381,65 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     throw err;
   }
 
+  // More robust "click Login" that works when login is a DIV/SPAN/etc
+  async function clickLoginButton() {
+    // 1) real button by role
+    const btn1 = page.getByRole("button", { name: /login|sign in/i }).first();
+    if (await btn1.isVisible().catch(() => false)) {
+      await btn1.click({ timeout: 10000 }).catch(() => null);
+      return "role_button";
+    }
+
+    // 2) text match
+    const t = page.getByText(/login|sign in/i).first();
+    if (await t.isVisible().catch(() => false)) {
+      await t.click({ timeout: 10000 }).catch(() => null);
+      return "text_click";
+    }
+
+    // 3) DOM scan click for visible clickable element containing login
+    const clicked = await page.evaluate(() => {
+      const re = /login|sign in/i;
+
+      function isVisible(el) {
+        const style = window.getComputedStyle(el);
+        if (!style) return false;
+        if (style.visibility === "hidden" || style.display === "none") return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 2 && r.height > 2 && r.bottom > 0 && r.right > 0 && r.top < window.innerHeight && r.left < window.innerWidth;
+      }
+
+      function isClickable(el) {
+        const tag = (el.tagName || "").toLowerCase();
+        const role = (el.getAttribute("role") || "").toLowerCase();
+        const cursor = window.getComputedStyle(el).cursor;
+        return tag === "button" || tag === "a" || role === "button" || role === "tab" || cursor === "pointer" || el.hasAttribute("onclick");
+      }
+
+      const els = Array.from(document.querySelectorAll("button,a,div,span,[role='button'],[onclick]"));
+      const matches = [];
+
+      for (const el of els) {
+        if (!isVisible(el)) continue;
+        const text = (el.innerText || el.textContent || "").trim().replace(/\s+/g, " ");
+        if (!text) continue;
+        if (!re.test(text)) continue;
+
+        const r = el.getBoundingClientRect();
+        matches.push({ el, text: text.slice(0, 60), clickable: isClickable(el), area: r.width * r.height });
+      }
+
+      matches.sort((a, b) => (b.clickable - a.clickable) || (b.area - a.area));
+      if (!matches[0]) return { ok: false };
+      matches[0].el.click();
+      return { ok: true, text: matches[0].text };
+    }).catch(() => ({ ok: false }));
+
+    if (clicked?.ok) return `dom_scan:${clicked.text || ""}`;
+
+    return "not_found";
+  }
+
   try {
     // 1) Go to login
     const resp = await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
@@ -1355,6 +1447,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
     const status = resp ? resp.status() : null;
 
+    // Cloudflare hard fail detection even if status is 200
     const html0 = await page.content().catch(() => "");
     if (isCloudflareErrorHtml(html0)) {
       await dumpDebugStep(page, "cloudflare-login", { loginUrl, username: account.username, status });
@@ -1364,8 +1457,8 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await dumpDebugStep(page, "after-goto-login", { loginUrl, username: account.username, status, mobile });
 
     // 2) Find login fields
-    const userRes = await findVisibleInAnyFrame(page, USER_SELECTORS, 25000);
-    const passRes = await findVisibleInAnyFrame(page, PASS_SELECTORS, 25000);
+    const userRes = await findVisibleInAnyFrame(page, USER_SELECTORS, 30000);
+    const passRes = await findVisibleInAnyFrame(page, PASS_SELECTORS, 30000);
     if (!userRes.ok || !passRes.ok) {
       await dumpDebugStep(page, "login-fields-missing", { userFound: userRes.ok, passFound: passRes.ok });
       await fail("login-fields-missing", "Login fields not found", { userFound: userRes.ok, passFound: passRes.ok });
@@ -1374,6 +1467,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     // 3) Fill + click login (retry a few times)
     let loggedIn = false;
     let lastAfterClick = null;
+    let lastSettle = null;
 
     for (let attempt = 1; attempt <= 6; attempt++) {
       console.log("Login attempt", attempt, "for", account.username, "on", loginUrl);
@@ -1382,8 +1476,8 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       await sleep(1200);
       await closeOverlays(page);
 
-      const userRes2 = await findVisibleInAnyFrame(page, USER_SELECTORS, 20000);
-      const passRes2 = await findVisibleInAnyFrame(page, PASS_SELECTORS, 20000);
+      const userRes2 = await findVisibleInAnyFrame(page, USER_SELECTORS, 25000);
+      const passRes2 = await findVisibleInAnyFrame(page, PASS_SELECTORS, 25000);
       if (!userRes2.ok || !passRes2.ok) {
         await dumpDebugStep(page, `login-attempt-${attempt}-fields-missing`, { attempt });
         continue;
@@ -1403,24 +1497,28 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       await passField.fill(account.password).catch(() => null);
       await sleep(150);
 
-      const loginBtn = page.getByRole("button", { name: /login|sign in/i }).first();
-      if (await loginBtn.isVisible().catch(() => false)) {
-        await loginBtn.click({ timeout: 10000 }).catch(() => null);
-      } else {
+      const clickMethod = await clickLoginButton();
+
+      // Fallback: Enter
+      if (clickMethod === "not_found") {
         await passField.press("Enter").catch(() => null);
       }
 
       await sleep(450);
       lastAfterClick = await logAfterLoginClick(page);
 
-      const settled = await waitForLoginToSettle(page, 25000);
-      await dumpDebugStep(page, `after-login-attempt-${attempt}`, { attempt, lastAfterClick, settled });
+      // Allow SPA to process
+      const settled = await waitForLoginToSettle(page, 45000);
+      lastSettle = settled;
+
+      await dumpDebugStep(page, `after-login-attempt-${attempt}`, {
+        attempt,
+        clickMethod,
+        lastAfterClick,
+        settled
+      });
 
       if (!settled.ok) continue;
-
-      if ((await isVisibleInAnyFrame(page, USER_SELECTORS)) && (await isVisibleInAnyFrame(page, PASS_SELECTORS))) {
-        continue;
-      }
 
       loggedIn = true;
       console.log("Login likely succeeded for", account.username, "on", loginUrl, "| reason:", settled.reason);
@@ -1428,7 +1526,8 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     }
 
     if (!loggedIn) {
-      await fail("login-failed", "Login failed (login form never disappeared)", { lastAfterClick });
+      await debugDumpButtons(page, "login-clickables");
+      await fail("login-failed", "Login failed (never detected logged-in state)", { lastAfterClick, lastSettle });
     }
 
     // 4) Ensure we are on Futures/Trade page
@@ -1436,7 +1535,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     await dumpDebugStep(page, "after-ensure-futures", { fut });
 
     if (!fut.ok) {
-      await fail("futures-nav-failed", "Could not reach Futures/Trade page (nav + direct attempts failed)", { fut });
+      await fail("futures-nav-failed", "Could not reach Futures/Trade page", { fut });
     }
 
     // 5) Navigate/open the order code flow
@@ -1448,7 +1547,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     }
 
     // 6) Find and fill order code input
-    const codeRes = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 15000);
+    const codeRes = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 20000);
     if (!codeRes.ok) {
       await fail("code-box-missing", "Order code input not found");
     }
@@ -1465,7 +1564,8 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       page.getByRole("button", { name: /confirm/i }).first(),
       page.getByRole("button", { name: /submit/i }).first(),
       page.getByRole("button", { name: /follow/i }).first(),
-      page.getByRole("button", { name: /ok/i }).first()
+      page.getByRole("button", { name: /ok/i }).first(),
+      page.getByText(/confirm/i).first()
     ];
 
     let confirmBtn = null;
@@ -1528,10 +1628,9 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 async function openOrderCodeFlow(page) {
   const attempts = [
     { name: "invited_me", regex: /invited\s*me/i },
-    { name: "invite", regex: /invite|invitation/i },
-    { name: "position_order", regex: /position\s*order/i },
-    { name: "trade", regex: /trade/i },
-    { name: "futures", regex: /futures|contract|合约|期货/i }
+    { name: "invite", regex: /invite|invitation|follow-up/i },
+    { name: "copying_history", regex: /copying\s*history/i },
+    { name: "position_order", regex: /position\s*order/i }
   ];
 
   for (const a of attempts) {
@@ -1542,13 +1641,13 @@ async function openOrderCodeFlow(page) {
         await sleep(900);
         await closeOverlays(page);
 
-        const codeRes = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 2500);
+        const codeRes = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 3000);
         if (codeRes.ok) return true;
       }
     } catch {}
   }
 
-  const codeRes2 = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 2500);
+  const codeRes2 = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 3000);
   return codeRes2.ok;
 }
 
@@ -1563,6 +1662,7 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("Failure capture: ALWAYS ON");
   console.log("FORCE_MOBILE:", FORCE_MOBILE);
   console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
+  console.log("API_REWRITE:", API_REWRITE_ENABLED, "match:", API_REWRITE_MATCH, "target:", API_REWRITE_TARGET);
   console.log("Email provider:", EMAIL_PROVIDER);
   console.log("Email configured:", emailConfigured());
   console.log("Verify toast/pending:", VERIFY_TOAST, VERIFY_PENDING);
