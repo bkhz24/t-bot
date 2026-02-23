@@ -157,24 +157,12 @@ function baseFromUrl(u) {
   }
 }
 
+// h5 MUST hit /trade to initialize state
 function homeUrlFromLoginUrl(loginUrl) {
   const base = baseFromUrl(loginUrl);
   if (!base) return null;
   const isPc = loginUrl.includes("/pc/#/");
-  // IMPORTANT: h5 needs /trade first to initialize session state
   return isPc ? `${base}/pc/#/` : `${base}/h5/#/trade`;
-}
-
-function futuresUrlFromLoginUrl(loginUrl) {
-  try {
-    const u = new URL(loginUrl);
-    const base = `${u.protocol}//${u.host}`;
-    const isPc = loginUrl.includes("/pc/#/");
-    const prefix = isPc ? "/pc/#/" : "/h5/#/";
-    return `${base}${prefix}contractTransaction`;
-  } catch {
-    return null;
-  }
 }
 
 function safeJsonParseAccounts() {
@@ -334,18 +322,36 @@ async function findVisibleInAnyFrame(page, selector, timeoutMs) {
   return { ok: false, frame: null, locator: null };
 }
 
-async function isVisibleOrderCodeBox(page) {
-  for (const f of page.frames()) {
-    try {
-      const loc = f.locator(ORDER_CODE_SELECTORS).first();
-      if (await loc.isVisible().catch(() => false)) return true;
-    } catch {}
+async function loginInputsVisible(page) {
+  const u = await findVisibleInAnyFrame(page, USER_SELECTORS, 1200);
+  const p = await findVisibleInAnyFrame(page, PASS_SELECTORS, 1200);
+  return u.ok && p.ok;
+}
+
+async function hasBottomNavSignals(page) {
+  // these labels match your screenshot bottom bar: Home, Markets, Futures, Perpetual, Assets
+  const patterns = [/home/i, /markets/i, /futures/i, /perpetual/i, /assets/i];
+  for (const re of patterns) {
+    const vis = await page.getByText(re).first().isVisible().catch(() => false);
+    if (vis) return true;
   }
   return false;
 }
 
+async function loginConfirmed(page) {
+  // If login inputs are gone => logged in
+  const stillLogin = await loginInputsVisible(page);
+  if (!stillLogin) return { ok: true, reason: "login_inputs_gone" };
+
+  // If bottom nav exists, we are on post-login UI even if hash says login
+  const nav = await hasBottomNavSignals(page);
+  if (nav) return { ok: true, reason: "bottom_nav_present" };
+
+  return { ok: false, reason: "still_looks_like_login" };
+}
+
 // --------------------
-// Futures navigation (BOTTOM NAV)
+// Futures navigation
 // --------------------
 async function bottomMiddleTap(page, label = "BOTTOM-MIDDLE TAP") {
   const vp = page.viewportSize() || { width: 390, height: 844 };
@@ -356,9 +362,8 @@ async function bottomMiddleTap(page, label = "BOTTOM-MIDDLE TAP") {
   await sleep(900);
 }
 
-// Click the bottom NAV "Futures" (DOM scan near bottom) OR coordinate tap
 async function clickBottomNavFutures(page) {
-  // 1) Try DOM scan: click a visible element whose text is "Futures" and is near the bottom
+  // 1) DOM scan for "Futures" in bottom quarter
   const domClicked = await page.evaluate(() => {
     function visible(el) {
       const r = el.getBoundingClientRect();
@@ -377,12 +382,10 @@ async function clickBottomNavFutures(page) {
       if (t.toLowerCase() !== "futures") continue;
       if (!visible(el)) continue;
       const r = el.getBoundingClientRect();
-      // Only trust items in bottom 25% of screen (bottom nav)
-      if (r.top < window.innerHeight * 0.75) continue;
-      const score = (r.top / window.innerHeight) * 100 + (r.left / window.innerWidth) * 10;
-      cand.push({ el, score });
+      if (r.top < window.innerHeight * 0.75) continue; // bottom nav zone
+      cand.push({ el, y: r.top });
     }
-    cand.sort((a, b) => b.score - a.score);
+    cand.sort((a, b) => b.y - a.y);
     if (!cand[0]) return false;
     cand[0].el.click();
     return true;
@@ -394,53 +397,47 @@ async function clickBottomNavFutures(page) {
     return true;
   }
 
-  // 2) Fallback to bottom-middle tap
+  // 2) bottom-middle tap fallback (3 tries)
   for (let i = 1; i <= 3; i++) {
     await bottomMiddleTap(page, `BOTTOM-MIDDLE FUTURES TAP attempt ${i}`);
-    const invited = await page.getByText(/invited\s*me/i).first().isVisible().catch(() => false);
-    const codeBox = await isVisibleOrderCodeBox(page);
-    if (invited || codeBox) return true;
+    const fut = await page.getByText(/invited\s*me|position\s*order|order code/i).first().isVisible().catch(() => false);
+    if (fut) return true;
   }
 
   return false;
 }
 
-// Ensure the correct flow: Home -> Futures -> Invited me -> Code box
 async function ensureFuturesInvitedAndCode(page, loginUrl) {
   const homeUrl = homeUrlFromLoginUrl(loginUrl);
 
-  // CRITICAL: load /trade first on h5 to avoid being kicked to login later
   if (homeUrl) {
     await page.goto(homeUrl, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => null);
-    await sleep(1200);
+    await sleep(1400);
     await closeOverlays(page);
-    await dumpDebugState(page, "after-home-trade", { homeUrl });
+    await dumpDebugState(page, "after-home-trade", { homeUrl, url: page.url() });
   }
 
-  // Click bottom nav futures
   const futOk = await clickBottomNavFutures(page);
   await dumpDebugState(page, "after-futures-nav", { futOk, url: page.url() });
 
-  // If we got bounced to login, stop immediately (don’t type code into email)
+  // If we got bounced to login, stop immediately
   const u = page.url() || "";
-  if (/\/login\b|#\/login\b/i.test(u)) {
+  if (/\/login\b|#\/login\b/i.test(u) && (await loginInputsVisible(page))) {
     return { ok: false, reason: "bounced_to_login_after_futures", url: u };
   }
 
-  // Click "Invited me" if present
   const invited = page.getByText(/invited\s*me/i).first();
   if (await invited.isVisible().catch(() => false)) {
     console.log('Clicking "Invited me"');
     await invited.click({ timeout: 8000 }).catch(() => null);
-    await sleep(1000);
+    await sleep(1100);
+    await closeOverlays(page);
   }
 
-  // Confirm code input exists
   const codeRes = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 12000);
   return { ok: codeRes.ok, reason: codeRes.ok ? "code_box_found" : "code_box_missing", url: page.url() };
 }
 
-// Robust confirm click
 async function clickConfirmSmart(page) {
   const direct = [
     page.getByRole("button", { name: /confirm/i }).first(),
@@ -476,10 +473,8 @@ async function clickConfirmSmart(page) {
       if (!t) continue;
       if (!/\bconfirm\b/i.test(t)) continue;
       if (!visible(el)) continue;
-
       const r = el.getBoundingClientRect();
-      const score = (r.left / window.innerWidth) * 100 + (r.top / window.innerHeight) * 10;
-      cand.push({ el, score });
+      cand.push({ el, score: r.top + r.left });
     }
 
     cand.sort((a, b) => b.score - a.score);
@@ -667,9 +662,6 @@ app.get("/", (req, res) => {
       Health: <a href="/health">/health</a>
       | Last screenshot: <a href="/last-shot?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/last-shot</a>
       | Debug: <a href="/debug?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/debug</a>
-      | DNS test: <a href="/dns-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/dns-test</a>
-      | Net test: <a href="/net-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/net-test</a>
-      | Email test: <a href="/email-test?p=${encodeURIComponent(BOT_PASSWORD || "YOUR_PASSWORD")}">/email-test</a>
     </div>
   `);
 });
@@ -687,12 +679,6 @@ app.get("/health", (req, res) => {
     forceMobile: FORCE_MOBILE,
     apiRewrite: { enabled: API_REWRITE, match: API_REWRITE_MATCH, target: API_REWRITE_TARGET }
   });
-});
-
-app.get("/email-test", async (req, res) => {
-  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-  const result = await sendEmail("T-Bot | email test", `Email test sent at ${nowLocal()}`);
-  res.json({ ok: true, result });
 });
 
 app.get("/last-shot", (req, res) => {
@@ -749,32 +735,6 @@ app.get("/debug/files", (req, res) => {
   fs.createReadStream(full).pipe(res);
 });
 
-app.get("/dns-test", async (req, res) => {
-  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-  const hosts = ["dsj12.cc", "dsj877.com", "dsj72.com", "api.ddjea.com", "api.sendgrid.com"];
-  const out = {};
-  for (const h of hosts) {
-    try { out[h] = { ok: true, addrs: await dns.lookup(h, { all: true }) }; }
-    catch (e) { out[h] = { ok: false, error: e?.message || String(e) }; }
-  }
-  res.json(out);
-});
-
-app.get("/net-test", async (req, res) => {
-  if (!authOk(req)) return res.status(401).send("Unauthorized. Add ?p=YOUR_PASSWORD");
-  const urls = ["https://dsj12.cc/", "https://dsj877.com/", "https://api.ddjea.com/api/app/ping"];
-  const results = {};
-  for (const u of urls) {
-    try {
-      const r = await fetch(u, { method: "GET" });
-      results[u] = { ok: true, status: r.status, bodyPreview: (await r.text()).slice(0, 240) };
-    } catch (e) {
-      results[u] = { ok: false, error: e?.message || String(e) };
-    }
-  }
-  res.json(results);
-});
-
 app.post("/run", async (req, res) => {
   const p = (req.body.p || "").toString();
   const code = (req.body.code || "").toString().trim();
@@ -806,58 +766,21 @@ app.post("/run", async (req, res) => {
   res.send("Run started. Check logs, /last-shot, and /debug.");
 
   (async () => {
-    const startedAt = nowLocal();
-    const subjectPrefix = `T-Bot | Run ${lastRunId}`;
-    let failAlertsSent = 0;
-
     try {
-      console.log("Bot started");
-      console.log("Run ID:", lastRunId);
-      console.log("Accounts loaded:", cfg.accounts.length);
-      console.log("Code received length:", code.length);
-      console.log("DEBUG_CAPTURE:", DEBUG_CAPTURE);
-      console.log("FORCE_MOBILE:", FORCE_MOBILE);
-      console.log("LOGIN_URLS:", LOGIN_URLS.join(", "));
-      console.log("API_REWRITE:", API_REWRITE, "match:", API_REWRITE_MATCH, "target:", API_REWRITE_TARGET);
-
       const pf = await preflightSites();
       if (!pf.ok) throw new Error(`Preflight failed. ${pf.note}`);
 
       const runSites = pf.sites;
       console.log("Chosen sites for this run:", runSites.join(", "));
 
-      await sendEmail(`${subjectPrefix} started`, `T-Bot started at ${startedAt}\nRun ID: ${lastRunId}\nSites: ${runSites.join(", ")}`);
-
-      const results = [];
-
       for (const account of cfg.accounts) {
         console.log("----");
         console.log("Account:", account.username);
-
-        try {
-          const used = await runAccountAllSites(account, code, runSites);
-          results.push({ username: account.username, ok: true, site: used.site, note: used.note });
-        } catch (e) {
-          const msg = e?.message || String(e);
-          results.push({ username: account.username, ok: false, error: msg });
-          lastError = `Account failed ${account.username}: ${msg}`;
-
-          if (EMAIL_ACCOUNT_FAIL_ALERTS && failAlertsSent < EMAIL_MAX_FAIL_ALERTS) {
-            failAlertsSent += 1;
-            await sendEmail(`${subjectPrefix} account FAILED: ${account.username}`, `Account failed: ${account.username}\nRun: ${lastRunId}\nError:\n${msg}`);
-          }
-        }
+        await runAccountAllSites(account, code, runSites);
       }
-
-      await sendEmail(
-        `${subjectPrefix} finished`,
-        results.map((r) => (r.ok ? `SUCCESS: ${r.username} (${r.site}) ${r.note || ""}` : `FAIL: ${r.username} (${r.error})`)).join("\n")
-      );
     } catch (e) {
-      const msg = e?.message || String(e);
-      lastError = msg;
-      await sendEmail(`${subjectPrefix} FAILED`, `Run failed at ${nowLocal()}\nRun ID: ${lastRunId}\nError: ${msg}`);
-      console.log("Run failed:", msg);
+      lastError = e?.message || String(e);
+      console.log("Run failed:", lastError);
     } finally {
       isRunning = false;
     }
@@ -873,9 +796,9 @@ async function runAccountAllSites(account, orderCode, runSites) {
   for (const loginUrl of runSites) {
     console.log("Trying site:", loginUrl, "for", account.username);
     try {
-      const note = await runAccountOnSite(account, orderCode, loginUrl);
+      await runAccountOnSite(account, orderCode, loginUrl);
       console.log("SUCCESS:", account.username, "on", loginUrl);
-      return { site: loginUrl, note };
+      return;
     } catch (e) {
       const msg = e?.message || String(e);
       console.log("Site failed:", loginUrl, "for", account.username, "err:", msg);
@@ -894,9 +817,6 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
   });
 
-  const harPath =
-    DEBUG_CAPTURE && lastDebugDir ? path.join(lastDebugDir, `har-${sanitize(account.username)}-${Date.now()}.har`) : null;
-
   const context = await browser.newContext({
     viewport: mobile ? { width: 390, height: 844 } : { width: 1280, height: 720 },
     locale: "en-US",
@@ -904,8 +824,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
     hasTouch: mobile,
     userAgent: mobile
       ? "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-      : undefined,
-    recordHar: harPath ? { path: harPath, content: "embed" } : undefined
+      : undefined
   });
 
   const page = await context.newPage();
@@ -938,6 +857,7 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
 
     await dumpDebugState(page, "after-goto", { loginUrl, status: resp ? resp.status() : null, mobile });
 
+    // Find login fields
     const userRes = await findVisibleInAnyFrame(page, USER_SELECTORS, 25000);
     const passRes = await findVisibleInAnyFrame(page, PASS_SELECTORS, 25000);
     if (!userRes.ok || !passRes.ok) throw new Error("Login fields not found");
@@ -951,89 +871,81 @@ async function runAccountOnSite(account, orderCode, loginUrl) {
       await sleep(1200);
       await closeOverlays(page);
 
-      const userRes2 = await findVisibleInAnyFrame(page, USER_SELECTORS, 20000);
-      const passRes2 = await findVisibleInAnyFrame(page, PASS_SELECTORS, 20000);
-      if (!userRes2.ok || !passRes2.ok) continue;
+      const u2 = await findVisibleInAnyFrame(page, USER_SELECTORS, 20000);
+      const p2 = await findVisibleInAnyFrame(page, PASS_SELECTORS, 20000);
+      if (!u2.ok || !p2.ok) continue;
 
-      await userRes2.locator.fill("").catch(() => null);
-      await passRes2.locator.fill("").catch(() => null);
+      await u2.locator.fill("").catch(() => null);
+      await p2.locator.fill("").catch(() => null);
 
-      await userRes2.locator.click({ timeout: 5000 }).catch(() => null);
-      await userRes2.locator.fill(account.username).catch(() => null);
+      await u2.locator.click({ timeout: 5000 }).catch(() => null);
+      await u2.locator.fill(account.username).catch(() => null);
       await sleep(200);
 
-      await passRes2.locator.click({ timeout: 5000 }).catch(() => null);
-      await passRes2.locator.fill(account.password).catch(() => null);
+      await p2.locator.click({ timeout: 5000 }).catch(() => null);
+      await p2.locator.fill(account.password).catch(() => null);
       await sleep(200);
 
       const loginBtn = page.getByRole("button", { name: /login|sign in/i }).first();
       if (await loginBtn.isVisible().catch(() => false)) await loginBtn.click({ timeout: 10000 }).catch(() => null);
-      else await passRes2.locator.press("Enter").catch(() => null);
+      else await p2.locator.press("Enter").catch(() => null);
 
-      await sleep(1800);
-      await dumpDebugState(page, `after-login-attempt-${attempt}`, { attempt, url: page.url() });
+      await sleep(1600);
 
-      // Confirm login by landing on Home/Trade (this also initializes state)
+      // Always go to home/trade after login click
       const home = homeUrlFromLoginUrl(loginUrl);
       if (home) {
         await page.goto(home, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => null);
-        await sleep(1200);
+        await sleep(1400);
         await closeOverlays(page);
-        await dumpDebugState(page, "after-home-confirm", { homeUrl: home, url: page.url() });
+      }
 
-        // If we are not on /login anymore, consider login good
-        const u = page.url() || "";
-        if (!/\/login\b|#\/login\b/i.test(u)) {
-          loggedIn = true;
-          console.log("Login confirmed for", account.username, "on", loginUrl);
-          break;
-        }
+      const conf = await loginConfirmed(page);
+      await dumpDebugState(page, `after-home-confirm`, { attempt, conf, url: page.url() });
+
+      if (conf.ok) {
+        loggedIn = true;
+        console.log("Login confirmed:", conf.reason);
+        break;
       }
     }
 
     if (!loggedIn) throw new Error("Login failed");
 
-    // Now do: Home -> Futures bottom tab -> Invited me -> Code box
+    // Now Home -> Futures -> Invited me -> Code input
     const flow = await ensureFuturesInvitedAndCode(page, loginUrl);
     await dumpDebugState(page, "after-flow", flow);
 
     if (!flow.ok) {
-      if (flow.reason === "bounced_to_login_after_futures") {
-        throw new Error("Bounced back to login after tapping Futures (session not stable)");
-      }
-      throw new Error("Could not reach order code input after Futures + Invited me");
+      throw new Error(`Flow failed: ${flow.reason}`);
     }
 
-    // Find code input
-    const codeRes = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 15000);
-    if (!codeRes.ok) throw new Error("Order code input not found");
-
-    // Guard: stop if kicked to login
+    // Guard: if we’re on login, STOP (avoid typing code into email)
     const curUrl = page.url() || "";
-    if (/\/login\b|#\/login\b/i.test(curUrl)) {
+    if (/\/login\b|#\/login\b/i.test(curUrl) && (await loginInputsVisible(page))) {
       await dumpDebugState(page, "kicked-to-login", { curUrl });
       throw new Error("Kicked back to login before entering order code (stopping to avoid typing into email).");
     }
+
+    const codeRes = await findVisibleInAnyFrame(page, ORDER_CODE_SELECTORS, 15000);
+    if (!codeRes.ok) throw new Error("Order code input not found");
 
     await codeRes.locator.click().catch(() => null);
     await codeRes.locator.fill(orderCode).catch(() => null);
     await sleep(700);
     await dumpDebugState(page, "after-code", { codeLength: String(orderCode || "").length });
 
-    // Click confirm
     const clicked = await clickConfirmSmart(page);
     await dumpDebugState(page, "after-confirm-click", { clicked });
-
     if (!clicked) throw new Error("Confirm button not found");
 
-    // Verify
     let lastVerify = null;
     for (let i = 1; i <= CONFIRM_RETRIES; i++) {
       const verify = await verifyOrderFollowed(page);
       lastVerify = verify;
       if (verify.ok) {
         await dumpDebugState(page, "confirm-verified", { verify });
-        return verify.detail || "verified";
+        return;
       }
       await sleep(CONFIRM_RETRY_DELAY_MS);
     }
