@@ -577,7 +577,7 @@ async function runFlow(page, loginUrl, orderCode) {
   // We must use pressSequentially() to fire real keydown/keypress/input/keyup events
   // so Vue's reactive state actually receives the value.
   await codeBox.fill('').catch(()=>null); // clear first
-  await codeBox.pressSequentially(String(orderCode), { delay: 30 }).catch(async () => {
+  await codeBox.pressSequentially(String(orderCode), { delay: 40 }).catch(async () => {
     // Fallback: use evaluate to set value via native setter + dispatch input event
     await page.evaluate((code) => {
       const sel = '.follow-input input, .action-box input[type="text"], .el-input-group__prepend ~ input, .el-input-group input';
@@ -591,6 +591,55 @@ async function runFlow(page, loginUrl, orderCode) {
       }
     }, String(orderCode)).catch(()=>null);
   });
+  await sleep(300);
+
+  // CRITICAL FIX: After typing, blur the input so Vue's v-model finalizes.
+  // ElementUI's el-input requires blur to commit the value to the component.
+  // Also use Vue's __vue__ instance to set the value directly on the component.
+  await page.evaluate((code) => {
+    const input = document.querySelector('.follow-input input') ||
+                  document.querySelector('input[placeholder*="order"]');
+    if (!input) return;
+
+    // 1. Set native value via prototype setter
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    if (setter) setter.call(input, code);
+    else input.value = code;
+
+    // 2. Fire all Vue/ElementUI reactive events
+    ['input', 'change'].forEach(type => {
+      input.dispatchEvent(new Event(type, { bubbles: true }));
+    });
+
+    // 3. Use Vue __vue__ instance to set value directly on component
+    // Walk up the DOM to find the el-input Vue component
+    let el = input;
+    while (el) {
+      if (el.__vue__) {
+        const vm = el.__vue__;
+        // ElInput stores value in vm.currentValue or vm.value
+        if ('currentValue' in vm) vm.currentValue = code;
+        if (typeof vm.handleInput === 'function') {
+          // Simulate the input handler with a fake event
+          try { vm.handleInput({ target: { value: code } }); } catch(e) {}
+        }
+        // Emit up to parent component (the one with v-model)
+        vm.$emit('input', code);
+        // Also try parent
+        if (vm.$parent) {
+          vm.$parent.$emit('input', code);
+          if ('currentValue' in vm.$parent) vm.$parent.currentValue = code;
+        }
+        break;
+      }
+      el = el.parentElement;
+    }
+
+    // 4. Blur to finalize (this is key for ElementUI v-model)
+    input.dispatchEvent(new FocusEvent('blur', { bubbles: true }));
+    input.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+    input.blur();
+  }, String(orderCode)).catch(()=>null);
   await sleep(400);
 
   const filled = await codeBox.inputValue().catch(()=>"");
@@ -631,19 +680,34 @@ async function runFlow(page, loginUrl, orderCode) {
   for (let i = 1; i <= CONFIRM_RETRIES; i++) {
     console.log(`Confirm click attempt ${i}`);
 
-    // Re-ensure Vue's reactive state has the value before clicking
+    // Re-ensure Vue's reactive state + blur input before clicking
     await page.evaluate((code) => {
       const input = document.querySelector('.follow-input input') ||
-                    document.querySelector('.el-input-group__append')?.closest('.el-input-group')?.querySelector('input');
-      if (input && input.value !== code) {
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-        if (setter) setter.call(input, code);
-        else input.value = code;
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
+                    document.querySelector('input[placeholder*="order"]');
+      if (!input) return;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+      if (setter) setter.call(input, code);
+      else input.value = code;
+      ['input', 'change'].forEach(t => input.dispatchEvent(new Event(t, { bubbles: true })));
+      // Use Vue __vue__ instance to update component data
+      let el = input;
+      while (el) {
+        if (el.__vue__) {
+          const vm = el.__vue__;
+          if ('currentValue' in vm) vm.currentValue = code;
+          if (typeof vm.handleInput === 'function') {
+            try { vm.handleInput({ target: { value: code } }); } catch(e) {}
+          }
+          vm.$emit('input', code);
+          break;
+        }
+        el = el.parentElement;
       }
+      // BLUR - finalizes ElementUI v-model before button click
+      input.dispatchEvent(new FocusEvent('blur', { bubbles: true }));
+      input.blur();
     }, String(orderCode)).catch(()=>null);
-    await sleep(100);
+    await sleep(200);
 
     // Strategy A: Playwright force-click
     if (confirmBtn) {
