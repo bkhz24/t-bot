@@ -1,1009 +1,793 @@
 "use strict";
 
 const express = require("express");
-const crypto = require("crypto");
-const fs = require("fs");
-const path = require("path");
+const crypto  = require("crypto");
+const fs      = require("fs");
+const path    = require("path");
 const { chromium } = require("playwright");
 
-const PORT = Number(process.env.PORT || 8080);
+/* ═══════════════════════════════════════════════════════════════════
+   CONFIGURATION
+   ═══════════════════════════════════════════════════════════════════ */
+const PORT              = Number(process.env.PORT) || 8080;
+const PASSWORD          = process.env.BOT_PASSWORD || process.env.PASSWORD || "";
+const ORDER_CODE        = (process.env.ORDER_CODE || "").trim();
+const LOGIN_ATTEMPTS    = Number(process.env.LOGIN_ATTEMPTS) || 8;
+const CONFIRM_RETRIES   = Number(process.env.CONFIRM_RETRIES) || 8;
+const WAIT_AFTER_LOGIN  = Number(process.env.WAIT_AFTER_LOGIN_MS) || 8000;
+const CODE_LENGTH       = Number(process.env.CODE_LENGTH) || 9;
+const FORCE_MOBILE      = (process.env.FORCE_MOBILE || "auto").toLowerCase();
 
-// ── Required env ──────────────────────────────────────────────────────────────
-const BOT_PASSWORD  = (process.env.BOT_PASSWORD || process.env.RUN_PASSWORD || "").toString();
-const ACCOUNTS_JSON = (process.env.ACCOUNTS_JSON || "").toString();
-const LOGIN_URLS_ENV = (process.env.LOGIN_URLS || "").toString();
+const ACCOUNTS = (() => {
+  try { return JSON.parse(process.env.ACCOUNTS || "[]"); }
+  catch { return []; }
+})();
 
-// ── Optional env ──────────────────────────────────────────────────────────────
-const DEBUG_CAPTURE      = envTruthy(process.env.DEBUG_CAPTURE || "1");
-const FORCE_MOBILE_MODE  = (process.env.FORCE_MOBILE || "auto").toString().trim().toLowerCase();
+const LOGIN_URLS = (process.env.LOGIN_URLS || "")
+  .split(",").map(s => s.trim()).filter(Boolean);
 
-// Login
-const LOGIN_ATTEMPTS      = Number(process.env.LOGIN_ATTEMPTS     || "6");
-const LOGIN_FIELD_WAIT_MS = Number(process.env.LOGIN_FIELD_WAIT_MS|| "20000");
-const WAIT_AFTER_LOGIN_MS = Number(process.env.WAIT_AFTER_LOGIN_MS|| "2200");
+/* ═══════════════════════════════════════════════════════════════════
+   EMAIL
+   ═══════════════════════════════════════════════════════════════════ */
+let emailSend = null;
+try {
+  const mod = require("./src/emailer");
+  // Handle various export shapes
+  if (typeof mod === "function")                emailSend = mod;
+  else if (mod && typeof mod.send === "function")      emailSend = mod.send.bind(mod);
+  else if (mod && typeof mod.sendEmail === "function")  emailSend = mod.sendEmail.bind(mod);
+  else if (mod && typeof mod.default === "function")    emailSend = mod.default;
+} catch { /* emailer not available */ }
 
-// Navigation
-const WAIT_AFTER_FUTURES_MS        = Number(process.env.WAIT_AFTER_FUTURES_MS        || "1800");
-const WAIT_AFTER_FUTURES_DIRECT_MS = Number(process.env.WAIT_AFTER_FUTURES_DIRECT_MS || "1800");
-const WAIT_AFTER_GOTO_MS           = Number(process.env.WAIT_AFTER_GOTO_MS           || "1500");
-const WAIT_AFTER_INVITED_MS        = Number(process.env.WAIT_AFTER_INVITED_MS        || "1500");
+const emailOk = !!emailSend;
 
-// Confirm
-const CONFIRM_RETRIES       = Number(process.env.CONFIRM_RETRIES        || "8");
-const CONFIRM_RETRY_DELAY_MS= Number(process.env.CONFIRM_RETRY_DELAY_MS || "3500");
-const CONFIRM_WAIT_MS       = Number(process.env.CONFIRM_WAIT_MS        || "4000");
-
-// Verify
-const VERIFY_TOAST      = envTruthy(process.env.VERIFY_TOAST    || "1");
-const VERIFY_PENDING    = envTruthy(process.env.VERIFY_PENDING  || "1");
-const VERIFY_TIMEOUT_MS = Number(process.env.VERIFY_TIMEOUT_MS || "25000");
-
-// Email
-const EMAIL_ENABLED      = envTruthy(process.env.EMAIL_ENABLED   || "1");
-const EMAIL_PROVIDER     = (process.env.EMAIL_PROVIDER || "sendgrid").toString().trim().toLowerCase();
-const SENDGRID_API_KEY   = (process.env.SENDGRID_API_KEY || "").toString().trim();
-const EMAIL_FROM_RAW     = (process.env.EMAIL_FROM || "").toString().trim();
-const EMAIL_FROM_NAME    = (process.env.EMAIL_FROM_NAME || "T-Bot").toString().trim();
-const EMAIL_TO           = (process.env.EMAIL_TO || "").toString().trim();
-const EMAIL_MAX_FAIL_ALERTS = Number(process.env.EMAIL_MAX_FAIL_ALERTS || "4");
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function envTruthy(v) {
-  const s = (v || "").toString().trim().toLowerCase();
-  return s === "1" || s === "true" || s === "yes" || s === "on";
-}
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function nowLocal() { return new Date().toLocaleString("en-US", { timeZoneName: "short" }); }
-function escapeHtml(s) {
-  return String(s ?? "")
-    .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
-    .replaceAll('"',"&quot;").replaceAll("'","&#39;");
-}
-function sanitizeFilename(s) {
-  return String(s ?? "").replace(/[^a-z0-9._-]+/gi,"_").replace(/_+/g,"_")
-    .replace(/^_+|_+$/g,"").slice(0,80);
-}
-function authOk(req) {
-  const p = (req.query.p || "").toString();
-  return !!BOT_PASSWORD && p === BOT_PASSWORD;
-}
-function ensureDir(d) { try { fs.mkdirSync(d, { recursive:true }); } catch {} }
-function safeListDir(d) { try { return fs.readdirSync(d).filter(x=>!x.includes("..")); } catch { return []; } }
-
-// ── Accounts ──────────────────────────────────────────────────────────────────
-function parseAccounts() {
-  if (!ACCOUNTS_JSON) return { ok:false, accounts:[], error:"ACCOUNTS_JSON not set" };
+async function notify(subject, body) {
+  if (!emailSend) return;
   try {
-    const parsed = JSON.parse(ACCOUNTS_JSON);
-    if (!Array.isArray(parsed)) return { ok:false, accounts:[], error:"ACCOUNTS_JSON must be an array" };
-    const cleaned = parsed.map(a => ({
-      username: String(a?.username||"").trim(),
-      password: String(a?.password||"")
-    }));
-    const bad = cleaned.find(a => !a.username || !a.password);
-    if (bad) return { ok:false, accounts:[], error:"Each account needs username + password" };
-    return { ok:true, accounts:cleaned, error:null };
-  } catch(e) {
-    return { ok:false, accounts:[], error:`ACCOUNTS_JSON invalid: ${e?.message||String(e)}` };
+    await emailSend(subject, body);
+    console.log(`Email sent: ${subject.substring(0, 50)}`);
+  } catch (e) {
+    console.log(`Email error: ${e.message}`);
   }
 }
 
-// ── Login URLs ────────────────────────────────────────────────────────────────
-function parseLoginUrls() {
-  const fallback = ["https://dsj88.net/h5/#/login"];
-  const raw = (LOGIN_URLS_ENV || "").trim();
-  if (!raw) return fallback;
-  const list = raw.split(",").map(x=>x.trim()).filter(Boolean);
-  return list.length ? list : fallback;
-}
-const LOGIN_URLS = parseLoginUrls();
+/* ═══════════════════════════════════════════════════════════════════
+   DEBUG STORAGE
+   ═══════════════════════════════════════════════════════════════════ */
+const DEBUG_DIR = "/tmp/debug";
+fs.mkdirSync(DEBUG_DIR, { recursive: true });
 
-function isH5Url(url) { return /\/h5\//i.test(url); }
-function shouldUseMobile(loginUrl) {
-  if (FORCE_MOBILE_MODE === "true"  || FORCE_MOBILE_MODE === "1") return true;
-  if (FORCE_MOBILE_MODE === "false" || FORCE_MOBILE_MODE === "0") return false;
-  return isH5Url(loginUrl); // auto
-}
-function baseFromUrl(url) {
-  try { const u = new URL(url); return `${u.protocol}//${u.host}`; } catch { return null; }
-}
-function futuresUrlFrom(loginUrl) {
-  const base = baseFromUrl(loginUrl);
-  if (!base) return null;
-  const prefix = loginUrl.includes("/pc/#/") ? "/pc/#/" : "/h5/#/";
-  return `${base}${prefix}contractTransaction`;
-}
-
-// ── Email ─────────────────────────────────────────────────────────────────────
-function parseFromEmail(raw) {
-  const s = (raw||"").trim();
-  if (!s) return "";
-  const m = s.match(/<([^>]+)>/);
-  if (m && m[1]) return m[1].trim();
-  return s;
-}
-function emailConfigured() {
-  if (!EMAIL_ENABLED) return false;
-  if (EMAIL_PROVIDER !== "sendgrid") return false;
-  return !!(SENDGRID_API_KEY && parseFromEmail(EMAIL_FROM_RAW) && EMAIL_TO);
-}
-async function sendEmail(subject, text) {
-  if (!emailConfigured()) { console.log("Email not configured, skipping:", subject); return { ok:false, skipped:true }; }
+function cleanDebug() {
   try {
-    const sg = require("@sendgrid/mail");
-    sg.setApiKey(SENDGRID_API_KEY);
-    const [res] = await sg.send({
-      to: EMAIL_TO.split(",").map(s=>s.trim()).filter(Boolean),
-      from: { email: parseFromEmail(EMAIL_FROM_RAW), name: EMAIL_FROM_NAME },
-      subject, text
-    });
-    console.log("Email sent:", subject, res?.statusCode);
-    return { ok:true };
-  } catch(e) {
-    const err = e?.response?.body ? JSON.stringify(e.response.body) : (e?.message||String(e));
-    console.log("Email failed:", err);
-    return { ok:false, error:err };
-  }
-}
-
-// ── Debug artifacts ───────────────────────────────────────────────────────────
-let isRunning = false, lastRunAt = null, lastError = null;
-let lastRunId = null, lastDebugDir = null, lastShotPath = null;
-
-function writePlaceholderShot() {
-  try {
-    ensureDir("/app");
-    fs.writeFileSync("/app/last-shot.png",
-      Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axl1mQAAAAASUVORK5CYII=","base64")
-    );
+    for (const f of fs.readdirSync(DEBUG_DIR))
+      fs.unlinkSync(path.join(DEBUG_DIR, f));
   } catch {}
 }
-async function saveShot(page, filePath) {
-  try { await page.screenshot({ path:filePath, fullPage:true }); lastShotPath = filePath; } catch {}
-  try { fs.copyFileSync(filePath, "/app/last-shot.png"); } catch {}
-}
-async function dumpStep(page, tag, extra={}) {
-  if (!DEBUG_CAPTURE) return;
-  const dir = lastDebugDir || "/tmp";
-  ensureDir(dir);
-  const base = path.join(dir, `${sanitizeFilename(tag)}-${Date.now()}`);
-  try { fs.writeFileSync(`${base}.url.txt`,   String(page.url()||"")); } catch {}
-  try { fs.writeFileSync(`${base}.extra.json`, JSON.stringify(extra,null,2)); } catch {}
-  try { fs.writeFileSync(`${base}.html`,       String(await page.content().catch(()=>""))); } catch {}
-  try { await saveShot(page, `${base}.png`); } catch {}
-}
-async function captureFailure(page, tag, msg) {
-  const dir = lastDebugDir || "/tmp";
-  ensureDir(dir);
-  const base = path.join(dir, `${sanitizeFilename(tag)}-${Date.now()}`);
-  const url = page.url() || "";
-  console.log("FAIL:", msg, "| URL:", url);
-  try { await saveShot(page, `${base}.png`); } catch {}
-  try { fs.writeFileSync(`${base}.html`, String(await page.content().catch(()=>""))); } catch {}
-  try { fs.writeFileSync(`${base}.url.txt`, url); } catch {}
+
+async function snap(page, label) {
+  const name = `${Date.now()}_${label.replace(/[^a-z0-9_-]/gi, "_")}`;
+  try {
+    await page.screenshot({
+      path: path.join(DEBUG_DIR, `${name}.png`),
+      fullPage: true,
+    });
+  } catch {}
+  try {
+    fs.writeFileSync(path.join(DEBUG_DIR, `${name}.html`), await page.content());
+  } catch {}
 }
 
-// ── Selectors ─────────────────────────────────────────────────────────────────
-// The login page uses <input type="text"> for email and <input type="password"> for password
-// The Login button is a <div class="login-btn"> — NOT a <button>!
-const USER_SEL = [
-  'input[type="email"]',
-  'input[type="text"]',
-  'input[placeholder*="email" i]',
-  'input[placeholder*="account" i]',
-  'input[placeholder*="phone" i]',
-  'input[placeholder*="mobile" i]',
-  'input[name*="user" i]',
-  'input[name*="email" i]',
-].join(", ");
+/* ═══════════════════════════════════════════════════════════════════
+   HELPERS
+   ═══════════════════════════════════════════════════════════════════ */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const PASS_SEL = [
-  'input[type="password"]',
-  'input[placeholder*="password" i]',
-].join(", ");
-
-const ORDER_CODE_SEL = [
-  'input[placeholder*="order code" i]',
-  'input[placeholder*="Please enter the order" i]',
-  'input[placeholder*="order" i]',
-  'input[placeholder*="code" i]',
-].join(", ");
-
-// ── Core helpers ──────────────────────────────────────────────────────────────
-async function findVisible(page, selector, timeoutMs=10000) {
-  const end = Date.now() + timeoutMs;
-  while (Date.now() < end) {
-    const loc = page.locator(selector).first();
-    if (await loc.isVisible().catch(()=>false)) return { ok:true, locator:loc };
-    await sleep(300);
-  }
-  return { ok:false, locator:null };
+function isMobile(url) {
+  if (FORCE_MOBILE === "true") return true;
+  if (FORCE_MOBILE === "false") return false;
+  return url.includes("/h5/");
 }
 
-async function closeOverlays(page) {
-  const candidates = [
-    page.getByRole("button", { name:/close|cancel|dismiss|got it|ok|agree/i }).first(),
-    page.locator('[aria-label*="close" i]').first(),
-    page.locator('button:has-text("×")').first(),
-    page.locator(".modal-close").first(),
-  ];
-  for (const c of candidates) {
-    try {
-      if (await c.isVisible().catch(()=>false)) {
-        await c.click({ timeout:1500 }).catch(()=>null);
-        await sleep(200);
-      }
-    } catch {}
-  }
+function baseUrl(loginUrl) {
+  try { return new URL(loginUrl).origin; }
+  catch { return loginUrl.replace(/\/(pc|h5)\/.*/i, ""); }
 }
 
-async function loginFieldsVisible(page) {
-  const u = page.locator(USER_SEL).first();
-  const p = page.locator(PASS_SEL).first();
-  return (await u.isVisible().catch(()=>false)) && (await p.isVisible().catch(()=>false));
+/**
+ * Type into a Vue/Element-UI input properly.
+ *
+ * Playwright's fill() sets the DOM value directly but BYPASSES Vue's
+ * v-model event listeners. Vue's internal state stays empty, so any
+ * button that reads the reactive data sees nothing.
+ *
+ * pressSequentially() simulates real keystrokes (keydown → keypress →
+ * input → keyup for each character), which correctly triggers Vue
+ * reactivity.
+ */
+async function vueType(page, locator, value, opts = {}) {
+  const { delay = 40 } = opts;
+
+  // Focus and clear
+  await locator.click();
+  await sleep(150);
+  await page.keyboard.press("Control+A");
+  await page.keyboard.press("Backspace");
+  await sleep(150);
+
+  // Type character-by-character (triggers Vue v-model)
+  await locator.pressSequentially(value, { delay });
+  await sleep(300);
+
+  // Verify
+  const actual = await locator.inputValue().catch(() => "");
+  if (actual === value) return true;
+
+  // Fallback: native setter + event dispatch
+  console.log(`  vueType verify mismatch ("${actual}" vs "${value}"), using native setter fallback`);
+  await page.evaluate((val) => {
+    const el = document.querySelector(".follow-input .el-input__inner")
+            || document.querySelector('input[placeholder*="order code"]')
+            || document.querySelector('input[placeholder*="enter the order"]');
+    if (!el) return;
+    const set = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype, "value"
+    ).set;
+    set.call(el, val);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    el.dispatchEvent(
+      new InputEvent("input", { bubbles: true, data: val, inputType: "insertText" })
+    );
+  }, value);
+  await sleep(300);
+
+  return (await locator.inputValue().catch(() => "")) === value;
 }
 
-function isOnLoginPage(url) {
-  return (url||"").includes("/#/login") || (url||"").includes("/login");
-}
-
-// ── THE KEY FIX: Click the login button (it's a div, not a button) ────────────
-async function clickLoginButton(page) {
-  // 1. The site uses <div class="login-btn"> - try this first
-  const divBtn = page.locator('.login-btn').first();
-  if (await divBtn.isVisible().catch(()=>false)) {
-    console.log("Clicking .login-btn div");
-    await divBtn.click({ timeout:8000 }).catch(()=>null);
-    return true;
-  }
-
-  // 2. Try text content matches
-  const textTargets = [
-    page.locator('div:has-text("Login")').filter({ hasText:/^Login$/ }).first(),
-    page.getByText(/^Login$/i).first(),
-    page.getByRole("button", { name:/login|sign in/i }).first(),
-    page.locator('button[type="submit"]').first(),
-    page.locator('input[type="submit"]').first(),
-  ];
-  for (const t of textTargets) {
-    if (await t.isVisible().catch(()=>false)) {
-      console.log("Clicking login via fallback");
-      await t.click({ timeout:5000 }).catch(()=>null);
-      return true;
-    }
-  }
-
-  // 3. Last resort: press Enter on the password field
-  const passField = page.locator(PASS_SEL).first();
-  if (await passField.isVisible().catch(()=>false)) {
-    console.log("Pressing Enter on password field");
-    await passField.press("Enter").catch(()=>null);
-    return true;
-  }
-
-  return false;
-}
-
-// ── Login flow ────────────────────────────────────────────────────────────────
-async function login(page, account, loginUrl) {
+/* ═══════════════════════════════════════════════════════════════════
+   LOGIN
+   ═══════════════════════════════════════════════════════════════════ */
+async function login(page, url, user, pass) {
   for (let attempt = 1; attempt <= LOGIN_ATTEMPTS; attempt++) {
-    console.log(`Login attempt ${attempt}/${LOGIN_ATTEMPTS} for ${account.username} on ${loginUrl}`);
+    console.log(`Login attempt ${attempt}/${LOGIN_ATTEMPTS} for ${user} on ${url}`);
 
-    await page.goto(loginUrl, { waitUntil:"domcontentloaded", timeout:60000 }).catch(()=>null);
-    await sleep(1500);
-    await closeOverlays(page);
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    } catch (e) {
+      console.log(`  Nav error: ${e.message}`);
+      if (attempt < LOGIN_ATTEMPTS) { await sleep(3000); continue; }
+      return false;
+    }
+    await sleep(3000);
 
-    // Wait for fields
-    const userRes = await findVisible(page, USER_SEL, LOGIN_FIELD_WAIT_MS);
-    const passRes = await findVisible(page, PASS_SEL, 5000);
+    /* --- Fill credentials (also use pressSequentially for Vue) --- */
+    try {
+      const userIn = page.locator([
+        'input[type="text"]',
+        'input[type="email"]',
+        'input[placeholder*="email" i]',
+        'input[placeholder*="account" i]',
+        'input[placeholder*="phone" i]',
+      ].join(", ")).first();
+      await userIn.waitFor({ timeout: 10000 });
+      await userIn.click({ clickCount: 3 });
+      await userIn.pressSequentially(user, { delay: 20 });
 
-    if (!userRes.ok || !passRes.ok) {
-      console.log("  Fields not found, retrying...");
-      await dumpStep(page, `login-no-fields-${attempt}`, { loginUrl });
-      continue;
+      const passIn = page.locator('input[type="password"]').first();
+      await passIn.click({ clickCount: 3 });
+      await passIn.pressSequentially(pass, { delay: 20 });
+
+      const vu = await userIn.inputValue();
+      const pl = (await passIn.inputValue()).length;
+      console.log(`  Filled user: "${vu}" (expected: "${user}"), pass length: ${pl}`);
+    } catch (e) {
+      console.log(`  Fill error: ${e.message}`);
+      if (attempt < LOGIN_ATTEMPTS) { await sleep(2000); continue; }
+      return false;
     }
 
-    // Fill credentials
-    const userField = userRes.locator;
-    const passField = passRes.locator;
+    /* --- Click login button --- */
+    // The login button is a <div class="login-btn">, NOT a <button>
+    try {
+      const lb = page.locator(".login-btn").first();
+      if (await lb.isVisible({ timeout: 3000 }).catch(() => false)) {
+        console.log("Clicking .login-btn div");
+        await lb.click();
+      } else {
+        // Fallback: try any button with login text
+        const btn = page.locator(
+          'button:has-text("Login"), button:has-text("Sign in"), button:has-text("Log in")'
+        ).first();
+        if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await btn.click();
+        } else {
+          await page.keyboard.press("Enter");
+        }
+      }
+    } catch {
+      await page.keyboard.press("Enter");
+    }
 
-    await userField.click({ timeout:3000 }).catch(()=>null);
-    await userField.fill("").catch(()=>null);
-    await sleep(100);
-    await userField.fill(account.username).catch(()=>null);
-    await sleep(200);
+    await sleep(WAIT_AFTER_LOGIN || 8000);
 
-    await passField.click({ timeout:3000 }).catch(()=>null);
-    await passField.fill("").catch(()=>null);
-    await sleep(100);
-    await passField.fill(account.password).catch(()=>null);
-    await sleep(200);
+    /* --- Check success --- */
+    const cur = page.url();
+    const still = await page.locator('input[type="password"]').isVisible().catch(() => false);
+    const onLogin = cur.includes("/login");
+    console.log(`  After login: url=${cur}, stillHasFields=${still}, onLoginPage=${onLogin}`);
 
-    // Verify filled correctly
-    const filledUser = await userField.inputValue().catch(()=>"");
-    const filledPass = await passField.inputValue().catch(()=>"");
-    console.log(`  Filled user: "${filledUser}" (expected: "${account.username}"), pass length: ${filledPass.length}`);
-
-    // Click login
-    await clickLoginButton(page);
-    await sleep(WAIT_AFTER_LOGIN_MS);
-    await closeOverlays(page);
-
-    await dumpStep(page, `after-login-${attempt}`, { loginUrl, attempt });
-
-    // Check if we got past the login page
-    const url = page.url() || "";
-    const stillHasFields = await loginFieldsVisible(page);
-    const onLoginPage = isOnLoginPage(url);
-
-    console.log(`  After login: url=${url}, stillHasFields=${stillHasFields}, onLoginPage=${onLoginPage}`);
-
-    if (!stillHasFields && !onLoginPage) {
+    if (!onLogin && !still) {
       console.log("  ✓ Login SUCCESS");
       return true;
     }
-    if (!stillHasFields) {
-      console.log("  ✓ Login likely success (fields gone)");
-      return true;
-    }
 
-    // Still on login — wait a bit more and check again
+    console.log("  ✗ Login attempt failed");
     await sleep(2000);
-    const stillOnLogin2 = await loginFieldsVisible(page);
-    if (!stillOnLogin2) {
-      console.log("  ✓ Login success (delayed)");
-      return true;
-    }
-
-    console.log(`  Login attempt ${attempt} failed, retrying...`);
-  }
-
-  return false;
-}
-
-// ── Navigation: Futures ───────────────────────────────────────────────────────
-async function gotoFuturesPC(page) {
-  // On PC, "Futures" is in the top nav with a dropdown
-  // Try clicking the "Futures" nav item which has a popover with "Futures" and "Perpetual" options
-  console.log("PC: Looking for Futures nav item...");
-
-  // The nav item is a div with text " Futures " and a dropdown icon
-  // Try clicking the nav Futures item to open the dropdown
-  const futuresNav = page.locator('.el-popover__reference').filter({ hasText: /futures/i }).first();
-  if (await futuresNav.isVisible().catch(()=>false)) {
-    await futuresNav.click({ timeout:5000 }).catch(()=>null);
-    await sleep(600);
-    console.log("PC: Clicked Futures nav popover");
-
-    // Now click "Futures" in the dropdown (as opposed to "Perpetual" or "Convert")
-    const dropdownFutures = page.locator('.lang-item.pointer').filter({ hasText: /^Futures$/i }).first();
-    if (await dropdownFutures.isVisible().catch(()=>false)) {
-      await dropdownFutures.click({ timeout:5000 }).catch(()=>null);
-      await sleep(WAIT_AFTER_FUTURES_MS);
-      console.log("PC: Clicked Futures in dropdown");
-      return true;
-    }
-
-    // fallback: any visible "Futures" text in dropdown area
-    const anyFutures = page.getByText(/^Futures$/i).first();
-    if (await anyFutures.isVisible().catch(()=>false)) {
-      await anyFutures.click({ timeout:3000 }).catch(()=>null);
-      await sleep(WAIT_AFTER_FUTURES_MS);
-      return true;
-    }
-  }
-
-  // Simpler fallback: just click any element with "Futures" text
-  const simpleFutures = page.getByText(/futures/i).first();
-  if (await simpleFutures.isVisible().catch(()=>false)) {
-    await simpleFutures.click({ timeout:5000 }).catch(()=>null);
-    await sleep(WAIT_AFTER_FUTURES_MS);
-    return true;
-  }
-
-  return false;
-}
-
-async function gotoFuturesMobile(page) {
-  console.log("Mobile: Looking for Futures bottom tab...");
-
-  // Mobile bottom nav has: Home, Markets, Futures (middle), Perpetual, Assets
-  const clicked =
-    await page.getByRole("tab",   { name:/^futures$/i }).first().isVisible().catch(()=>false) ?
-      (await page.getByRole("tab", { name:/^futures$/i }).first().click({ timeout:5000 }).catch(()=>false), true) :
-    await page.getByText(/^Futures$/i).first().isVisible().catch(()=>false) ?
-      (await page.getByText(/^Futures$/i).first().click({ timeout:5000 }).catch(()=>false), true) :
-    false;
-
-  if (clicked) {
-    await sleep(WAIT_AFTER_FUTURES_MS);
-    console.log("Mobile: Clicked Futures tab");
-    return true;
-  }
-
-  // Tap the middle-bottom of the screen (Futures is the 3rd of 5 bottom tabs)
-  const vp = page.viewportSize() || { width:390, height:844 };
-  const x = Math.floor(vp.width * 0.50);
-  const y = Math.floor(vp.height * 0.94);
-  for (let i = 1; i <= 3; i++) {
-    console.log(`Mobile: Bottom-middle tap attempt ${i} at (${x}, ${y})`);
-    await page.mouse.click(x, y).catch(()=>null);
-    await sleep(1000);
-    const hasInvitedMe = await page.getByText(/invited\s*me/i).first().isVisible().catch(()=>false);
-    if (hasInvitedMe) {
-      console.log("Mobile: Found 'Invited me' after tap - success");
-      return true;
-    }
   }
   return false;
 }
 
-// ── Navigation: Invited Me ────────────────────────────────────────────────────
-async function clickInvitedMe(page) {
-  const end = Date.now() + 8000;
-  while (Date.now() < end) {
-    const tab = page.getByText(/invited\s*me/i).first();
-    if (await tab.isVisible().catch(()=>false)) {
-      await tab.click({ timeout:5000 }).catch(()=>null);
-      await sleep(WAIT_AFTER_INVITED_MS);
-      console.log("Clicked 'Invited me'");
-      return true;
-    }
-    await sleep(400);
-  }
-  console.log("'Invited me' tab not found");
-  return false;
-}
+/* ═══════════════════════════════════════════════════════════════════
+   NAVIGATE TO CONTRACT TRANSACTION PAGE
+   ═══════════════════════════════════════════════════════════════════ */
+async function goToContractPage(page, loginUrl) {
+  const base = baseUrl(loginUrl);
+  const mobile = isMobile(loginUrl);
 
-// ── Verification ──────────────────────────────────────────────────────────────
-async function waitForToast(page) {
-  if (!VERIFY_TOAST) return { ok:false, type:"toast_off" };
-  const patterns = [/already\s*followed/i, /followed/i, /success/i, /completed/i, /submitted/i, /pending/i, /order/i];
-  const end = Date.now() + VERIFY_TIMEOUT_MS;
-  while (Date.now() < end) {
-    // Check text-based toasts
-    for (const re of patterns) {
-      const loc = page.getByText(re).first();
-      if (await loc.isVisible().catch(()=>false)) {
-        const txt = (await loc.textContent().catch(()=>""))?.trim().slice(0,120)||"";
-        // Skip generic "order" matches that are just page labels
-        if (txt.length > 2 && txt.length < 100) {
-          return { ok:true, type:"toast", detail:txt };
+  if (!mobile) {
+    /* PC: click Futures in the top nav */
+    console.log("PC: Looking for Futures nav item...");
+    try {
+      // The nav items are spans/divs inside the header with class selectors
+      const futuresNav = page.locator(
+        '.header span:has-text("Futures"), .header div:has-text("Futures")'
+      ).first();
+      if (await futuresNav.isVisible({ timeout: 5000 }).catch(() => false)) {
+        console.log("PC: Clicked Futures nav popover");
+        await futuresNav.click();
+        await sleep(1500);
+
+        // Click "Futures" in the dropdown popover
+        const dd = page.locator(
+          '.lang-item:has-text("Futures"), .el-popover .lang-item:has-text("Futures")'
+        ).first();
+        if (await dd.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await dd.click();
+          await sleep(2000);
         }
       }
-    }
-    // Check for the successDialog-page visibility (has two images, success one shown when visible)
-    const successVisible = await page.evaluate(() => {
-      const dlg = document.querySelector('.successDialog-page');
-      if (!dlg) return false;
-      const style = dlg.getAttribute('style')||'';
-      return !style.includes('display: none') && !style.includes('display:none');
-    }).catch(()=>false);
-    if (successVisible) return { ok:true, type:"success_dialog", detail:"successDialog visible" };
-
-    // Check for el-message or notification visible
-    const msgVisible = await page.evaluate(() => {
-      const msgs = document.querySelectorAll('.el-message, .el-notification, .el-message-box');
-      return Array.from(msgs).some(m => {
-        const s = m.getAttribute('style')||'';
-        return !s.includes('display: none');
-      });
-    }).catch(()=>false);
-    if (msgVisible) {
-      const txt = await page.locator('.el-message, .el-notification').first().textContent().catch(()=>"el-msg");
-      return { ok:true, type:"el-message", detail:txt?.trim().slice(0,120)||"" };
+    } catch (e) {
+      console.log(`PC Futures nav error: ${e.message}`);
     }
 
-    await sleep(300);
-  }
-  return { ok:false, type:"toast_timeout" };
-}
-
-async function verifyPending(page) {
-  if (!VERIFY_PENDING) return { ok:false, type:"pending_off" };
-  // Click "Position order" tab if visible
-  const posTab = page.getByText(/position\s*order/i).first();
-  if (await posTab.isVisible().catch(()=>false)) {
-    await posTab.click({ timeout:5000 }).catch(()=>null);
-    await sleep(800);
-  }
-  const end = Date.now() + VERIFY_TIMEOUT_MS;
-  while (Date.now() < end) {
-    if (await page.getByText(/pending/i).first().isVisible().catch(()=>false)) return { ok:true, type:"pending" };
-    await sleep(350);
-  }
-  return { ok:false, type:"pending_timeout" };
-}
-
-async function verifyOrder(page) {
-  const [t, p] = await Promise.all([waitForToast(page), verifyPending(page)]);
-  if (t.ok) return { ok:true, detail:`toast: ${t.detail||t.type}` };
-  if (p.ok) return { ok:true, detail:"pending seen" };
-  return { ok:false, detail:`toast=${t.type}, pending=${p.type}` };
-}
-
-// ── Main flow ─────────────────────────────────────────────────────────────────
-async function runFlow(page, loginUrl, orderCode) {
-  const mobile = shouldUseMobile(loginUrl);
-  console.log(`runFlow: mobile=${mobile}, loginUrl=${loginUrl}`);
-
-  // Step 1: Navigate to Futures
-  if (mobile) {
-    await gotoFuturesMobile(page);
+    // Always also direct-navigate to be safe
+    const txUrl = `${base}/pc/#/contractTransaction`;
+    console.log(`Navigating directly to: ${txUrl}`);
+    await page.goto(txUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
   } else {
-    await gotoFuturesPC(page);
+    /* Mobile: direct navigate */
+    const txUrl = `${base}/h5/#/contractTransaction`;
+    console.log(`Navigating directly to: ${txUrl}`);
+    await page.goto(txUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
   }
 
-  // Step 2: Always try the direct contractTransaction URL (reliable)
-  const directUrl = futuresUrlFrom(loginUrl);
-  if (directUrl) {
-    console.log("Navigating directly to:", directUrl);
-    await page.goto(directUrl, { waitUntil:"domcontentloaded", timeout:60000 }).catch(()=>null);
-    await sleep(WAIT_AFTER_FUTURES_DIRECT_MS);
-    await closeOverlays(page);
+  await sleep(4000);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   CLICK "INVITED ME" TAB
+   ═══════════════════════════════════════════════════════════════════ */
+async function clickInvitedMe(page) {
+  const selectors = [
+    'div.title:has-text("invited me")',
+    'div:text-is(" invited me ")',
+    ':text("invited me")',
+  ];
+
+  for (const sel of selectors) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await el.click();
+        console.log("Clicked 'Invited me'");
+        await sleep(2000);
+        return true;
+      }
+    } catch {}
   }
 
-  await dumpStep(page, "after-futures-nav", { directUrl, mobile });
+  // Last resort: JS click
+  const clicked = await page.evaluate(() => {
+    const divs = [...document.querySelectorAll("div.title, div")];
+    const target = divs.find(
+      (d) => d.textContent.trim().toLowerCase() === "invited me"
+    );
+    if (target) { target.click(); return true; }
+    return false;
+  });
 
-  // Safety check: not kicked back to login
-  const urlNow = page.url()||"";
-  if (isOnLoginPage(urlNow) || await loginFieldsVisible(page)) {
-    return { ok:false, reason:"kicked_to_login" };
+  if (clicked) {
+    console.log("Clicked 'Invited me' (via JS)");
+    await sleep(2000);
+    return true;
   }
 
-  // Step 3: Click "Invited me"
-  const invitedOk = await clickInvitedMe(page);
-  await dumpStep(page, "after-invited-me", { invitedOk });
+  console.log("WARNING: 'Invited me' tab not found");
+  return false;
+}
 
-  // Safety check again
-  const urlNow2 = page.url()||"";
-  if (isOnLoginPage(urlNow2) || await loginFieldsVisible(page)) {
-    return { ok:false, reason:"kicked_to_login_after_invited" };
+/* ═══════════════════════════════════════════════════════════════════
+   FILL CODE & CLICK CONFIRM  —  THE CRITICAL SECTION
+   ═══════════════════════════════════════════════════════════════════ */
+async function fillCodeAndConfirm(page, code) {
+  /* ── 1. Find the order code input ────────────────────────────── */
+  const inputSelectors = [
+    ".follow-input .el-input__inner",
+    'input[placeholder*="order code" i]',
+    'input[placeholder*="enter the order" i]',
+  ];
+
+  let input = null;
+  for (const sel of inputSelectors) {
+    const loc = page.locator(sel).first();
+    if (await loc.isVisible({ timeout: 3000 }).catch(() => false)) {
+      input = loc;
+      break;
+    }
   }
 
-  // Step 4: Find order code input
-  const codeRes = await findVisible(page, ORDER_CODE_SEL, 15000);
-  if (!codeRes.ok) {
-    await dumpStep(page, "code-box-missing", {});
-    return { ok:false, reason:"code_box_missing" };
+  if (!input) {
+    console.log("ERROR: Order code input not found");
+    await snap(page, "no_code_input");
+    return { success: false, reason: "input_not_found" };
   }
 
-  const codeBox = codeRes.locator;
-  await codeBox.scrollIntoViewIfNeeded().catch(()=>null);
-  await codeBox.click({ timeout:5000 }).catch(()=>null);
-  await sleep(300);
+  /* ── 2. Fill the code using pressSequentially (Vue-compatible) ─ */
+  const filled = await vueType(page, input, code);
+  const actualVal = await input.inputValue().catch(() => "");
+  console.log(`Code filled: "${actualVal}" (expected length ${CODE_LENGTH})`);
 
-  // Clear and type code with real keyboard events
-  await codeBox.fill('').catch(()=>null);
-  await codeBox.pressSequentially(String(orderCode), { delay: 50 }).catch(()=>null);
-  await sleep(300);
+  if (!filled && actualVal !== code) {
+    console.log("ERROR: Could not fill code into input");
+    await snap(page, "fill_failed");
+    return { success: false, reason: "fill_failed" };
+  }
 
-  const filled = await codeBox.inputValue().catch(()=>"");
-  console.log(`Code filled: "${filled}" (expected length ${String(orderCode).length})`);
-  await dumpStep(page, "after-code-fill", { filled });
+  /* ── 3. Find the Confirm button ──────────────────────────────── */
+  // From the HTML: <button class="el-button el-button--default el-button--mini">
+  // inside <div class="el-input-group__append">
+  const btnSelectors = [
+    ".follow-input .el-input-group__append button",
+    ".el-input-group__append .el-button",
+    ".el-input-group__append button",
+    'button:has-text("Confirm")',
+  ];
 
-  // Step 5 & 6: Vue-aware confirm with diagnostics + direct method call
-  // The button click silently fails because the parent Vue component's data property
-  // (e.g. followCode) isn't being set - only el-input's internal currentValue is.
-  // Strategy: walk up the Vue component tree, find the parent with the order code
-  // data property, set it directly, call the confirm method, AND click the button.
-  let lastVerify = null;
+  let confirmBtn = null;
+  let confirmSel = "";
+  for (const sel of btnSelectors) {
+    const loc = page.locator(sel).first();
+    if (await loc.isVisible({ timeout: 2000 }).catch(() => false)) {
+      confirmBtn = loc;
+      confirmSel = sel;
+      break;
+    }
+  }
 
+  const jsFound = await page.evaluate(() => {
+    return !!(
+      document.querySelector(".follow-input .el-input-group__append button") ||
+      document.querySelector(".el-input-group__append .el-button")
+    );
+  });
+
+  console.log(`confirmBtn found: ${!!confirmBtn} (sel=${confirmSel || "none"}), jsFound: ${jsFound}`);
+
+  /* ── 4. Click Confirm with retries ───────────────────────────── */
   for (let i = 1; i <= CONFIRM_RETRIES; i++) {
     console.log(`Confirm click attempt ${i}`);
 
-    const diag = await page.evaluate((code) => {
-      const input = document.querySelector('.follow-input input') ||
-                    document.querySelector('input[placeholder*="order"]') ||
-                    document.querySelector('.action-box input');
-      const button = document.querySelector('.follow-input .el-input-group__append button') ||
-                     Array.from(document.querySelectorAll('button'))
-                       .find(b => b.textContent.trim().toLowerCase() === 'confirm');
+    // Before each click, re-ensure Vue has the value
+    // (Vue might have cleared it or an earlier click attempt might have reset state)
+    await page.evaluate((val) => {
+      const el =
+        document.querySelector(".follow-input .el-input__inner") ||
+        document.querySelector('input[placeholder*="order code"]');
+      if (!el) return;
+      if (el.value === val) return; // already good
 
-      if (!input) return { error: 'no_input' };
-      if (!button) return { error: 'no_button' };
+      const set = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype, "value"
+      ).set;
+      set.call(el, val);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }, code);
 
-      // ── 1. Set native value ──────────────────────────────────────────────────
-      const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-      if (nativeSetter) nativeSetter.call(input, code);
-      else input.value = code;
+    await sleep(200);
 
-      // ── 2. Walk Vue instance chain, collect info + set data ────────────────
-      const vueChain = [];
-      const dataSet = [];
-      const methodsCalled = [];
-      const CODE_PROPS = ['followCode','orderCode','code','inviteCode','copyCode',
-                          'tradeCode','followOrderCode','inputCode','codeValue',
-                          'followInputCode','inputValue','confirmCode','joinCode',
-                          'applyCode','number','num','val'];
-      const CONFIRM_METHODS = /confirm|follow|join|submit|apply|order|copy|bind/i;
+    // Strategy A: Playwright click with force
+    if (confirmBtn) {
+      try {
+        await confirmBtn.click({ force: true, timeout: 1500 });
+      } catch {}
+    }
+    await sleep(300);
 
-      let el = input;
-      while (el && el !== document.body) {
-        if (el.__vue__) {
-          const vm = el.__vue__;
-          const dataKeys = Object.keys(vm.$data || {});
-          const methodNames = Object.keys(vm.$options?.methods || {});
-
-          vueChain.push({ tag: el.tagName, cls: (el.className||'').slice(0,50), dataKeys, methodNames });
-
-          // Set currentValue on el-input component
-          if ('currentValue' in vm) { vm.currentValue = code; dataSet.push('vm.currentValue'); }
-
-          // Trigger el-input's internal handler so it emits 'input' to parent
-          if (typeof vm.handleInput === 'function') {
-            try { vm.handleInput({ target: { value: code } }); methodsCalled.push('vm.handleInput'); } catch(e) {}
-          }
-
-          // Emit directly from this component level
-          try { vm.$emit('input', code); } catch(e) {}
-          try { vm.$emit('change', code); } catch(e) {}
-
-          // Check THIS component's data for code props
-          const thisData = vm.$data || {};
-          for (const prop of CODE_PROPS) {
-            if (prop in thisData) {
-              thisData[prop] = code;
-              try { vm.$set(vm, prop, code); } catch(e) {}
-              dataSet.push(`vm.${prop}`);
-            }
-          }
-
-          // ── Walk parent chain ────────────────────────────────────────────────
-          let pvm = vm.$parent;
-          let depth = 0;
-          while (pvm && depth < 8) {
-            const pdata = pvm.$data || {};
-            const pkeys = Object.keys(pdata);
-            const pmethods = Object.keys(pvm.$options?.methods || {});
-
-            // Set any code-like data property on parent
-            for (const prop of CODE_PROPS) {
-              if (prop in pdata) {
-                pdata[prop] = code;
-                try { pvm.$set(pvm, prop, code); } catch(e) {}
-                dataSet.push(`parent${depth}.${prop}`);
-              }
-            }
-
-            // Emit input on parent too
-            try { pvm.$emit('input', code); } catch(e) {}
-            try { pvm.$emit('change', code); } catch(e) {}
-
-            // Call any confirm-like method on parent
-            for (const mName of pmethods.filter(m => CONFIRM_METHODS.test(m))) {
-              try {
-                pvm[mName]();
-                methodsCalled.push(`parent${depth}.${mName}()`);
-              } catch(e) {}
-            }
-
-            pvm = pvm.$parent;
-            depth++;
-          }
-
-          break; // found first Vue instance in chain, done
-        }
-        el = el.parentElement;
+    // Strategy B: JavaScript click + MouseEvent dispatch
+    await page.evaluate(() => {
+      const btn =
+        document.querySelector(".follow-input .el-input-group__append button") ||
+        document.querySelector(".el-input-group__append .el-button");
+      if (btn) {
+        btn.click();
+        btn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
       }
+    });
+    await sleep(300);
 
-      // ── 3. Fire DOM events ───────────────────────────────────────────────────
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      input.dispatchEvent(new Event('change', { bubbles: true }));
+    // Strategy C: Press Enter on the input
+    try { await input.press("Enter"); } catch {}
 
-      // ── 4. Focus + blur cycle (finalizes v-model.lazy) ─────────────────────
-      input.focus();
-      input.dispatchEvent(new FocusEvent('focus', { bubbles: true }));
-      // small delay via nested requestAnimationFrame so Vue can process
-      return new Promise((resolve) => {
-        requestAnimationFrame(() => {
-          input.blur();
-          input.dispatchEvent(new FocusEvent('blur', { bubbles: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true }));
+    // Wait for the site to respond
+    await sleep(2500);
 
-          requestAnimationFrame(() => {
-            // ── 5. Click the button natively ──────────────────────────────────
-            button.dispatchEvent(new MouseEvent('mousedown', { bubbles:true, cancelable:true }));
-            button.dispatchEvent(new MouseEvent('mouseup',   { bubbles:true, cancelable:true }));
-            button.click();
-            button.dispatchEvent(new MouseEvent('click', { bubbles:true, cancelable:true }));
-
-            resolve({
-              vueChain,
-              dataSet,
-              methodsCalled,
-              inputValue: input.value,
-              buttonText: button.textContent?.trim(),
-            });
-          });
-        });
-      });
-    }, String(orderCode)).catch(e => ({ error: String(e).slice(0,100) }));
-
-    if (i === 1) {
-      // Log diagnostics on first attempt so we can see Vue structure
-      console.log('VUE_DIAG:', JSON.stringify(diag));
-    } else {
-      console.log(`  methodsCalled: ${JSON.stringify(diag?.methodsCalled)}, dataSet: ${JSON.stringify(diag?.dataSet)}`);
+    // Check for any response (toast, dialog, notification)
+    const resp = await detectResponse(page);
+    if (resp.found) {
+      console.log(`${resp.isSuccess ? "✓" : "✗"} Response: "${resp.text}"`);
+      await snap(page, resp.isSuccess ? "success" : "response");
+      return { success: resp.isSuccess, reason: resp.text };
     }
-
-    await sleep(400);
-
-    // Also try Playwright's own click (in case JS click didn't penetrate)
-    const confirmBtn = page.locator('.follow-input .el-input-group__append button').first();
-    const vis = await confirmBtn.isVisible().catch(()=>false);
-    if (vis) {
-      await confirmBtn.scrollIntoViewIfNeeded().catch(()=>null);
-      await confirmBtn.click({ force: true, timeout: 3000 }).catch(()=>null);
-    }
-
-    // Also try Enter key
-    await codeBox.press('Enter').catch(()=>null);
-
-    await sleep(CONFIRM_WAIT_MS);
-    await dumpStep(page, `after-confirm-${i}`, {});
-
-    const v = await verifyOrder(page);
-    lastVerify = v;
-    if (v.ok) {
-      console.log("✓ Order confirmed:", v.detail);
-      return { ok:true, detail:v.detail };
-    }
-    console.log(`  verify: ${JSON.stringify(v)}`);
-
-    await sleep(CONFIRM_RETRY_DELAY_MS);
   }
 
-  return { ok:false, reason:"verify_failed", detail:lastVerify?.detail||"" };
+  // All retries exhausted
+  await snap(page, "verify_failed");
+  return {
+    success: false,
+    reason: "verify_failed",
+    toast: "toast_off",
+    pending: "pending_off",
+  };
 }
 
-// ── Per-account runner ────────────────────────────────────────────────────────
-async function runAccountOnUrl(account, orderCode, loginUrl) {
-  const mobile = shouldUseMobile(loginUrl);
+/* ═══════════════════════════════════════════════════════════════════
+   DETECT RESPONSE (toast / dialog / notification)
+
+   The site uses a custom ".successDialog-page" that shows/hides.
+   It also might use Element UI's el-message or el-notification.
+   ═══════════════════════════════════════════════════════════════════ */
+async function detectResponse(page) {
+  // 1. Check the site's custom success/error dialog
+  //    HTML: <div class="successDialog-page" style="display: none;">
+  //          becomes visible when the API responds
+  const dialogInfo = await page.evaluate(() => {
+    const d = document.querySelector(".successDialog-page");
+    if (!d) return { visible: false, text: "" };
+
+    const style = window.getComputedStyle(d);
+    if (style.display === "none" || style.visibility === "hidden") {
+      return { visible: false, text: "" };
+    }
+
+    const txt = (d.querySelector(".content-text")?.textContent || "").trim();
+    return { visible: true, text: txt };
+  });
+
+  if (dialogInfo.visible && dialogInfo.text) {
+    const t = dialogInfo.text.toLowerCase();
+    return {
+      found: true,
+      text: dialogInfo.text,
+      isSuccess:
+        t.includes("success") ||
+        t.includes("follow") ||
+        t.includes("已跟单") ||
+        (!t.includes("invalid") && !t.includes("error") && !t.includes("fail")),
+    };
+  }
+
+  // If dialog is visible but no text, still count it (e.g. "Invalid parameter")
+  if (dialogInfo.visible) {
+    // Try to get ALL text from the dialog
+    const allText = await page
+      .locator(".successDialog-page")
+      .textContent()
+      .catch(() => "");
+    if (allText.trim()) {
+      const t = allText.trim().toLowerCase();
+      return {
+        found: true,
+        text: allText.trim(),
+        isSuccess: t.includes("success") || t.includes("follow"),
+      };
+    }
+    // Dialog visible but truly empty — might still be a response
+    return { found: true, text: "(dialog shown, no text)", isSuccess: false };
+  }
+
+  // 2. Check Element UI messages / notifications
+  for (const sel of [".el-message", ".el-notification", ".el-message-box__wrapper"]) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 400 }).catch(() => false)) {
+        const text = (await el.textContent().catch(() => "")).trim();
+        if (text) {
+          const t = text.toLowerCase();
+          return {
+            found: true,
+            text,
+            isSuccess: t.includes("success") || t.includes("follow"),
+          };
+        }
+      }
+    } catch {}
+  }
+
+  // 3. Check for any visible el-dialog that wasn't there before
+  const dialogText = await page.evaluate(() => {
+    const wrappers = document.querySelectorAll(".el-dialog__wrapper");
+    for (const w of wrappers) {
+      if (w.style.display === "none") continue;
+      const dlg = w.querySelector(".el-dialog");
+      if (!dlg) continue;
+      // Check if it has non-trivial visible content
+      const rect = dlg.getBoundingClientRect();
+      if (rect.height < 10) continue;
+      const txt = dlg.textContent?.trim() || "";
+      // Filter out the always-present dialogs (rules, covering positions, etc.)
+      if (txt && txt.length > 2 && txt.length < 500) {
+        if (
+          txt.toLowerCase().includes("invalid") ||
+          txt.toLowerCase().includes("success") ||
+          txt.toLowerCase().includes("follow") ||
+          txt.toLowerCase().includes("error") ||
+          txt.toLowerCase().includes("parameter") ||
+          txt.toLowerCase().includes("已跟")
+        ) {
+          return txt;
+        }
+      }
+    }
+    return null;
+  });
+
+  if (dialogText) {
+    const t = dialogText.toLowerCase();
+    return {
+      found: true,
+      text: dialogText.substring(0, 200),
+      isSuccess: t.includes("success") || t.includes("follow") || t.includes("已跟"),
+    };
+  }
+
+  return { found: false };
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   RUN ONE ACCOUNT
+   ═══════════════════════════════════════════════════════════════════ */
+async function runAccount(browser, user, pass, code) {
+  for (const loginUrl of LOGIN_URLS) {
+    console.log(`--- Trying ${loginUrl} for ${user} ---`);
+
+    const mobile = isMobile(loginUrl);
+    const ctx = await browser.newContext({
+      viewport: mobile
+        ? { width: 375, height: 812 }
+        : { width: 1440, height: 900 },
+      userAgent: mobile
+        ? "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+        : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    });
+
+    const page = await ctx.newPage();
+
+    // Log network/page errors for debugging
+    page.on("pageerror", (e) => console.log(`PAGE ERROR: ${e.message}`));
+    page.on("requestfailed", (r) => {
+      const u = r.url();
+      if (!u.includes("favicon") && !u.includes("beacon"))
+        console.log(`REQ FAILED: ${u} => ${r.failure()?.errorText || "unknown"}`);
+    });
+
+    try {
+      /* ── Login ──────────────────────────────────────────────── */
+      const loggedIn = await login(page, loginUrl, user, pass);
+      if (!loggedIn) {
+        await snap(page, `login_fail_${user.split("@")[0]}`);
+        await ctx.close();
+        continue; // try next URL
+      }
+
+      /* ── Navigate to contract page ─────────────────────────── */
+      console.log(`runFlow: mobile=${mobile}, loginUrl=${loginUrl}`);
+      await goToContractPage(page, loginUrl);
+
+      /* ── Click "Invited me" ────────────────────────────────── */
+      await clickInvitedMe(page);
+
+      /* ── Fill code & confirm ───────────────────────────────── */
+      const result = await fillCodeAndConfirm(page, code);
+
+      await ctx.close();
+
+      if (result.success) {
+        return { user, url: loginUrl, success: true, reason: result.reason };
+      }
+
+      // Log failure details
+      const failMsg = `Flow failed: ${result.reason} | toast=${result.toast || "n/a"}, pending=${result.pending || "n/a"}`;
+      console.log(`✗ FAILED: ${loginUrl} for ${user}: ${failMsg}`);
+      console.log(`FAIL: ${failMsg} | URL: ${loginUrl}`);
+
+      // Don't try other URLs — the flow got far enough that login works,
+      // the issue is the code/confirm, which will be the same on any URL
+      return { user, success: false, reason: failMsg };
+    } catch (e) {
+      console.log(`ERROR: ${e.message}`);
+      await snap(page, `error_${user.split("@")[0]}`);
+      await ctx.close();
+    }
+  }
+
+  return { user, success: false, reason: "all_urls_failed" };
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   MAIN BOT RUN
+   ═══════════════════════════════════════════════════════════════════ */
+let running = false;
+
+async function runBot(code) {
+  if (running) {
+    console.log("Already running, skipping");
+    return { error: "already_running" };
+  }
+  running = true;
+
+  const runId = crypto.randomBytes(6).toString("hex");
+  const ts = new Date().toISOString();
+
+  console.log(`====== BOT RUN ${runId} ======`);
+  console.log(`Started: ${ts}`);
+  console.log(`Accounts: ${ACCOUNTS.length}`);
+  console.log(`Login URLs: ${LOGIN_URLS.join(", ")}`);
+  console.log(`Force mobile: ${FORCE_MOBILE}`);
+  console.log(`Code length: ${CODE_LENGTH}`);
+
+  cleanDebug();
+  await notify(
+    `T-Bot | Run ${runId} started`,
+    `${ts}\nAccounts: ${ACCOUNTS.length}\nCode length: ${code.length}`
+  );
+
+  const results = [];
   const browser = await chromium.launch({
     headless: true,
-    args: ["--no-sandbox","--disable-dev-shm-usage","--disable-gpu"]
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+    ],
   });
-
-  const context = await browser.newContext({
-    viewport: mobile ? { width:390, height:844 } : { width:1280, height:720 },
-    locale: "en-US",
-    isMobile: mobile,
-    hasTouch: mobile,
-    userAgent: mobile
-      ? "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-      : undefined
-  });
-
-  const page = await context.newPage();
-
-  page.on("requestfailed", req => {
-    if (req.url().includes("/api/")) {
-      console.log("REQ FAILED:", req.url(), "=>", req.failure()?.errorText||"?");
-    }
-  });
-  page.on("pageerror", err => console.log("PAGE ERROR:", err?.message||String(err)));
 
   try {
-    // Step A: Login
-    const loggedIn = await login(page, account, loginUrl);
-    if (!loggedIn) {
-      await captureFailure(page, `${sanitizeFilename(account.username)}-login-failed`, "Login failed");
-      throw new Error("Login failed (stayed on login page)");
-    }
-
-    // Step B: Run main flow, retry once if kicked to login
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      const res = await runFlow(page, loginUrl, orderCode);
-      if (res.ok) return res.detail || "ok";
-
-      if (res.reason === "kicked_to_login" && attempt === 1) {
-        console.log("Kicked to login mid-flow, re-logging in...");
-        const relog = await login(page, account, loginUrl);
-        if (!relog) break;
-        continue;
+    for (const { user, pass } of ACCOUNTS) {
+      console.log(`\n====== Account: ${user} ======`);
+      const r = await runAccount(browser, user, pass, code);
+      results.push(r);
+      if (r.success) {
+        console.log(`✓ SUCCESS: ${r.url} for ${user}: ${r.reason}`);
       }
-
-      await captureFailure(page, `${sanitizeFilename(account.username)}-flow-failed`,
-        `Flow failed: ${res.reason}${res.detail ? ` | ${res.detail}` : ""}`);
-      throw new Error(`Flow failed: ${res.reason}${res.detail ? ` | ${res.detail}` : ""}`);
     }
-
-    throw new Error("Flow failed after retry");
   } finally {
-    await context.close().catch(()=>null);
-    await browser.close().catch(()=>null);
+    await browser.close();
+    running = false;
   }
+
+  const okCount   = results.filter((r) => r.success).length;
+  const failCount = results.filter((r) => !r.success).length;
+  console.log(`\n====== RUN ${runId} COMPLETE: ${okCount} ok, ${failCount} fail ======`);
+
+  const summary = results
+    .map((r) => `${r.user}: ${r.success ? "✓" : "✗"} ${r.reason || ""}`)
+    .join("\n");
+
+  await notify(
+    `T-Bot | Run ${runId} ${failCount ? `✗ ${failCount} failed` : "✓ ALL OK"}`,
+    summary
+  );
+
+  return { runId, results, okCount, failCount };
 }
 
-async function runAccountAllUrls(account, orderCode, urls) {
-  let lastErr = null;
-  for (const loginUrl of urls) {
-    console.log(`\n--- Trying ${loginUrl} for ${account.username} ---`);
-    try {
-      const note = await runAccountOnUrl(account, orderCode, loginUrl);
-      console.log(`✓ SUCCESS: ${account.username} on ${loginUrl} | ${note}`);
-      return { ok:true, site:loginUrl, note };
-    } catch(e) {
-      console.log(`✗ FAILED: ${loginUrl} for ${account.username}: ${e?.message||String(e)}`);
-      lastErr = e;
-    }
-  }
-  return { ok:false, error:lastErr?.message||"All URLs failed" };
-}
-
-// ── Express app ───────────────────────────────────────────────────────────────
+/* ═══════════════════════════════════════════════════════════════════
+   EXPRESS SERVER
+   ═══════════════════════════════════════════════════════════════════ */
 const app = express();
-app.use(express.urlencoded({ extended:true }));
 app.use(express.json());
 
-app.get("/", (req, res) => {
-  const cfg = parseAccounts();
-  res.setHeader("Content-Type","text/html; charset=utf-8");
-  res.send(`
-    <h2>T-Bot</h2>
-    <p>Running: <b>${isRunning ? "YES" : "NO"}</b></p>
-    <p>Last run: ${lastRunAt ? escapeHtml(lastRunAt) : "-"}</p>
-    <p>Last error: ${lastError ? escapeHtml(lastError) : "-"}</p>
-    <p>Accounts: ${cfg.ok ? cfg.accounts.length : "ERROR: "+escapeHtml(cfg.error||"")}</p>
-    <p>Login URLs: <code>${escapeHtml(LOGIN_URLS.join(", "))}</code></p>
-    <p>Email configured: <b>${emailConfigured() ? "YES" : "NO"}</b></p>
-    <hr/>
-    <form method="POST" action="/run">
-      <input name="p" type="password" placeholder="Password" required /><br/><br/>
-      <input name="code" placeholder="Order code" required style="width:300px"/><br/><br/>
-      <button type="submit">Run Bot</button>
-    </form>
-    <p>
-      <a href="/health">/health</a> |
-      <a href="/last-shot?p=${encodeURIComponent(BOT_PASSWORD||"")}">/last-shot</a> |
-      <a href="/debug?p=${encodeURIComponent(BOT_PASSWORD||"")}">/debug</a> |
-      <a href="/email-test?p=${encodeURIComponent(BOT_PASSWORD||"")}">/email-test</a>
-    </p>
-  `);
+function auth(req) {
+  if (!PASSWORD) return true;
+  return (req.query.p || req.body?.p || "") === PASSWORD;
+}
+
+/* Health check */
+app.get("/", (_req, res) => {
+  res.json({ status: "ok", accounts: ACCOUNTS.length, urls: LOGIN_URLS.length });
 });
 
-app.get("/health", (req, res) => {
-  const cfg = parseAccounts();
-  res.json({
-    ok: true, running: isRunning, lastRun: lastRunAt, lastError,
-    config: {
-      botPasswordSet: !!BOT_PASSWORD,
-      accountsOk: cfg.ok, accountsCount: cfg.ok ? cfg.accounts.length : 0,
-      loginUrls: LOGIN_URLS,
-      forceMobile: FORCE_MOBILE_MODE,
-      email: { configured: emailConfigured(), from: parseFromEmail(EMAIL_FROM_RAW), to: EMAIL_TO }
-    }
-  });
+/* Trigger a bot run */
+app.all("/run", async (req, res) => {
+  if (!auth(req)) return res.status(401).json({ error: "unauthorized" });
+
+  const code = req.query.code || req.body?.code || ORDER_CODE;
+  if (!code) return res.status(400).json({ error: "no code — set ORDER_CODE env var or pass ?code=XXX" });
+
+  const rid = crypto.randomBytes(6).toString("hex");
+  res.json({ status: "started", runId: rid, codeLength: code.length });
+
+  // Run in background so the HTTP response returns immediately
+  runBot(code).catch((e) => console.error("Run error:", e));
 });
 
-app.get("/email-test", async (req, res) => {
-  if (!authOk(req)) return res.status(401).send("Unauthorized");
-  const r = await sendEmail("T-Bot | email test", `Test at ${nowLocal()}`);
-  res.json(r);
-});
-
-app.get("/last-shot", (req, res) => {
-  if (!authOk(req)) return res.status(401).send("Unauthorized");
-  const stable = "/app/last-shot.png";
-  const src = fs.existsSync(stable) ? stable : (lastShotPath && fs.existsSync(lastShotPath) ? lastShotPath : null);
-  if (!src) return res.send("No screenshot yet.");
-  res.setHeader("Content-Type","image/png");
-  fs.createReadStream(src).pipe(res);
-});
-
+/* Debug file list */
 app.get("/debug", (req, res) => {
-  if (!authOk(req)) return res.status(401).send("Unauthorized");
-  res.setHeader("Content-Type","text/html; charset=utf-8");
-  if (!lastDebugDir) return res.send("<h3>No debug dir yet. Run the bot once.</h3>");
-  const files = safeListDir(lastDebugDir);
-  const links = files.map(f =>
-    `<li><a href="/debug/files?p=${encodeURIComponent(BOT_PASSWORD)}&f=${encodeURIComponent(f)}">${escapeHtml(f)}</a></li>`
-  ).join("");
-  res.send(`<h3>Debug: ${escapeHtml(lastDebugDir)}</h3><ul>${links}</ul>`);
+  if (!auth(req)) return res.status(401).json({ error: "unauthorized" });
+
+  const files = fs.readdirSync(DEBUG_DIR).sort().reverse();
+  const p = req.query.p ? `?p=${encodeURIComponent(req.query.p)}` : "";
+  res.send(`<!DOCTYPE html>
+<html><body style="background:#111;color:#eee;font-family:monospace;padding:20px">
+<h2>Debug (${files.length} files)</h2>
+${files
+  .map(
+    (f) =>
+      `<a href="/debug/${f}${p}" style="color:#4fc3f7;display:block;margin:5px 0">${f}</a>`
+  )
+  .join("")}
+${files.length === 0 ? "<p>No debug files yet. Run the bot first.</p>" : ""}
+</body></html>`);
 });
 
-app.get("/debug/files", (req, res) => {
-  if (!authOk(req)) return res.status(401).send("Unauthorized");
-  const f = (req.query.f||"").toString();
-  if (!lastDebugDir || !f || f.includes("..") || f.includes("/")) return res.status(400).send("Bad request");
-  const full = path.resolve(lastDebugDir, f);
-  if (!full.startsWith(path.resolve(lastDebugDir))) return res.status(400).send("Bad path");
-  if (!fs.existsSync(full)) return res.status(404).send("Not found");
-  res.setHeader("Content-Type", full.endsWith(".png") ? "image/png" : "text/plain; charset=utf-8");
-  fs.createReadStream(full).pipe(res);
+/* Debug serve individual file */
+app.get("/debug/:file", (req, res) => {
+  if (!auth(req)) return res.status(401).json({ error: "unauthorized" });
+
+  const fp = path.join(DEBUG_DIR, path.basename(req.params.file));
+  if (!fs.existsSync(fp)) return res.status(404).send("Not found");
+
+  if (fp.endsWith(".png")) res.setHeader("Content-Type", "image/png");
+  else if (fp.endsWith(".html")) res.setHeader("Content-Type", "text/html");
+  else res.setHeader("Content-Type", "text/plain");
+
+  res.sendFile(fp);
 });
 
-app.post("/run", async (req, res) => {
-  const p    = (req.body.p    || "").toString();
-  const code = (req.body.code || "").toString().trim();
+/* Last screenshot shortcut */
+app.get("/last-shot", (req, res) => {
+  if (!auth(req)) return res.status(401).json({ error: "unauthorized" });
 
-  if (!BOT_PASSWORD) return res.status(500).send("BOT_PASSWORD not set.");
-  if (p !== BOT_PASSWORD) return res.status(401).send("Wrong password.");
-  if (!code) return res.status(400).send("No code provided.");
-  if (isRunning) return res.send("Bot is already running.");
+  const pngs = fs
+    .readdirSync(DEBUG_DIR)
+    .filter((f) => f.endsWith(".png"))
+    .sort()
+    .reverse();
 
-  const cfg = parseAccounts();
-  if (!cfg.ok) return res.status(500).send(cfg.error||"ACCOUNTS_JSON invalid.");
-
-  isRunning   = true;
-  lastError   = null;
-  lastRunAt   = nowLocal();
-  lastRunId   = crypto.randomBytes(6).toString("hex");
-  lastDebugDir= `/tmp/debug-${lastRunId}`;
-  ensureDir(lastDebugDir);
-  writePlaceholderShot();
-
-  res.setHeader("Content-Type","text/plain; charset=utf-8");
-  res.send(`Run ${lastRunId} started. Check /health and /debug for status.`);
-
-  (async () => {
-    const startedAt = nowLocal();
-    let failAlertsSent = 0;
-
-    console.log(`\n====== BOT RUN ${lastRunId} ======`);
-    console.log(`Started: ${startedAt}`);
-    console.log(`Accounts: ${cfg.accounts.length}`);
-    console.log(`Login URLs: ${LOGIN_URLS.join(", ")}`);
-    console.log(`Force mobile: ${FORCE_MOBILE_MODE}`);
-    console.log(`Code length: ${code.length}`);
-
-    try {
-      await sendEmail(
-        `T-Bot | Run ${lastRunId} started`,
-        `Started: ${startedAt}\nAccounts: ${cfg.accounts.length}\nURLs: ${LOGIN_URLS.length}\n`
-      );
-
-      const results = [];
-
-      for (const account of cfg.accounts) {
-        console.log(`\n====== Account: ${account.username} ======`);
-        const r = await runAccountAllUrls(account, code, LOGIN_URLS);
-        results.push({ username:account.username, ...r });
-
-        if (!r.ok) {
-          lastError = `${account.username}: ${r.error}`;
-          if (failAlertsSent < EMAIL_MAX_FAIL_ALERTS) {
-            failAlertsSent++;
-            await sendEmail(
-              `T-Bot | Run ${lastRunId} FAILED: ${account.username}`,
-              `Account: ${account.username}\nRun: ${lastRunId}\nTime: ${nowLocal()}\n\nError:\n${r.error}\n`
-            );
-          }
-        }
-      }
-
-      const finishedAt = nowLocal();
-      const okCount   = results.filter(x=>x.ok).length;
-      const failCount = results.length - okCount;
-
-      const summary = results.map(r =>
-        r.ok ? `✓ ${r.username} (${r.site}) - ${r.note||""}` : `✗ ${r.username} - ${r.error}`
-      ).join("\n");
-
-      console.log(`\n====== DONE: ${okCount} ok, ${failCount} failed ======`);
-      console.log(summary);
-
-      await sendEmail(
-        `T-Bot | Run ${lastRunId} finished (${okCount} ok, ${failCount} failed)`,
-        `Finished: ${finishedAt}\nRun: ${lastRunId}\n\n${summary}\n`
-      );
-    } catch(e) {
-      const msg = e?.message||String(e);
-      lastError = msg;
-      console.log("Run error:", msg);
-      await sendEmail(`T-Bot | Run ${lastRunId} CRASHED`, `Crashed: ${nowLocal()}\n\n${msg}\n`);
-    } finally {
-      isRunning = false;
-    }
-  })();
+  if (!pngs.length) return res.status(404).send("No screenshots yet");
+  res.setHeader("Content-Type", "image/png");
+  res.sendFile(path.join(DEBUG_DIR, pngs[0]));
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, "0.0.0.0", () => {
+/* ═══════════════════════════════════════════════════════════════════
+   START
+   ═══════════════════════════════════════════════════════════════════ */
+console.log(`Force mobile: ${FORCE_MOBILE}`);
+console.log(`Email configured: ${emailOk}`);
+
+app.listen(PORT, () => {
   console.log(`T-Bot listening on port ${PORT}`);
   console.log(`Login URLs: ${LOGIN_URLS.join(", ")}`);
-  console.log(`Force mobile: ${FORCE_MOBILE_MODE}`);
-  console.log(`Email configured: ${emailConfigured()}`);
-  writePlaceholderShot();
 });
