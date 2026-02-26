@@ -458,16 +458,42 @@ async function clickInvitedMe(page) {
 // ── Verification ──────────────────────────────────────────────────────────────
 async function waitForToast(page) {
   if (!VERIFY_TOAST) return { ok:false, type:"toast_off" };
-  const patterns = [/already\s*followed/i, /followed/i, /success/i, /completed/i, /submitted/i, /pending/i];
+  const patterns = [/already\s*followed/i, /followed/i, /success/i, /completed/i, /submitted/i, /pending/i, /order/i];
   const end = Date.now() + VERIFY_TIMEOUT_MS;
   while (Date.now() < end) {
+    // Check text-based toasts
     for (const re of patterns) {
       const loc = page.getByText(re).first();
       if (await loc.isVisible().catch(()=>false)) {
         const txt = (await loc.textContent().catch(()=>""))?.trim().slice(0,120)||"";
-        return { ok:true, type:"toast", detail:txt };
+        // Skip generic "order" matches that are just page labels
+        if (txt.length > 2 && txt.length < 100) {
+          return { ok:true, type:"toast", detail:txt };
+        }
       }
     }
+    // Check for the successDialog-page visibility (has two images, success one shown when visible)
+    const successVisible = await page.evaluate(() => {
+      const dlg = document.querySelector('.successDialog-page');
+      if (!dlg) return false;
+      const style = dlg.getAttribute('style')||'';
+      return !style.includes('display: none') && !style.includes('display:none');
+    }).catch(()=>false);
+    if (successVisible) return { ok:true, type:"success_dialog", detail:"successDialog visible" };
+
+    // Check for el-message or notification visible
+    const msgVisible = await page.evaluate(() => {
+      const msgs = document.querySelectorAll('.el-message, .el-notification, .el-message-box');
+      return Array.from(msgs).some(m => {
+        const s = m.getAttribute('style')||'';
+        return !s.includes('display: none');
+      });
+    }).catch(()=>false);
+    if (msgVisible) {
+      const txt = await page.locator('.el-message, .el-notification').first().textContent().catch(()=>"el-msg");
+      return { ok:true, type:"el-message", detail:txt?.trim().slice(0,120)||"" };
+    }
+
     await sleep(300);
   }
   return { ok:false, type:"toast_timeout" };
@@ -554,34 +580,57 @@ async function runFlow(page, loginUrl, orderCode) {
   await dumpStep(page, "after-code-fill", { filled });
 
   // Step 5: Click Confirm button
-  // The confirm button appears next to the order code input
-  // From HTML: the Confirm button is <button class="el-button el-button--default el-button--mini">
-  // inside a div.el-input-group__append, next to the order code input
-  const confirmCandidates = [
-    page.locator('.el-input-group__append button').first(),
-    page.locator('.el-button--mini').filter({ hasText:/confirm/i }).first(),
-    page.locator('.el-button').filter({ hasText:/confirm/i }).first(),
-    page.locator('.confirm-btn').first(),
-    page.getByRole("button", { name:/confirm/i }).first(),
-    page.locator('button:has-text("Confirm")').first(),
+  // From HTML: <button class="el-button el-button--default el-button--mini" text="">
+  // inside .follow-input .el-input-group__append
+  const confirmSelectors = [
+    '.follow-input .el-input-group__append button',
+    '.action-box .el-input-group__append button',
+    '.el-input-group__append button',
   ];
 
   let confirmBtn = null;
-  for (const c of confirmCandidates) {
-    if (await c.isVisible().catch(()=>false)) { confirmBtn = c; break; }
+  let confirmSel = null;
+  for (const sel of confirmSelectors) {
+    const loc = page.locator(sel).first();
+    const vis = await loc.isVisible().catch(()=>false);
+    if (vis) { confirmBtn = loc; confirmSel = sel; break; }
   }
 
-  if (!confirmBtn) {
+  // Also check JS-based search
+  const jsConfirmFound = await page.evaluate(() => {
+    const btns = Array.from(document.querySelectorAll('button'));
+    return btns.some(b => b.textContent.trim().toLowerCase() === 'confirm');
+  }).catch(()=>false);
+  console.log(`confirmBtn found: ${!!confirmBtn} (sel=${confirmSel}), jsFound: ${jsConfirmFound}`);
+
+  if (!confirmBtn && !jsConfirmFound) {
     await dumpStep(page, "confirm-btn-missing", {});
     return { ok:false, reason:"confirm_btn_missing" };
   }
 
-  // Step 6: Click confirm with retries
+  // Step 6: Click confirm with retries using multiple strategies
   let lastVerify = null;
   for (let i = 1; i <= CONFIRM_RETRIES; i++) {
     console.log(`Confirm click attempt ${i}`);
-    await confirmBtn.scrollIntoViewIfNeeded().catch(()=>null);
-    await confirmBtn.click({ timeout:8000 }).catch(()=>null);
+
+    // Strategy A: Playwright force-click
+    if (confirmBtn) {
+      await confirmBtn.scrollIntoViewIfNeeded().catch(()=>null);
+      await confirmBtn.click({ force: true, timeout:5000 }).catch(e => console.log('  A failed:', e.message?.slice(0,80)));
+    }
+    await sleep(300);
+
+    // Strategy B: JS dispatchEvent click
+    await page.evaluate(() => {
+      const btns = Array.from(document.querySelectorAll('button'));
+      const b = btns.find(b => b.textContent.trim().toLowerCase() === 'confirm');
+      if (b) b.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    }).catch(()=>null);
+    await sleep(300);
+
+    // Strategy C: Press Enter on the code input
+    await codeBox.press('Enter').catch(()=>null);
+
     await sleep(CONFIRM_WAIT_MS);
     await dumpStep(page, `after-confirm-${i}`, {});
 
