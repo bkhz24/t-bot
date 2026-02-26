@@ -571,160 +571,173 @@ async function runFlow(page, loginUrl, orderCode) {
   const codeBox = codeRes.locator;
   await codeBox.scrollIntoViewIfNeeded().catch(()=>null);
   await codeBox.click({ timeout:5000 }).catch(()=>null);
-  await sleep(200);
-
-  // IMPORTANT: fill() sets DOM value but bypasses Vue's v-model event listeners.
-  // We must use pressSequentially() to fire real keydown/keypress/input/keyup events
-  // so Vue's reactive state actually receives the value.
-  await codeBox.fill('').catch(()=>null); // clear first
-  await codeBox.pressSequentially(String(orderCode), { delay: 40 }).catch(async () => {
-    // Fallback: use evaluate to set value via native setter + dispatch input event
-    await page.evaluate((code) => {
-      const sel = '.follow-input input, .action-box input[type="text"], .el-input-group__prepend ~ input, .el-input-group input';
-      const input = document.querySelector(sel) || document.querySelector('input[placeholder*="order"]');
-      if (input) {
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-        if (setter) setter.call(input, code);
-        else input.value = code;
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-    }, String(orderCode)).catch(()=>null);
-  });
   await sleep(300);
 
-  // CRITICAL FIX: After typing, blur the input so Vue's v-model finalizes.
-  // ElementUI's el-input requires blur to commit the value to the component.
-  // Also use Vue's __vue__ instance to set the value directly on the component.
-  await page.evaluate((code) => {
-    const input = document.querySelector('.follow-input input') ||
-                  document.querySelector('input[placeholder*="order"]');
-    if (!input) return;
-
-    // 1. Set native value via prototype setter
-    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-    if (setter) setter.call(input, code);
-    else input.value = code;
-
-    // 2. Fire all Vue/ElementUI reactive events
-    ['input', 'change'].forEach(type => {
-      input.dispatchEvent(new Event(type, { bubbles: true }));
-    });
-
-    // 3. Use Vue __vue__ instance to set value directly on component
-    // Walk up the DOM to find the el-input Vue component
-    let el = input;
-    while (el) {
-      if (el.__vue__) {
-        const vm = el.__vue__;
-        // ElInput stores value in vm.currentValue or vm.value
-        if ('currentValue' in vm) vm.currentValue = code;
-        if (typeof vm.handleInput === 'function') {
-          // Simulate the input handler with a fake event
-          try { vm.handleInput({ target: { value: code } }); } catch(e) {}
-        }
-        // Emit up to parent component (the one with v-model)
-        vm.$emit('input', code);
-        // Also try parent
-        if (vm.$parent) {
-          vm.$parent.$emit('input', code);
-          if ('currentValue' in vm.$parent) vm.$parent.currentValue = code;
-        }
-        break;
-      }
-      el = el.parentElement;
-    }
-
-    // 4. Blur to finalize (this is key for ElementUI v-model)
-    input.dispatchEvent(new FocusEvent('blur', { bubbles: true }));
-    input.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
-    input.blur();
-  }, String(orderCode)).catch(()=>null);
-  await sleep(400);
+  // Clear and type code with real keyboard events
+  await codeBox.fill('').catch(()=>null);
+  await codeBox.pressSequentially(String(orderCode), { delay: 50 }).catch(()=>null);
+  await sleep(300);
 
   const filled = await codeBox.inputValue().catch(()=>"");
   console.log(`Code filled: "${filled}" (expected length ${String(orderCode).length})`);
   await dumpStep(page, "after-code-fill", { filled });
 
-  // Step 5: Click Confirm button
-  // From HTML: <button class="el-button el-button--default el-button--mini" text="">
-  // inside .follow-input .el-input-group__append
-  const confirmSelectors = [
-    '.follow-input .el-input-group__append button',
-    '.action-box .el-input-group__append button',
-    '.el-input-group__append button',
-  ];
-
-  let confirmBtn = null;
-  let confirmSel = null;
-  for (const sel of confirmSelectors) {
-    const loc = page.locator(sel).first();
-    const vis = await loc.isVisible().catch(()=>false);
-    if (vis) { confirmBtn = loc; confirmSel = sel; break; }
-  }
-
-  // Also check JS-based search
-  const jsConfirmFound = await page.evaluate(() => {
-    const btns = Array.from(document.querySelectorAll('button'));
-    return btns.some(b => b.textContent.trim().toLowerCase() === 'confirm');
-  }).catch(()=>false);
-  console.log(`confirmBtn found: ${!!confirmBtn} (sel=${confirmSel}), jsFound: ${jsConfirmFound}`);
-
-  if (!confirmBtn && !jsConfirmFound) {
-    await dumpStep(page, "confirm-btn-missing", {});
-    return { ok:false, reason:"confirm_btn_missing" };
-  }
-
-  // Step 6: Click confirm with retries using multiple strategies
+  // Step 5 & 6: Vue-aware confirm with diagnostics + direct method call
+  // The button click silently fails because the parent Vue component's data property
+  // (e.g. followCode) isn't being set - only el-input's internal currentValue is.
+  // Strategy: walk up the Vue component tree, find the parent with the order code
+  // data property, set it directly, call the confirm method, AND click the button.
   let lastVerify = null;
+
   for (let i = 1; i <= CONFIRM_RETRIES; i++) {
     console.log(`Confirm click attempt ${i}`);
 
-    // Re-ensure Vue's reactive state + blur input before clicking
-    await page.evaluate((code) => {
+    const diag = await page.evaluate((code) => {
       const input = document.querySelector('.follow-input input') ||
-                    document.querySelector('input[placeholder*="order"]');
-      if (!input) return;
-      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-      if (setter) setter.call(input, code);
+                    document.querySelector('input[placeholder*="order"]') ||
+                    document.querySelector('.action-box input');
+      const button = document.querySelector('.follow-input .el-input-group__append button') ||
+                     Array.from(document.querySelectorAll('button'))
+                       .find(b => b.textContent.trim().toLowerCase() === 'confirm');
+
+      if (!input) return { error: 'no_input' };
+      if (!button) return { error: 'no_button' };
+
+      // ── 1. Set native value ──────────────────────────────────────────────────
+      const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+      if (nativeSetter) nativeSetter.call(input, code);
       else input.value = code;
-      ['input', 'change'].forEach(t => input.dispatchEvent(new Event(t, { bubbles: true })));
-      // Use Vue __vue__ instance to update component data
+
+      // ── 2. Walk Vue instance chain, collect info + set data ────────────────
+      const vueChain = [];
+      const dataSet = [];
+      const methodsCalled = [];
+      const CODE_PROPS = ['followCode','orderCode','code','inviteCode','copyCode',
+                          'tradeCode','followOrderCode','inputCode','codeValue',
+                          'followInputCode','inputValue','confirmCode','joinCode',
+                          'applyCode','number','num','val'];
+      const CONFIRM_METHODS = /confirm|follow|join|submit|apply|order|copy|bind/i;
+
       let el = input;
-      while (el) {
+      while (el && el !== document.body) {
         if (el.__vue__) {
           const vm = el.__vue__;
-          if ('currentValue' in vm) vm.currentValue = code;
+          const dataKeys = Object.keys(vm.$data || {});
+          const methodNames = Object.keys(vm.$options?.methods || {});
+
+          vueChain.push({ tag: el.tagName, cls: (el.className||'').slice(0,50), dataKeys, methodNames });
+
+          // Set currentValue on el-input component
+          if ('currentValue' in vm) { vm.currentValue = code; dataSet.push('vm.currentValue'); }
+
+          // Trigger el-input's internal handler so it emits 'input' to parent
           if (typeof vm.handleInput === 'function') {
-            try { vm.handleInput({ target: { value: code } }); } catch(e) {}
+            try { vm.handleInput({ target: { value: code } }); methodsCalled.push('vm.handleInput'); } catch(e) {}
           }
-          vm.$emit('input', code);
-          break;
+
+          // Emit directly from this component level
+          try { vm.$emit('input', code); } catch(e) {}
+          try { vm.$emit('change', code); } catch(e) {}
+
+          // Check THIS component's data for code props
+          const thisData = vm.$data || {};
+          for (const prop of CODE_PROPS) {
+            if (prop in thisData) {
+              thisData[prop] = code;
+              try { vm.$set(vm, prop, code); } catch(e) {}
+              dataSet.push(`vm.${prop}`);
+            }
+          }
+
+          // ── Walk parent chain ────────────────────────────────────────────────
+          let pvm = vm.$parent;
+          let depth = 0;
+          while (pvm && depth < 8) {
+            const pdata = pvm.$data || {};
+            const pkeys = Object.keys(pdata);
+            const pmethods = Object.keys(pvm.$options?.methods || {});
+
+            // Set any code-like data property on parent
+            for (const prop of CODE_PROPS) {
+              if (prop in pdata) {
+                pdata[prop] = code;
+                try { pvm.$set(pvm, prop, code); } catch(e) {}
+                dataSet.push(`parent${depth}.${prop}`);
+              }
+            }
+
+            // Emit input on parent too
+            try { pvm.$emit('input', code); } catch(e) {}
+            try { pvm.$emit('change', code); } catch(e) {}
+
+            // Call any confirm-like method on parent
+            for (const mName of pmethods.filter(m => CONFIRM_METHODS.test(m))) {
+              try {
+                pvm[mName]();
+                methodsCalled.push(`parent${depth}.${mName}()`);
+              } catch(e) {}
+            }
+
+            pvm = pvm.$parent;
+            depth++;
+          }
+
+          break; // found first Vue instance in chain, done
         }
         el = el.parentElement;
       }
-      // BLUR - finalizes ElementUI v-model before button click
-      input.dispatchEvent(new FocusEvent('blur', { bubbles: true }));
-      input.blur();
-    }, String(orderCode)).catch(()=>null);
-    await sleep(200);
 
-    // Strategy A: Playwright force-click
-    if (confirmBtn) {
-      await confirmBtn.scrollIntoViewIfNeeded().catch(()=>null);
-      await confirmBtn.click({ force: true, timeout:5000 }).catch(e => console.log('  A failed:', e.message?.slice(0,80)));
+      // ── 3. Fire DOM events ───────────────────────────────────────────────────
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+
+      // ── 4. Focus + blur cycle (finalizes v-model.lazy) ─────────────────────
+      input.focus();
+      input.dispatchEvent(new FocusEvent('focus', { bubbles: true }));
+      // small delay via nested requestAnimationFrame so Vue can process
+      return new Promise((resolve) => {
+        requestAnimationFrame(() => {
+          input.blur();
+          input.dispatchEvent(new FocusEvent('blur', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+
+          requestAnimationFrame(() => {
+            // ── 5. Click the button natively ──────────────────────────────────
+            button.dispatchEvent(new MouseEvent('mousedown', { bubbles:true, cancelable:true }));
+            button.dispatchEvent(new MouseEvent('mouseup',   { bubbles:true, cancelable:true }));
+            button.click();
+            button.dispatchEvent(new MouseEvent('click', { bubbles:true, cancelable:true }));
+
+            resolve({
+              vueChain,
+              dataSet,
+              methodsCalled,
+              inputValue: input.value,
+              buttonText: button.textContent?.trim(),
+            });
+          });
+        });
+      });
+    }, String(orderCode)).catch(e => ({ error: String(e).slice(0,100) }));
+
+    if (i === 1) {
+      // Log diagnostics on first attempt so we can see Vue structure
+      console.log('VUE_DIAG:', JSON.stringify(diag));
+    } else {
+      console.log(`  methodsCalled: ${JSON.stringify(diag?.methodsCalled)}, dataSet: ${JSON.stringify(diag?.dataSet)}`);
     }
-    await sleep(300);
 
-    // Strategy B: JS dispatchEvent click
-    await page.evaluate(() => {
-      const btns = Array.from(document.querySelectorAll('button'));
-      const b = btns.find(b => b.textContent.trim().toLowerCase() === 'confirm');
-      if (b) b.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-    }).catch(()=>null);
-    await sleep(300);
+    await sleep(400);
 
-    // Strategy C: Press Enter on the code input
+    // Also try Playwright's own click (in case JS click didn't penetrate)
+    const confirmBtn = page.locator('.follow-input .el-input-group__append button').first();
+    const vis = await confirmBtn.isVisible().catch(()=>false);
+    if (vis) {
+      await confirmBtn.scrollIntoViewIfNeeded().catch(()=>null);
+      await confirmBtn.click({ force: true, timeout: 3000 }).catch(()=>null);
+    }
+
+    // Also try Enter key
     await codeBox.press('Enter').catch(()=>null);
 
     await sleep(CONFIRM_WAIT_MS);
@@ -736,6 +749,7 @@ async function runFlow(page, loginUrl, orderCode) {
       console.log("✓ Order confirmed:", v.detail);
       return { ok:true, detail:v.detail };
     }
+    console.log(`  verify: ${JSON.stringify(v)}`);
 
     await sleep(CONFIRM_RETRY_DELAY_MS);
   }
