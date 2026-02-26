@@ -555,13 +555,15 @@ async function runFlow(page, loginUrl, orderCode) {
 
   // Step 5: Click Confirm button
   // The confirm button appears next to the order code input
+  // From HTML: the Confirm button is <button class="el-button el-button--default el-button--mini">
+  // inside a div.el-input-group__append, next to the order code input
   const confirmCandidates = [
+    page.locator('.el-input-group__append button').first(),
+    page.locator('.el-button--mini').filter({ hasText:/confirm/i }).first(),
+    page.locator('.el-button').filter({ hasText:/confirm/i }).first(),
     page.locator('.confirm-btn').first(),
     page.getByRole("button", { name:/confirm/i }).first(),
     page.locator('button:has-text("Confirm")').first(),
-    page.locator('div:has-text("Confirm")').filter({ hasText:/^Confirm$/ }).first(),
-    page.getByText(/^Confirm$/i).first(),
-    page.getByRole("button", { name:/submit/i }).first(),
   ];
 
   let confirmBtn = null;
