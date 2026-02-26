@@ -572,8 +572,26 @@ async function runFlow(page, loginUrl, orderCode) {
   await codeBox.scrollIntoViewIfNeeded().catch(()=>null);
   await codeBox.click({ timeout:5000 }).catch(()=>null);
   await sleep(200);
-  await codeBox.fill(String(orderCode)).catch(()=>null);
-  await sleep(500);
+
+  // IMPORTANT: fill() sets DOM value but bypasses Vue's v-model event listeners.
+  // We must use pressSequentially() to fire real keydown/keypress/input/keyup events
+  // so Vue's reactive state actually receives the value.
+  await codeBox.fill('').catch(()=>null); // clear first
+  await codeBox.pressSequentially(String(orderCode), { delay: 30 }).catch(async () => {
+    // Fallback: use evaluate to set value via native setter + dispatch input event
+    await page.evaluate((code) => {
+      const sel = '.follow-input input, .action-box input[type="text"], .el-input-group__prepend ~ input, .el-input-group input';
+      const input = document.querySelector(sel) || document.querySelector('input[placeholder*="order"]');
+      if (input) {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+        if (setter) setter.call(input, code);
+        else input.value = code;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }, String(orderCode)).catch(()=>null);
+  });
+  await sleep(400);
 
   const filled = await codeBox.inputValue().catch(()=>"");
   console.log(`Code filled: "${filled}" (expected length ${String(orderCode).length})`);
@@ -612,6 +630,20 @@ async function runFlow(page, loginUrl, orderCode) {
   let lastVerify = null;
   for (let i = 1; i <= CONFIRM_RETRIES; i++) {
     console.log(`Confirm click attempt ${i}`);
+
+    // Re-ensure Vue's reactive state has the value before clicking
+    await page.evaluate((code) => {
+      const input = document.querySelector('.follow-input input') ||
+                    document.querySelector('.el-input-group__append')?.closest('.el-input-group')?.querySelector('input');
+      if (input && input.value !== code) {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+        if (setter) setter.call(input, code);
+        else input.value = code;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }, String(orderCode)).catch(()=>null);
+    await sleep(100);
 
     // Strategy A: Playwright force-click
     if (confirmBtn) {
