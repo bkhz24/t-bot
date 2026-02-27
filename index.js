@@ -1054,18 +1054,8 @@ app.get("/debug/files", (req, res) => {
   fs.createReadStream(full).pipe(res);
 });
 
-app.post("/run", async (req, res) => {
-  const p    = (req.body.p    || "").toString();
-  const code = (req.body.code || "").toString().trim();
-
-  if (!BOT_PASSWORD) return res.status(500).send("BOT_PASSWORD not set.");
-  if (p !== BOT_PASSWORD) return res.status(401).send("Wrong password.");
-  if (!code) return res.status(400).send("No code provided.");
-  if (isRunning) return res.send("Bot is already running.");
-
-  const cfg = parseAccounts();
-  if (!cfg.ok) return res.status(500).send(cfg.error||"ACCOUNTS_JSON invalid.");
-
+// ── Core run function (called from web UI or Telegram) ───────────────────────
+function startRun(code, cfg) {
   isRunning   = true;
   lastError   = null;
   lastRunAt   = nowLocal();
@@ -1073,9 +1063,6 @@ app.post("/run", async (req, res) => {
   lastDebugDir= `/tmp/debug-${lastRunId}`;
   ensureDir(lastDebugDir);
   writePlaceholderShot();
-
-  res.setHeader("Content-Type","text/plain; charset=utf-8");
-  res.send(`Run ${lastRunId} started. Check /health and /debug for status.`);
 
   (async () => {
     const startedAt = nowLocal();
@@ -1087,7 +1074,6 @@ app.post("/run", async (req, res) => {
     console.log(`Force mobile: ${FORCE_MOBILE_MODE}`);
     console.log(`Code length: ${code.length}`);
 
-    // ── STARTED ───────────────────────────────────────────────────────────────
     await notify(
       `T-Bot STARTED | Code: ${code} | Run ${lastRunId}`,
       [
@@ -1103,7 +1089,6 @@ app.post("/run", async (req, res) => {
       `🚀 <b>T-Bot STARTED</b>\nCode: <code>${code}</code>\nAccounts: ${cfg.accounts.length}\nTime: ${startedAt}`
     );
 
-    // Brief pause so started message arrives before per-account messages
     await sleep(4000);
 
     try {
@@ -1114,7 +1099,6 @@ app.post("/run", async (req, res) => {
         const r = await runAccountAllUrls(account, code, LOGIN_URLS);
         results.push({ username:account.username, ...r });
 
-        // ── PER-ACCOUNT NOTIFICATION ──────────────────────────────────────────
         try {
           if (r.ok) {
             const g2confirmed = r.reason === 'both_gates_passed';
@@ -1164,9 +1148,8 @@ app.post("/run", async (req, res) => {
         } catch(notifyErr) {
           console.log(`Notify failed for ${account.username}:`, notifyErr?.message||String(notifyErr));
         }
-      } // end for account loop
+      }
 
-      // ── FINAL SUMMARY ─────────────────────────────────────────────────────────
       const finishedAt = nowLocal();
       const okCount    = results.filter(x => x.ok).length;
       const failCount  = results.filter(x => !x.ok).length;
@@ -1216,7 +1199,120 @@ app.post("/run", async (req, res) => {
       isRunning = false;
     }
   })();
+}
+
+app.post("/run", async (req, res) => {
+  const p    = (req.body.p    || "").toString();
+  const code = (req.body.code || "").toString().trim();
+
+  if (!BOT_PASSWORD) return res.status(500).send("BOT_PASSWORD not set.");
+  if (p !== BOT_PASSWORD) return res.status(401).send("Wrong password.");
+  if (!code) return res.status(400).send("No code provided.");
+  if (isRunning) return res.send("Bot is already running.");
+
+  const cfg = parseAccounts();
+  if (!cfg.ok) return res.status(500).send(cfg.error||"ACCOUNTS_JSON invalid.");
+
+  startRun(code, cfg);
+  res.setHeader("Content-Type","text/plain; charset=utf-8");
+  res.send(`Run ${lastRunId} started.`);
 });
+
+// ── Telegram command polling ──────────────────────────────────────────────────
+// Anyone in the authorized chat can send:
+//   /run CODE   — starts a run with that code
+//   /status     — reports current status
+// No password needed — access is controlled by who is in the Telegram chat.
+async function telegramGetUpdates(offset) {
+  const https = require("https");
+  return new Promise((resolve) => {
+    const path = `/bot${TELEGRAM_TOKEN}/getUpdates?timeout=25&offset=${offset||0}`;
+    const req = https.request({ hostname:"api.telegram.org", path, method:"GET" }, (res) => {
+      let data = "";
+      res.on("data", c => data += c);
+      res.on("end", () => {
+        try { resolve(JSON.parse(data)); } catch { resolve({ ok:false, result:[] }); }
+      });
+    });
+    req.on("error", () => resolve({ ok:false, result:[] }));
+    req.end();
+  });
+}
+
+async function startTelegramPolling() {
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.log("Telegram not configured — polling disabled");
+    return;
+  }
+  console.log("Telegram polling started — send /run CODE or /status to your bot");
+
+  let offset = 0;
+  while (true) {
+    try {
+      const data = await telegramGetUpdates(offset);
+      if (data.ok && data.result?.length) {
+        for (const update of data.result) {
+          offset = update.update_id + 1;
+          const msg = update.message || update.channel_post;
+          if (!msg) continue;
+
+          // Only accept commands from the authorized chat
+          const fromChatId = String(msg.chat?.id || "");
+          if (fromChatId !== String(TELEGRAM_CHAT_ID)) {
+            console.log(`Telegram: ignored message from unauthorized chat ${fromChatId}`);
+            continue;
+          }
+
+          const text = (msg.text || "").trim();
+          const fromName = msg.from?.first_name || msg.from?.username || "someone";
+          console.log(`Telegram command from ${fromName}: ${text}`);
+
+          // /status
+          if (/^\/status/i.test(text)) {
+            const statusMsg = isRunning
+              ? `⏳ <b>Bot is currently running</b>\nRun ID: ${lastRunId}\nStarted: ${lastRunAt}`
+              : lastRunAt
+                ? `✅ <b>Bot is idle</b>\nLast run: ${lastRunAt}\n${lastError ? '❌ Last error: '+lastError : 'Last run completed OK'}`
+                : `💤 <b>Bot is idle</b>\nNo runs yet.`;
+            await sendTelegram(statusMsg).catch(()=>{});
+            continue;
+          }
+
+          // /run CODE
+          const runMatch = text.match(/^\/run\s+([A-Za-z0-9]+)/i);
+          if (runMatch) {
+            const code = runMatch[1].trim();
+            if (isRunning) {
+              await sendTelegram(`⚠️ Bot is already running (Run ID: ${lastRunId}). Wait for it to finish.`).catch(()=>{});
+              continue;
+            }
+            const cfg = parseAccounts();
+            if (!cfg.ok) {
+              await sendTelegram(`❌ Cannot start — accounts not configured: ${cfg.error}`).catch(()=>{});
+              continue;
+            }
+            console.log(`Telegram trigger: /run ${code} from ${fromName}`);
+            await sendTelegram(`👍 Got it ${fromName}! Starting run with code <code>${code}</code>...`).catch(()=>{});
+            startRun(code, cfg);
+            continue;
+          }
+
+          // Unknown command — send help
+          if (text.startsWith('/')) {
+            await sendTelegram(
+              `<b>T-Bot commands:</b>\n\n/run CODE — start a run\n    Example: <code>/run 1GR0QF3KL</code>\n\n/status — check if bot is running`
+            ).catch(()=>{});
+          }
+        }
+      }
+    } catch(e) {
+      console.log("Telegram polling error:", e?.message||String(e));
+      await sleep(5000);
+    }
+  }
+}
+
+
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, "0.0.0.0", () => {
@@ -1225,4 +1321,5 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`Force mobile: ${FORCE_MOBILE_MODE}`);
   console.log(`Email configured: ${emailConfigured()}`);
   writePlaceholderShot();
+  startTelegramPolling();
 });
