@@ -129,21 +129,24 @@ function emailConfigured() {
 }
 async function sendEmail(subject, text) {
   if (!emailConfigured()) { console.log("Email not configured, skipping:", subject); return { ok:false, skipped:true }; }
-  try {
-    const sg = require("@sendgrid/mail");
-    sg.setApiKey(SENDGRID_API_KEY);
-    const [res] = await sg.send({
-      to: EMAIL_TO.split(",").map(s=>s.trim()).filter(Boolean),
-      from: { email: parseFromEmail(EMAIL_FROM_RAW), name: EMAIL_FROM_NAME },
-      subject, text
-    });
-    console.log("Email sent:", subject, res?.statusCode);
-    return { ok:true };
-  } catch(e) {
-    const err = e?.response?.body ? JSON.stringify(e.response.body) : (e?.message||String(e));
-    console.log("Email failed:", err);
-    return { ok:false, error:err };
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const sg = require("@sendgrid/mail");
+      sg.setApiKey(SENDGRID_API_KEY);
+      const [res] = await sg.send({
+        to: EMAIL_TO.split(",").map(s=>s.trim()).filter(Boolean),
+        from: { email: parseFromEmail(EMAIL_FROM_RAW), name: EMAIL_FROM_NAME },
+        subject, text
+      });
+      console.log(`Email OK (attempt ${attempt}): [${res?.statusCode}] ${subject}`);
+      return { ok:true };
+    } catch(e) {
+      const err = e?.response?.body ? JSON.stringify(e.response.body) : (e?.message||String(e));
+      console.log(`Email FAILED (attempt ${attempt}/3): ${subject} => ${err}`);
+      if (attempt < 3) await sleep(2000);
+    }
   }
+  return { ok:false, error:"failed after 3 attempts" };
 }
 
 // ── Debug artifacts ───────────────────────────────────────────────────────────
@@ -1033,7 +1036,7 @@ app.post("/run", async (req, res) => {
 
     // ── STARTED EMAIL ─────────────────────────────────────────────────────────
     await sendEmail(
-      `🚀 T-Bot STARTED | Run ${lastRunId}`,
+      `T-Bot STARTED | Run ${lastRunId}`,
       [
         `T-Bot has started a new run.`,
         ``,
@@ -1055,58 +1058,62 @@ app.post("/run", async (req, res) => {
         results.push({ username:account.username, ...r });
 
         // ── PER-ACCOUNT EMAIL (sent immediately, success OR failure) ──────────
-        if (r.ok) {
-          const g1 = r.gate1 || {};
-          const g2 = r.gate2 || {};
-          const hasWarning = r.reason === 'gate1_ok_gate2_warn';
+        try {
+          if (r.ok) {
+            const g1 = r.gate1 || {};
+            const g2 = r.gate2 || {};
+            const hasWarning = r.reason === 'gate1_ok_gate2_warn';
 
-          await sendEmail(
-            hasWarning
-              ? `⚠️ T-Bot | ${account.username} — API OK but pending not confirmed`
-              : `✅ T-Bot | ${account.username} — ORDER CONFIRMED`,
-            [
+            await sendEmail(
               hasWarning
-                ? `⚠️  ORDER SUBMITTED but could not confirm "pending" in Position order tab.`
-                : `✅  ORDER CONFIRMED — both verification gates passed.`,
-              ``,
-              `Account:  ${account.username}`,
-              `Site:     ${r.site || '-'}`,
-              `Time:     ${nowLocal()}`,
-              ``,
-              `── Gate 1: Server API ───────────────────────────`,
-              g1.ok
-                ? `✅ PASSED — Server accepted the order`
-                : `❌ FAILED — ${g1.detail || 'no response'}`,
-              g1.detail ? `   Detail: ${g1.detail}` : '',
-              ``,
-              `── Gate 2: Position Order Tab ───────────────────`,
-              g2.ok
-                ? `✅ PASSED — "pending" order visible`
-                : `❌ FAILED — ${g2.detail || 'pending not found'}`,
-              g2.ok && g2.detail
-                ? `   Order row: ${g2.detail.slice(0, 200)}`
-                : '',
-            ].filter(l => l !== null).join('\n')
-          );
-        } else {
-          lastError = `${account.username}: ${r.error}`;
-          await sendEmail(
-            `❌ T-Bot | ${account.username} — FAILED`,
-            [
-              `❌  This account FAILED to place an order.`,
-              ``,
-              `Account: ${account.username}`,
-              `Time:    ${nowLocal()}`,
-              `Run ID:  ${lastRunId}`,
-              ``,
-              `Error: ${r.error}`,
-              ``,
-              r.gate1 ? `Gate 1: ${r.gate1.ok ? 'passed' : 'FAILED'} — ${r.gate1.detail || ''}` : '',
-              r.gate2 ? `Gate 2: ${r.gate2.ok ? 'passed' : 'FAILED'} — ${r.gate2.detail || ''}` : '',
-            ].filter(l => l !== null).join('\n')
-          );
+                ? `T-Bot | ${account.username} - API OK, pending unconfirmed`
+                : `T-Bot | ${account.username} - ORDER CONFIRMED`,
+              [
+                hasWarning
+                  ? `ORDER SUBMITTED but could not confirm "pending" in Position order tab.`
+                  : `ORDER CONFIRMED — both verification gates passed.`,
+                ``,
+                `Account:  ${account.username}`,
+                `Site:     ${r.site || '-'}`,
+                `Time:     ${nowLocal()}`,
+                ``,
+                `-- Gate 1: Server API --`,
+                g1.ok
+                  ? `PASSED — Server accepted the order`
+                  : `FAILED — ${g1.detail || 'no response'}`,
+                g1.detail ? `Detail: ${g1.detail}` : '',
+                ``,
+                `-- Gate 2: Position Order Tab --`,
+                g2.ok
+                  ? `PASSED — "pending" order visible`
+                  : `FAILED — ${g2.detail || 'pending not found'}`,
+                g2.ok && g2.detail
+                  ? `Order row: ${g2.detail.slice(0, 200)}`
+                  : '',
+              ].filter(l => l !== null).join('\n')
+            );
+          } else {
+            lastError = `${account.username}: ${r.error}`;
+            await sendEmail(
+              `T-Bot | ${account.username} - FAILED`,
+              [
+                `This account FAILED to place an order.`,
+                ``,
+                `Account: ${account.username}`,
+                `Time:    ${nowLocal()}`,
+                `Run ID:  ${lastRunId}`,
+                ``,
+                `Error: ${r.error}`,
+                ``,
+                r.gate1 ? `Gate 1: ${r.gate1.ok ? 'passed' : 'FAILED'} — ${r.gate1.detail || ''}` : '',
+                r.gate2 ? `Gate 2: ${r.gate2.ok ? 'passed' : 'FAILED'} — ${r.gate2.detail || ''}` : '',
+              ].filter(l => l !== null).join('\n')
+            );
+          }
+        } catch(emailErr) {
+          console.log(`Per-account email failed for ${account.username}:`, emailErr?.message||String(emailErr));
         }
-      }
+      } // end for account loop
 
       // ── FINAL SUMMARY EMAIL ──────────────────────────────────────────────────
       const finishedAt = nowLocal();
@@ -1115,9 +1122,9 @@ app.post("/run", async (req, res) => {
       const failCount  = results.filter(x => !x.ok).length;
 
       const summaryLines = results.map(r => {
-        if (!r.ok) return `❌  ${r.username}\n    Error: ${r.error}`;
-        if (r.reason === 'gate1_ok_gate2_warn') return `⚠️  ${r.username} (${r.site})\n    API confirmed — pending tab check inconclusive`;
-        return `✅  ${r.username} (${r.site})\n    Gate1: API confirmed | Gate2: pending visible`;
+        if (!r.ok) return `FAILED: ${r.username}\n    Error: ${r.error}`;
+        if (r.reason === 'gate1_ok_gate2_warn') return `WARNING: ${r.username} (${r.site})\n    API confirmed — pending tab check inconclusive`;
+        return `CONFIRMED: ${r.username} (${r.site})\n    Gate1: API confirmed | Gate2: pending visible`;
       });
 
       console.log(`\n====== DONE: ${okCount} confirmed, ${warnCount} warn, ${failCount} failed ======`);
@@ -1126,8 +1133,8 @@ app.post("/run", async (req, res) => {
       const allOk = failCount === 0;
       await sendEmail(
         allOk
-          ? `✅ T-Bot DONE | ${okCount + warnCount}/${results.length} accounts confirmed`
-          : `⚠️ T-Bot DONE | ${okCount + warnCount} ok, ${failCount} FAILED`,
+          ? `T-Bot DONE | ${okCount + warnCount}/${results.length} accounts confirmed`
+          : `T-Bot DONE | ${okCount + warnCount} ok, ${failCount} FAILED`,
         [
           `T-Bot run complete.`,
           ``,
@@ -1135,13 +1142,13 @@ app.post("/run", async (req, res) => {
           `Finished: ${finishedAt}`,
           `Run ID:   ${lastRunId}`,
           ``,
-          `── Results ──────────────────────────────────────────`,
-          `  ✅ Fully confirmed:  ${okCount}`,
-          `  ⚠️  API ok, tab warn: ${warnCount}`,
-          `  ❌ Failed:           ${failCount}`,
-          `  Total accounts:    ${results.length}`,
+          `-- Results --`,
+          `  Fully confirmed:  ${okCount}`,
+          `  API ok, tab warn: ${warnCount}`,
+          `  Failed:           ${failCount}`,
+          `  Total accounts:   ${results.length}`,
           ``,
-          `── Per-account ──────────────────────────────────────`,
+          `-- Per-account --`,
           ...summaryLines,
         ].join('\n')
       );
@@ -1149,7 +1156,7 @@ app.post("/run", async (req, res) => {
       const msg = e?.message || String(e);
       lastError = msg;
       console.log("Run error:", msg);
-      await sendEmail(`💥 T-Bot CRASHED | Run ${lastRunId}`, `Crashed: ${nowLocal()}\n\n${msg}\n`);
+      await sendEmail(`T-Bot CRASHED | Run ${lastRunId}`, `Crashed: ${nowLocal()}\n\n${msg}\n`);
     } finally {
       isRunning = false;
     }
