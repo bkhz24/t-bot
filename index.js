@@ -203,10 +203,10 @@ const PASS_SEL = [
 ].join(", ");
 
 const ORDER_CODE_SEL = [
+  '.follow-input input',
   'input[placeholder*="order code" i]',
   'input[placeholder*="Please enter the order" i]',
-  'input[placeholder*="order" i]',
-  'input[placeholder*="code" i]',
+  'input[placeholder*="enter the order" i]',
 ].join(", ");
 
 // ── Core helpers ──────────────────────────────────────────────────────────────
@@ -440,14 +440,24 @@ async function gotoFuturesMobile(page) {
 
 // ── Navigation: Invited Me ────────────────────────────────────────────────────
 async function clickInvitedMe(page) {
-  const end = Date.now() + 8000;
+  const end = Date.now() + 10000;
   while (Date.now() < end) {
     const tab = page.getByText(/invited\s*me/i).first();
     if (await tab.isVisible().catch(()=>false)) {
       await tab.click({ timeout:5000 }).catch(()=>null);
-      await sleep(WAIT_AFTER_INVITED_MS);
       console.log("Clicked 'Invited me'");
-      return true;
+      // Wait until the order code input actually appears (up to 8s) before returning
+      const inputEnd = Date.now() + 8000;
+      while (Date.now() < inputEnd) {
+        const inp = page.locator(ORDER_CODE_SEL).first();
+        if (await inp.isVisible().catch(()=>false)) {
+          console.log("  Order code input visible");
+          return true;
+        }
+        await sleep(300);
+      }
+      console.log("  Order code input not found after clicking Invited me");
+      return true; // tab was clicked, input just didn't appear - let runFlow handle it
     }
     await sleep(400);
   }
@@ -745,9 +755,11 @@ async function runFlow(page, loginUrl, orderCode) {
 
   if (!gate1.ok) {
     await dumpStep(page, 'gate1-failed', {});
+    // If server explicitly rejected the code as invalid, no point trying other URLs
+    const isBadCode = gate1.errCode === 100001 || /invalid.param|invalid.code|code.*invalid|not.*exist/i.test(gate1.errCodeDes||'');
     return {
       ok: false,
-      reason: 'gate1_failed',
+      reason: isBadCode ? 'bad_code' : 'gate1_failed',
       detail: gate1.detail || 'follow/code API did not return resultCode:true',
       gate1, gate2: null
     };
@@ -870,7 +882,10 @@ async function runAccountOnUrl(account, orderCode, loginUrl) {
 
       await captureFailure(page, `${sanitizeFilename(account.username)}-flow-failed`,
         `Flow failed: ${res.reason}${res.detail ? ` | ${res.detail}` : ""}`);
-      throw new Error(`Flow failed: ${res.reason}${res.detail ? ` | ${res.detail}` : ""}`);
+      // Use a special error class so runAccountAllUrls can bail immediately
+      const err = new Error(`Flow failed: ${res.reason}${res.detail ? ` | ${res.detail}` : ""}`);
+      err.reason = res.reason;
+      throw err;
     }
 
     throw new Error("Flow failed after retry");
@@ -891,6 +906,11 @@ async function runAccountAllUrls(account, orderCode, urls) {
     } catch(e) {
       console.log(`✗ FAILED: ${loginUrl} for ${account.username}: ${e?.message||String(e)}`);
       lastErr = e;
+      // bad_code = server confirmed the code is invalid — no point trying other URLs
+      if (e.reason === 'bad_code') {
+        console.log(`  ↳ Code rejected by server (errCode 100001) — skipping remaining URLs for ${account.username}`);
+        break;
+      }
     }
   }
   return { ok:false, error:lastErr?.message||"All URLs failed" };
