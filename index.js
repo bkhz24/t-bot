@@ -47,6 +47,10 @@ const EMAIL_FROM_NAME    = (process.env.EMAIL_FROM_NAME || "T-Bot").toString().t
 const EMAIL_TO           = (process.env.EMAIL_TO || "").toString().trim();
 const EMAIL_MAX_FAIL_ALERTS = Number(process.env.EMAIL_MAX_FAIL_ALERTS || "4");
 
+// Telegram
+const TELEGRAM_TOKEN   = (process.env.TELEGRAM_TOKEN   || "").toString().trim();
+const TELEGRAM_CHAT_ID = (process.env.TELEGRAM_CHAT_ID || "").toString().trim();
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function envTruthy(v) {
   const s = (v || "").toString().trim().toLowerCase();
@@ -147,6 +151,49 @@ async function sendEmail(subject, text) {
     }
   }
   return { ok:false, error:"failed after 3 attempts" };
+}
+
+async function sendTelegram(message) {
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return { ok:false, skipped:true };
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const https = require("https");
+      const body = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: "HTML" });
+      await new Promise((resolve, reject) => {
+        const req = https.request({
+          hostname: "api.telegram.org",
+          path: `/bot${TELEGRAM_TOKEN}/sendMessage`,
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) }
+        }, (res) => {
+          let data = "";
+          res.on("data", c => data += c);
+          res.on("end", () => {
+            const parsed = JSON.parse(data);
+            if (parsed.ok) resolve(parsed);
+            else reject(new Error(parsed.description || "Telegram error"));
+          });
+        });
+        req.on("error", reject);
+        req.write(body);
+        req.end();
+      });
+      console.log(`Telegram OK (attempt ${attempt}): ${message.slice(0,60)}`);
+      return { ok:true };
+    } catch(e) {
+      console.log(`Telegram FAILED (attempt ${attempt}/3): ${e?.message||String(e)}`);
+      if (attempt < 3) await sleep(2000);
+    }
+  }
+  return { ok:false, error:"failed after 3 attempts" };
+}
+
+// Send both email and Telegram together
+async function notify(subject, emailBody, telegramMsg) {
+  await Promise.all([
+    sendEmail(subject, emailBody).catch(e => console.log("notify email error:", e?.message)),
+    sendTelegram(telegramMsg || `${subject}\n\n${emailBody.slice(0,300)}`).catch(e => console.log("notify telegram error:", e?.message))
+  ]);
 }
 
 // ── Debug artifacts ───────────────────────────────────────────────────────────
@@ -1040,8 +1087,8 @@ app.post("/run", async (req, res) => {
     console.log(`Force mobile: ${FORCE_MOBILE_MODE}`);
     console.log(`Code length: ${code.length}`);
 
-    // ── STARTED EMAIL ─────────────────────────────────────────────────────────
-    await sendEmail(
+    // ── STARTED ───────────────────────────────────────────────────────────────
+    await notify(
       `T-Bot STARTED | Code: ${code} | Run ${lastRunId}`,
       [
         `T-Bot has started a new run.`,
@@ -1051,11 +1098,12 @@ app.post("/run", async (req, res) => {
         `Accounts: ${cfg.accounts.length}`,
         `Code:     ${code}`,
         ``,
-        `You will receive an email for each account and a final summary.`,
-      ].join('\n')
+        `You will receive a message for each account and a final summary.`,
+      ].join('\n'),
+      `🚀 <b>T-Bot STARTED</b>\nCode: <code>${code}</code>\nAccounts: ${cfg.accounts.length}\nTime: ${startedAt}`
     );
 
-    // Brief pause so the started email arrives before per-account emails
+    // Brief pause so started message arrives before per-account messages
     await sleep(4000);
 
     try {
@@ -1066,37 +1114,37 @@ app.post("/run", async (req, res) => {
         const r = await runAccountAllUrls(account, code, LOGIN_URLS);
         results.push({ username:account.username, ...r });
 
-        // ── PER-ACCOUNT EMAIL (sent immediately, success OR failure) ──────────
+        // ── PER-ACCOUNT NOTIFICATION ──────────────────────────────────────────
         try {
           if (r.ok) {
-            const g1 = r.gate1 || {};
-            const g2 = r.gate2 || {};
             const g2confirmed = r.reason === 'both_gates_passed';
+            const g2note = g2confirmed
+              ? `Gate 2: ${(r.gate2?.how||'tab')} confirmed ✓`
+              : `Gate 2: order row not yet visible (normal)`;
 
-            await sendEmail(
+            await notify(
               `T-Bot | ${account.username} - ORDER CONFIRMED`,
               [
-                `ORDER CONFIRMED — server accepted the order (Gate 1 passed).`,
+                `ORDER CONFIRMED — server accepted the order.`,
                 ``,
                 `Account:  ${account.username}`,
                 `Site:     ${r.site || '-'}`,
                 `Time:     ${nowLocal()}`,
                 ``,
-                `-- Gate 1: Server API (definitive confirmation) --`,
+                `-- Gate 1: Server API --`,
                 `PASSED — Server returned resultCode:true`,
-                g1.detail ? `Detail: ${g1.detail}` : '',
+                r.gate1?.detail ? `Detail: ${r.gate1.detail}` : '',
                 ``,
-                `-- Gate 2: Position Order Tab (visual check) --`,
+                `-- Gate 2: Visual Check --`,
                 g2confirmed
-                  ? `PASSED — ${g2.how}: ${(g2.detail||'').slice(0,200)}`
-                  : `NOTE — Order row not yet visible in tab (normal if page was still loading)`,
-                ``,
-                `The order is confirmed via the server API. Gate 2 is a secondary visual check only.`,
-              ].filter(l => l !== null).join('\n')
+                  ? `PASSED — ${r.gate2?.how}: ${(r.gate2?.detail||'').slice(0,150)}`
+                  : `NOTE — Order row not yet visible in tab (normal if page still loading)`,
+              ].filter(l => l !== null).join('\n'),
+              `✅ <b>ORDER CONFIRMED</b>\n<b>${account.username}</b>\nCode: <code>${code}</code>\nTime: ${nowLocal()}\nGate 1: API confirmed ✓\n${g2note}`
             );
           } else {
             lastError = `${account.username}: ${r.error}`;
-            await sendEmail(
+            await notify(
               `T-Bot | ${account.username} - FAILED`,
               [
                 `This account FAILED to place an order.`,
@@ -1109,15 +1157,16 @@ app.post("/run", async (req, res) => {
                 ``,
                 r.gate1 ? `Gate 1: ${r.gate1.ok ? 'passed' : 'FAILED'} — ${r.gate1.detail || ''}` : '',
                 r.gate2 ? `Gate 2: ${r.gate2.ok ? 'passed' : 'FAILED'} — ${r.gate2.detail || ''}` : '',
-              ].filter(l => l !== null).join('\n')
+              ].filter(l => l !== null).join('\n'),
+              `❌ <b>FAILED</b>\n<b>${account.username}</b>\nTime: ${nowLocal()}\nError: ${r.error?.slice(0,120)}`
             );
           }
-        } catch(emailErr) {
-          console.log(`Per-account email failed for ${account.username}:`, emailErr?.message||String(emailErr));
+        } catch(notifyErr) {
+          console.log(`Notify failed for ${account.username}:`, notifyErr?.message||String(notifyErr));
         }
       } // end for account loop
 
-      // ── FINAL SUMMARY EMAIL ──────────────────────────────────────────────────
+      // ── FINAL SUMMARY ─────────────────────────────────────────────────────────
       const finishedAt = nowLocal();
       const okCount    = results.filter(x => x.ok).length;
       const failCount  = results.filter(x => !x.ok).length;
@@ -1128,11 +1177,15 @@ app.post("/run", async (req, res) => {
         return `CONFIRMED: ${r.username} (${r.site})\n    ${g2note}`;
       });
 
+      const tgSummary = results.map(r =>
+        r.ok ? `✅ ${r.username}` : `❌ ${r.username}`
+      ).join('\n');
+
       console.log(`\n====== DONE: ${okCount} confirmed, ${failCount} failed ======`);
       console.log(summaryLines.join('\n'));
 
       const allOk = failCount === 0;
-      await sendEmail(
+      await notify(
         allOk
           ? `T-Bot DONE | ${okCount}/${results.length} accounts confirmed`
           : `T-Bot DONE | ${okCount} confirmed, ${failCount} FAILED`,
@@ -1150,13 +1203,15 @@ app.post("/run", async (req, res) => {
           ``,
           `-- Per-account --`,
           ...summaryLines,
-        ].join('\n')
+        ].join('\n'),
+        `${allOk ? '✅' : '⚠️'} <b>T-Bot DONE</b>\n${okCount}/${results.length} confirmed\nStarted: ${startedAt}\nFinished: ${finishedAt}\n\n${tgSummary}`
       );
     } catch(e) {
       const msg = e?.message || String(e);
       lastError = msg;
       console.log("Run error:", msg);
-      await sendEmail(`T-Bot CRASHED | Run ${lastRunId}`, `Crashed: ${nowLocal()}\n\n${msg}\n`);
+      await notify(`T-Bot CRASHED | Run ${lastRunId}`, `Crashed: ${nowLocal()}\n\n${msg}\n`,
+        `💥 <b>T-Bot CRASHED</b>\n${msg.slice(0,200)}`);
     } finally {
       isRunning = false;
     }
