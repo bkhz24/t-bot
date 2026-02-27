@@ -1036,7 +1036,7 @@ app.post("/run", async (req, res) => {
 
     // ── STARTED EMAIL ─────────────────────────────────────────────────────────
     await sendEmail(
-      `T-Bot STARTED | Run ${lastRunId}`,
+      `T-Bot STARTED | Code: ${code} | Run ${lastRunId}`,
       [
         `T-Bot has started a new run.`,
         ``,
@@ -1048,6 +1048,9 @@ app.post("/run", async (req, res) => {
         `You will receive an email for each account and a final summary.`,
       ].join('\n')
     );
+
+    // Brief pause so the started email arrives before per-account emails
+    await sleep(4000);
 
     try {
       const results = [];
