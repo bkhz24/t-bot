@@ -188,12 +188,9 @@ async function sendTelegram(message) {
   return { ok:false, error:"failed after 3 attempts" };
 }
 
-// Send both email and Telegram together
+// Send Telegram notification (email removed - Telegram only)
 async function notify(subject, emailBody, telegramMsg) {
-  await Promise.all([
-    sendEmail(subject, emailBody).catch(e => console.log("notify email error:", e?.message)),
-    sendTelegram(telegramMsg || `${subject}\n\n${emailBody.slice(0,300)}`).catch(e => console.log("notify telegram error:", e?.message))
-  ]);
+  await sendTelegram(telegramMsg || `${subject}\n\n${emailBody.slice(0,300)}`).catch(e => console.log("notify telegram error:", e?.message));
 }
 
 // ── Debug artifacts ───────────────────────────────────────────────────────────
