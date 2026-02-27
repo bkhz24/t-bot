@@ -456,71 +456,129 @@ async function clickInvitedMe(page) {
 }
 
 // ── Verification ──────────────────────────────────────────────────────────────
-async function waitForToast(page) {
-  if (!VERIFY_TOAST) return { ok:false, type:"toast_off" };
-  const patterns = [/already\s*followed/i, /followed/i, /success/i, /completed/i, /submitted/i, /pending/i, /order/i];
-  const end = Date.now() + VERIFY_TIMEOUT_MS;
-  while (Date.now() < end) {
-    // Check text-based toasts
-    for (const re of patterns) {
-      const loc = page.getByText(re).first();
-      if (await loc.isVisible().catch(()=>false)) {
-        const txt = (await loc.textContent().catch(()=>""))?.trim().slice(0,120)||"";
-        // Skip generic "order" matches that are just page labels
-        if (txt.length > 2 && txt.length < 100) {
-          return { ok:true, type:"toast", detail:txt };
-        }
-      }
-    }
-    // Check for the successDialog-page visibility (has two images, success one shown when visible)
-    const successVisible = await page.evaluate(() => {
-      const dlg = document.querySelector('.successDialog-page');
-      if (!dlg) return false;
-      const style = dlg.getAttribute('style')||'';
-      return !style.includes('display: none') && !style.includes('display:none');
-    }).catch(()=>false);
-    if (successVisible) return { ok:true, type:"success_dialog", detail:"successDialog visible" };
-
-    // Check for el-message or notification visible
-    const msgVisible = await page.evaluate(() => {
-      const msgs = document.querySelectorAll('.el-message, .el-notification, .el-message-box');
-      return Array.from(msgs).some(m => {
-        const s = m.getAttribute('style')||'';
-        return !s.includes('display: none');
-      });
-    }).catch(()=>false);
-    if (msgVisible) {
-      const txt = await page.locator('.el-message, .el-notification').first().textContent().catch(()=>"el-msg");
-      return { ok:true, type:"el-message", detail:txt?.trim().slice(0,120)||"" };
-    }
-
-    await sleep(300);
+// ── Gate 1: Wait for the follow/code API to return resultCode:true ────────────
+async function waitForFollowCodeApi(apiPromise) {
+  try {
+    const result = await Promise.race([
+      apiPromise,
+      new Promise((_, rej) => setTimeout(() => rej(new Error("api_timeout")), VERIFY_TIMEOUT_MS))
+    ]);
+    return result;
+  } catch(e) {
+    return { ok:false, type:"api_timeout", detail:e.message };
   }
-  return { ok:false, type:"toast_timeout" };
 }
 
-async function verifyPending(page) {
-  if (!VERIFY_PENDING) return { ok:false, type:"pending_off" };
-  // Click "Position order" tab if visible
+// ── Gate 2: Verify "pending" appears in Position order tab ───────────────────
+async function verifyPositionOrderPending(page) {
+  const end = Date.now() + VERIFY_TIMEOUT_MS;
+
+  // Click the "Position order" tab
   const posTab = page.getByText(/position\s*order/i).first();
   if (await posTab.isVisible().catch(()=>false)) {
     await posTab.click({ timeout:5000 }).catch(()=>null);
-    await sleep(800);
+    console.log("  Clicked Position order tab");
+    await sleep(1200);
   }
-  const end = Date.now() + VERIFY_TIMEOUT_MS;
+
   while (Date.now() < end) {
-    if (await page.getByText(/pending/i).first().isVisible().catch(()=>false)) return { ok:true, type:"pending" };
-    await sleep(350);
+    // Check for pending in table rows
+    const pendingResult = await page.evaluate(() => {
+      // Table rows
+      const rows = Array.from(document.querySelectorAll('.light-table tr, .el-table__row, .order-list-item'));
+      for (const r of rows) {
+        const txt = (r.textContent||'').trim();
+        if (/pending/i.test(txt) && txt.length > 5) {
+          return { found:true, text: txt.replace(/\s+/g,' ').slice(0,200) };
+        }
+      }
+      // Any cell
+      const cells = Array.from(document.querySelectorAll('td, .el-table__cell'));
+      for (const c of cells) {
+        const txt = (c.textContent||'').trim();
+        if (/^pending$/i.test(txt)) {
+          // grab parent row text
+          const row = c.closest('tr') || c.parentElement;
+          return { found:true, text: (row?.textContent||txt).replace(/\s+/g,' ').slice(0,200) };
+        }
+      }
+      return { found:false };
+    }).catch(()=>({ found:false }));
+
+    if (pendingResult.found) {
+      return { ok:true, type:"pending", detail:pendingResult.text };
+    }
+
+    // Also check toasts / dialog while waiting
+    const toastResult = await page.evaluate(() => {
+      const msgs = Array.from(document.querySelectorAll(
+        '.el-message, .el-notification, .el-message-box__content, .el-message__content'
+      ));
+      for (const m of msgs) {
+        const s = m.getAttribute('style')||'';
+        if (!s.includes('display: none') && !s.includes('display:none')) {
+          const txt = (m.textContent||'').trim();
+          if (txt.length > 2) return { found:true, text:txt.slice(0,150) };
+        }
+      }
+      const dlg = document.querySelector('.successDialog-page');
+      if (dlg) {
+        const s = dlg.getAttribute('style')||'';
+        if (!s.includes('display: none') && !s.includes('display:none')) {
+          const txt = (dlg.querySelector('.content-text')?.textContent||'').trim();
+          return { found:true, text: txt || 'success dialog' };
+        }
+      }
+      return { found:false };
+    }).catch(()=>({ found:false }));
+
+    if (toastResult.found) {
+      return { ok:true, type:"toast", detail:toastResult.text };
+    }
+
+    await sleep(500);
   }
-  return { ok:false, type:"pending_timeout" };
+
+  return { ok:false, type:"pending_timeout", detail:"No pending order found in Position order tab after waiting" };
 }
 
-async function verifyOrder(page) {
-  const [t, p] = await Promise.all([waitForToast(page), verifyPending(page)]);
-  if (t.ok) return { ok:true, detail:`toast: ${t.detail||t.type}` };
-  if (p.ok) return { ok:true, detail:"pending seen" };
-  return { ok:false, detail:`toast=${t.type}, pending=${p.type}` };
+// ── Two-gate verify: API confirmation + Position order pending ────────────────
+async function verifyOrderTwoGate(page, followCodeApiPromise) {
+  console.log("  Gate 1: waiting for follow/code API response...");
+  const gate1 = await waitForFollowCodeApi(followCodeApiPromise);
+  console.log("  Gate 1:", JSON.stringify(gate1));
+
+  if (!gate1.ok) {
+    return {
+      ok: false,
+      gate1, gate2: null,
+      detail: `Gate1 FAILED: ${gate1.detail||gate1.type||"api not received"}`,
+      summary: "❌ Gate 1 failed — server did not confirm order"
+    };
+  }
+
+  console.log("  Gate 2: checking Position order tab for pending...");
+  const gate2 = await verifyPositionOrderPending(page);
+  console.log("  Gate 2:", JSON.stringify(gate2));
+
+  if (!gate2.ok) {
+    return {
+      ok: false,
+      gate1, gate2,
+      detail: `Gate1 OK, Gate2 FAILED: ${gate2.detail}`,
+      summary: "⚠️ Gate 1 passed (API confirmed) but no pending order visible in Position order tab"
+    };
+  }
+
+  return {
+    ok: true,
+    gate1, gate2,
+    detail: `Gate1: api ok | Gate2: ${gate2.detail}`,
+    summary: `✅ CONFIRMED: API accepted + pending order visible in Position order tab\nOrder: ${gate2.detail}`
+  };
 }
+
+
 
 // ── Main flow ─────────────────────────────────────────────────────────────────
 async function runFlow(page, loginUrl, orderCode) {
@@ -571,25 +629,26 @@ async function runFlow(page, loginUrl, orderCode) {
   const codeBox = codeRes.locator;
   await codeBox.scrollIntoViewIfNeeded().catch(()=>null);
 
-  // ── Set up network API response interception ─────────────────────────────
-  // The API response is the ground truth - if a call fires, something happened.
-  let apiCallDetected = false;
-  let apiCallDetail = "";
+  // ── Intercept ONLY the follow/code API — this is Gate 1's signal ──────────
+  // We use a promise that resolves the moment the real order-submission API fires.
+  // ANY other API (quotes, depth, etc.) is ignored here.
+  let followCodeResolve = null;
+  const followCodeApiPromise = new Promise(resolve => { followCodeResolve = resolve; });
+
   const apiResponseHandler = async (response) => {
     try {
       const url = response.url();
-      if (!url.includes('/api/')) return;
-      const status = response.status();
+      // Only care about the specific order submission endpoint
+      if (!url.includes('/second/share/user/follow/code') &&
+          !url.includes('/follow/code') &&
+          !url.includes('/user/follow')) return;
       let body = "";
       try { body = await response.text(); } catch(_) {}
-      const lbody = body.toLowerCase();
-      // Any API response that mentions follow/code/order/success/error is relevant
-      if (/follow|code|order|share|invite|copy/i.test(url) ||
-          /follow|code|order|share|invite|success|error|msg|message/i.test(lbody)) {
-        apiCallDetected = true;
-        apiCallDetail = `${status} ${url.slice(-70)} => ${body.slice(0,150)}`;
-        console.log(`API_HIT: ${apiCallDetail}`);
-      }
+      const data = JSON.parse(body);
+      const ok = data?.resultCode === true;
+      const detail = `${response.status()} ${url.slice(-60)} => resultCode:${data?.resultCode}, errCode:${data?.errCode}, msg:${data?.errCodeDes}`;
+      console.log(`FOLLOW_CODE_API: ${detail}`);
+      followCodeResolve({ ok, resultCode: data?.resultCode, errCode: data?.errCode, errCodeDes: data?.errCodeDes, detail });
     } catch(_) {}
   };
   page.on('response', apiResponseHandler);
@@ -605,21 +664,16 @@ async function runFlow(page, loginUrl, orderCode) {
   console.log(`Code filled: "${filled}" (expected length ${String(orderCode).length})`);
   await dumpStep(page, "after-code-fill", { filled });
 
-  // ── Prime Vue: set followCode on parent + call ONLY followCodeClick ───────
-  // KEY LESSON FROM LOGS: calling multiple Vue methods (investConfirm, followDialogConfirm etc.)
-  // crashes with "Cannot read properties of undefined (reading 'shareId')" because those
-  // methods need a selected row. We ONLY call followCodeClick which IS the button's handler.
+  // ── Prime Vue: set followCode on parent component, call followCodeClick ───
   const vuePrimed = await page.evaluate((code) => {
     const input = document.querySelector('.follow-input input') ||
                   document.querySelector('input[placeholder*="order"]');
     if (!input) return { ok:false, reason:'no_input' };
 
-    // 1. Set native value
     const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
     if (nativeSetter) nativeSetter.call(input, code);
     else input.value = code;
 
-    // 2. Find parent Vue instance and set followCode + call ONLY followCodeClick
     const CODE_PROPS = ['followCode','orderCode','code','inviteCode','copyCode',
                         'tradeCode','followOrderCode','inputCode','codeValue'];
     let el = input;
@@ -627,24 +681,18 @@ async function runFlow(page, loginUrl, orderCode) {
     while (el && el !== document.body) {
       if (el.__vue__) {
         const vm = el.__vue__;
-        // Set currentValue on el-input
         if ('currentValue' in vm) vm.currentValue = code;
         if (typeof vm.handleInput === 'function') {
           try { vm.handleInput({ target: { value: code } }); } catch(_) {}
         }
         vm.$emit('input', code);
-        // Walk parent chain to find component with followCode
         let pvm = vm.$parent;
         let depth = 0;
         while (pvm && depth < 10) {
           const pdata = pvm.$data || {};
           let found = false;
           for (const prop of CODE_PROPS) {
-            if (prop in pdata) {
-              pdata[prop] = code;
-              try { pvm.$set(pvm, prop, code); } catch(_) {}
-              found = true;
-            }
+            if (prop in pdata) { pdata[prop] = code; try { pvm.$set(pvm, prop, code); } catch(_) {} found = true; }
           }
           if (found) { parentVm = pvm; break; }
           pvm = pvm.$parent;
@@ -655,25 +703,19 @@ async function runFlow(page, loginUrl, orderCode) {
       el = el.parentElement;
     }
 
-    // 3. Fire DOM events + blur to finalize v-model
     input.dispatchEvent(new Event('input', { bubbles: true }));
     input.dispatchEvent(new Event('change', { bubbles: true }));
     input.blur();
     input.dispatchEvent(new FocusEvent('blur', { bubbles: true }));
 
-    // 4. Call ONLY followCodeClick (the actual button handler) - nothing else
     if (parentVm) {
-      const methods = parentVm.$options?.methods || {};
-      // Try the most specific name first
-      const candidates = ['followCodeClick','userFollowCode','checkFollowCode',
-                          'searchFollowCode','followCode','handleFollowCode'];
+      const candidates = ['followCodeClick','userFollowCode','checkFollowCode','searchFollowCode','handleFollowCode'];
       for (const m of candidates) {
         if (typeof parentVm[m] === 'function') {
           try { parentVm[m](); return { ok:true, called:m }; } catch(e) {}
         }
       }
-      // If none matched, don't call anything - let the button click do it
-      return { ok:true, called:'none', allMethods: Object.keys(methods).slice(0,30) };
+      return { ok:true, called:'none' };
     }
     return { ok:false, reason:'no_parent_vm' };
   }, String(orderCode)).catch(e => ({ ok:false, reason:String(e).slice(0,80) }));
@@ -681,143 +723,102 @@ async function runFlow(page, loginUrl, orderCode) {
   console.log('Vue prime:', JSON.stringify(vuePrimed));
   await sleep(400);
 
-  // ── Click loop ────────────────────────────────────────────────────────────
-  let lastVerify = null;
+  // ── Click the button once (Vue prime already called followCodeClick) ───────
   const confirmBtn = page.locator('.follow-input .el-input-group__append button').first();
+  const vis = await confirmBtn.isVisible().catch(()=>false);
+  if (vis) {
+    await confirmBtn.scrollIntoViewIfNeeded().catch(()=>null);
+    await confirmBtn.click({ force: true, timeout: 5000 }).catch(()=>null);
+    console.log('Confirm button clicked');
+  }
+  await sleep(200);
+  await codeBox.press('Enter').catch(()=>null);
 
-  for (let i = 1; i <= CONFIRM_RETRIES; i++) {
-    console.log(`Confirm click attempt ${i}`);
-    apiCallDetected = false;
+  // ── GATE 1: Wait for follow/code API response ─────────────────────────────
+  console.log('Gate 1: waiting for follow/code API response...');
+  const gate1 = await Promise.race([
+    followCodeApiPromise,
+    new Promise(res => setTimeout(() => res({ ok:false, detail:'api_timeout: no follow/code response in time' }), VERIFY_TIMEOUT_MS))
+  ]);
+  page.off('response', apiResponseHandler);
+  console.log('Gate 1 result:', JSON.stringify(gate1));
 
-    // Re-set followCode before each click (Vue state can reset)
-    await page.evaluate((code) => {
-      const input = document.querySelector('.follow-input input') ||
-                    document.querySelector('input[placeholder*="order"]');
-      if (!input) return;
-      const CODE_PROPS = ['followCode','orderCode','code','inviteCode','copyCode','tradeCode'];
-      let el = input;
-      while (el && el !== document.body) {
-        if (el.__vue__) {
-          const vm = el.__vue__;
-          if ('currentValue' in vm) vm.currentValue = code;
-          if (typeof vm.handleInput === 'function') {
-            try { vm.handleInput({ target: { value: code } }); } catch(_) {}
-          }
-          vm.$emit('input', code);
-          let pvm = vm.$parent;
-          let depth = 0;
-          while (pvm && depth < 10) {
-            const pdata = pvm.$data || {};
-            for (const prop of CODE_PROPS) {
-              if (prop in pdata) { pdata[prop] = code; try { pvm.$set(pvm, prop, code); } catch(_) {} }
-            }
-            pvm = pvm.$parent; depth++;
-          }
-          break;
-        }
-        el = el.parentElement;
-      }
-      // DOM events + blur
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      input.dispatchEvent(new Event('change', { bubbles: true }));
-      input.blur();
-    }, String(orderCode)).catch(()=>null);
-    await sleep(150);
-
-    // Playwright click (triggers the real Vue @click handler on the button)
-    const vis = await confirmBtn.isVisible().catch(()=>false);
-    if (vis) {
-      await confirmBtn.scrollIntoViewIfNeeded().catch(()=>null);
-      await confirmBtn.click({ force: true, timeout: 5000 }).catch(()=>null);
-    }
-    await sleep(200);
-
-    // Also press Enter
-    await codeBox.press('Enter').catch(()=>null);
-
-    // Wait for API response or toast
-    const waitMs = CONFIRM_WAIT_MS;
-    await sleep(waitMs);
-    await dumpStep(page, `after-confirm-${i}`, {});
-
-    // If we detected an API call, log it and check for success signals
-    if (apiCallDetected) {
-      console.log(`  API detected: ${apiCallDetail}`);
-    }
-
-    // Check for any visible dialog/message regardless of content
-    const anyDialog = await page.evaluate(() => {
-      // successDialog-page
-      const dlg = document.querySelector('.successDialog-page');
-      if (dlg) {
-        const s = dlg.getAttribute('style')||'';
-        if (!s.includes('display: none') && !s.includes('display:none')) {
-          const txt = dlg.querySelector('.content-text')?.textContent?.trim() || '';
-          return { visible:true, type:'successDialog', text:txt };
-        }
-      }
-      // el-message
-      const msgs = Array.from(document.querySelectorAll('.el-message,.el-notification,.el-message-box'));
-      for (const m of msgs) {
-        const s = m.getAttribute('style')||'';
-        if (!s.includes('display: none') && !s.includes('display:none')) {
-          return { visible:true, type:'el-message', text:m.textContent?.trim().slice(0,120)||'' };
-        }
-      }
-      // Any dialog that appeared
-      const dialogs = Array.from(document.querySelectorAll('.el-dialog__wrapper'));
-      for (const d of dialogs) {
-        const s = d.getAttribute('style')||'';
-        if (!s.includes('display: none') && !s.includes('display:none')) {
-          return { visible:true, type:'el-dialog', text:d.textContent?.trim().slice(0,120)||'' };
-        }
-      }
-      return { visible:false };
-    }).catch(()=>({ visible:false }));
-
-    if (anyDialog.visible) {
-      console.log(`  Dialog/toast: ${JSON.stringify(anyDialog)}`);
-    }
-
-    const v = await verifyOrder(page);
-    lastVerify = v;
-
-    // SUCCESS conditions:
-    // 1. verifyOrder returns ok (toast/pending detected)
-    // 2. A dialog appeared with non-trivial text  
-    // 3. An API call was detected (the button IS working - even error means it fired)
-    if (v.ok) {
-      console.log("✓ Order confirmed:", v.detail);
-      page.off('response', apiResponseHandler);
-      return { ok:true, detail:v.detail };
-    }
-
-    if (anyDialog.visible && anyDialog.text && anyDialog.text.length > 5) {
-      console.log("✓ Dialog appeared:", anyDialog.text.slice(0,80));
-      page.off('response', apiResponseHandler);
-      return { ok:true, detail:`dialog: ${anyDialog.text.slice(0,80)}` };
-    }
-
-    if (apiCallDetected) {
-      // API fired - on a REAL run this means success (test code gets "invalid" but real code works)
-      // Return ok so we don't burn through all retries; the caller can decide from detail
-      const isError = /error|invalid|fail|not.found|expired/i.test(apiCallDetail);
-      console.log(`  API detected (isError=${isError}): ${apiCallDetail.slice(0,100)}`);
-      if (!isError) {
-        page.off('response', apiResponseHandler);
-        return { ok:true, detail:`api: ${apiCallDetail.slice(0,120)}` };
-      }
-      // Error response - with test code this is expected; don't burn more retries
-      console.log("  API returned error (test code?) - continuing");
-    }
-
-    console.log(`  verify: ${JSON.stringify(v)}`);
-    await sleep(CONFIRM_RETRY_DELAY_MS);
+  if (!gate1.ok) {
+    await dumpStep(page, 'gate1-failed', {});
+    return {
+      ok: false,
+      reason: 'gate1_failed',
+      detail: gate1.detail || 'follow/code API did not return resultCode:true',
+      gate1, gate2: null
+    };
   }
 
-  page.off('response', apiResponseHandler);
-  const finalApiNote = apiCallDetected ? ` (api_detected: ${apiCallDetail.slice(0,80)})` : "";
-  return { ok:false, reason:"verify_failed", detail:(lastVerify?.detail||"")+finalApiNote };
+  // ── GATE 2: Position order tab shows "pending" ───────────────────────────
+  console.log('Gate 2: checking Position order tab for pending...');
+  await sleep(800); // let the page update after API response
+
+  // Click Position order tab
+  const posTab = page.getByText(/position\s*order/i).first();
+  if (await posTab.isVisible().catch(()=>false)) {
+    await posTab.click({ timeout:5000 }).catch(()=>null);
+    console.log('  Clicked Position order tab');
+    await sleep(1200);
+  }
+
+  // Poll for "pending" in table rows
+  const gate2End = Date.now() + VERIFY_TIMEOUT_MS;
+  let gate2 = { ok:false, detail:'pending not found in Position order tab' };
+  while (Date.now() < gate2End) {
+    const pendingResult = await page.evaluate(() => {
+      // Check table rows
+      const rows = Array.from(document.querySelectorAll(
+        '.light-table tr, .el-table__row, .order-list-item'
+      ));
+      for (const r of rows) {
+        const txt = (r.textContent||'').trim();
+        if (/pending/i.test(txt) && txt.length > 5) {
+          return { found:true, text: txt.replace(/\s+/g,' ').slice(0,200) };
+        }
+      }
+      // Check individual cells for exact "pending" match
+      const cells = Array.from(document.querySelectorAll('td, .el-table__cell'));
+      for (const c of cells) {
+        if (/^\s*pending\s*$/i.test(c.textContent||'')) {
+          const row = c.closest('tr,.el-table__row') || c.parentElement;
+          return { found:true, text: (row?.textContent||'pending').replace(/\s+/g,' ').slice(0,200) };
+        }
+      }
+      return { found:false };
+    }).catch(()=>({ found:false }));
+
+    if (pendingResult.found) {
+      gate2 = { ok:true, detail:pendingResult.text };
+      break;
+    }
+    await sleep(500);
+  }
+
+  await dumpStep(page, 'gate2-result', { gate2ok: gate2.ok });
+  console.log('Gate 2 result:', JSON.stringify(gate2));
+
+  if (!gate2.ok) {
+    // Gate 1 passed but Gate 2 failed — still a partial success (API accepted)
+    // Don't fail the whole run; return ok:true with a warning
+    return {
+      ok: true,
+      reason: 'gate1_ok_gate2_warn',
+      detail: `Gate1 OK (API accepted) | Gate2 WARNING: ${gate2.detail}`,
+      gate1, gate2,
+      warning: 'API confirmed order but pending not visible in Position order tab'
+    };
+  }
+
+  return {
+    ok: true,
+    reason: 'both_gates_passed',
+    detail: `Gate1: API confirmed | Gate2: pending order visible`,
+    gate1, gate2
+  };
 }
 
 // ── Per-account runner ────────────────────────────────────────────────────────
@@ -858,7 +859,7 @@ async function runAccountOnUrl(account, orderCode, loginUrl) {
     // Step B: Run main flow, retry once if kicked to login
     for (let attempt = 1; attempt <= 2; attempt++) {
       const res = await runFlow(page, loginUrl, orderCode);
-      if (res.ok) return res.detail || "ok";
+      if (res.ok) return { ok:true, detail:res.detail, reason:res.reason, gate1:res.gate1, gate2:res.gate2, warning:res.warning };
 
       if (res.reason === "kicked_to_login" && attempt === 1) {
         console.log("Kicked to login mid-flow, re-logging in...");
@@ -884,9 +885,9 @@ async function runAccountAllUrls(account, orderCode, urls) {
   for (const loginUrl of urls) {
     console.log(`\n--- Trying ${loginUrl} for ${account.username} ---`);
     try {
-      const note = await runAccountOnUrl(account, orderCode, loginUrl);
-      console.log(`✓ SUCCESS: ${account.username} on ${loginUrl} | ${note}`);
-      return { ok:true, site:loginUrl, note };
+      const r = await runAccountOnUrl(account, orderCode, loginUrl);
+      console.log(`✓ SUCCESS: ${account.username} on ${loginUrl} | ${r.detail||r.reason||'ok'}`);
+      return { ok:true, site:loginUrl, note:r.detail, reason:r.reason, gate1:r.gate1, gate2:r.gate2, warning:r.warning };
     } catch(e) {
       console.log(`✗ FAILED: ${loginUrl} for ${account.username}: ${e?.message||String(e)}`);
       lastErr = e;
@@ -1002,7 +1003,6 @@ app.post("/run", async (req, res) => {
 
   (async () => {
     const startedAt = nowLocal();
-    let failAlertsSent = 0;
 
     console.log(`\n====== BOT RUN ${lastRunId} ======`);
     console.log(`Started: ${startedAt}`);
@@ -1011,12 +1011,22 @@ app.post("/run", async (req, res) => {
     console.log(`Force mobile: ${FORCE_MOBILE_MODE}`);
     console.log(`Code length: ${code.length}`);
 
-    try {
-      await sendEmail(
-        `T-Bot | Run ${lastRunId} started`,
-        `Started: ${startedAt}\nAccounts: ${cfg.accounts.length}\nURLs: ${LOGIN_URLS.length}\n`
-      );
+    // ── STARTED EMAIL ─────────────────────────────────────────────────────────
+    await sendEmail(
+      `🚀 T-Bot STARTED | Run ${lastRunId}`,
+      [
+        `T-Bot has started a new run.`,
+        ``,
+        `Time:     ${startedAt}`,
+        `Run ID:   ${lastRunId}`,
+        `Accounts: ${cfg.accounts.length}`,
+        `Code:     ${code}`,
+        ``,
+        `You will receive an email for each account and a final summary.`,
+      ].join('\n')
+    );
 
+    try {
       const results = [];
 
       for (const account of cfg.accounts) {
@@ -1024,38 +1034,102 @@ app.post("/run", async (req, res) => {
         const r = await runAccountAllUrls(account, code, LOGIN_URLS);
         results.push({ username:account.username, ...r });
 
-        if (!r.ok) {
+        // ── PER-ACCOUNT EMAIL (sent immediately, success OR failure) ──────────
+        if (r.ok) {
+          const g1 = r.gate1 || {};
+          const g2 = r.gate2 || {};
+          const hasWarning = r.reason === 'gate1_ok_gate2_warn';
+
+          await sendEmail(
+            hasWarning
+              ? `⚠️ T-Bot | ${account.username} — API OK but pending not confirmed`
+              : `✅ T-Bot | ${account.username} — ORDER CONFIRMED`,
+            [
+              hasWarning
+                ? `⚠️  ORDER SUBMITTED but could not confirm "pending" in Position order tab.`
+                : `✅  ORDER CONFIRMED — both verification gates passed.`,
+              ``,
+              `Account:  ${account.username}`,
+              `Site:     ${r.site || '-'}`,
+              `Time:     ${nowLocal()}`,
+              ``,
+              `── Gate 1: Server API ───────────────────────────`,
+              g1.ok
+                ? `✅ PASSED — Server accepted the order`
+                : `❌ FAILED — ${g1.detail || 'no response'}`,
+              g1.detail ? `   Detail: ${g1.detail}` : '',
+              ``,
+              `── Gate 2: Position Order Tab ───────────────────`,
+              g2.ok
+                ? `✅ PASSED — "pending" order visible`
+                : `❌ FAILED — ${g2.detail || 'pending not found'}`,
+              g2.ok && g2.detail
+                ? `   Order row: ${g2.detail.slice(0, 200)}`
+                : '',
+            ].filter(l => l !== null).join('\n')
+          );
+        } else {
           lastError = `${account.username}: ${r.error}`;
-          if (failAlertsSent < EMAIL_MAX_FAIL_ALERTS) {
-            failAlertsSent++;
-            await sendEmail(
-              `T-Bot | Run ${lastRunId} FAILED: ${account.username}`,
-              `Account: ${account.username}\nRun: ${lastRunId}\nTime: ${nowLocal()}\n\nError:\n${r.error}\n`
-            );
-          }
+          await sendEmail(
+            `❌ T-Bot | ${account.username} — FAILED`,
+            [
+              `❌  This account FAILED to place an order.`,
+              ``,
+              `Account: ${account.username}`,
+              `Time:    ${nowLocal()}`,
+              `Run ID:  ${lastRunId}`,
+              ``,
+              `Error: ${r.error}`,
+              ``,
+              r.gate1 ? `Gate 1: ${r.gate1.ok ? 'passed' : 'FAILED'} — ${r.gate1.detail || ''}` : '',
+              r.gate2 ? `Gate 2: ${r.gate2.ok ? 'passed' : 'FAILED'} — ${r.gate2.detail || ''}` : '',
+            ].filter(l => l !== null).join('\n')
+          );
         }
       }
 
+      // ── FINAL SUMMARY EMAIL ──────────────────────────────────────────────────
       const finishedAt = nowLocal();
-      const okCount   = results.filter(x=>x.ok).length;
-      const failCount = results.length - okCount;
+      const okCount    = results.filter(x => x.ok && x.reason !== 'gate1_ok_gate2_warn').length;
+      const warnCount  = results.filter(x => x.ok && x.reason === 'gate1_ok_gate2_warn').length;
+      const failCount  = results.filter(x => !x.ok).length;
 
-      const summary = results.map(r =>
-        r.ok ? `✓ ${r.username} (${r.site}) - ${r.note||""}` : `✗ ${r.username} - ${r.error}`
-      ).join("\n");
+      const summaryLines = results.map(r => {
+        if (!r.ok) return `❌  ${r.username}\n    Error: ${r.error}`;
+        if (r.reason === 'gate1_ok_gate2_warn') return `⚠️  ${r.username} (${r.site})\n    API confirmed — pending tab check inconclusive`;
+        return `✅  ${r.username} (${r.site})\n    Gate1: API confirmed | Gate2: pending visible`;
+      });
 
-      console.log(`\n====== DONE: ${okCount} ok, ${failCount} failed ======`);
-      console.log(summary);
+      console.log(`\n====== DONE: ${okCount} confirmed, ${warnCount} warn, ${failCount} failed ======`);
+      console.log(summaryLines.join('\n'));
 
+      const allOk = failCount === 0;
       await sendEmail(
-        `T-Bot | Run ${lastRunId} finished (${okCount} ok, ${failCount} failed)`,
-        `Finished: ${finishedAt}\nRun: ${lastRunId}\n\n${summary}\n`
+        allOk
+          ? `✅ T-Bot DONE | ${okCount + warnCount}/${results.length} accounts confirmed`
+          : `⚠️ T-Bot DONE | ${okCount + warnCount} ok, ${failCount} FAILED`,
+        [
+          `T-Bot run complete.`,
+          ``,
+          `Started:  ${startedAt}`,
+          `Finished: ${finishedAt}`,
+          `Run ID:   ${lastRunId}`,
+          ``,
+          `── Results ──────────────────────────────────────────`,
+          `  ✅ Fully confirmed:  ${okCount}`,
+          `  ⚠️  API ok, tab warn: ${warnCount}`,
+          `  ❌ Failed:           ${failCount}`,
+          `  Total accounts:    ${results.length}`,
+          ``,
+          `── Per-account ──────────────────────────────────────`,
+          ...summaryLines,
+        ].join('\n')
       );
     } catch(e) {
-      const msg = e?.message||String(e);
+      const msg = e?.message || String(e);
       lastError = msg;
       console.log("Run error:", msg);
-      await sendEmail(`T-Bot | Run ${lastRunId} CRASHED`, `Crashed: ${nowLocal()}\n\n${msg}\n`);
+      await sendEmail(`💥 T-Bot CRASHED | Run ${lastRunId}`, `Crashed: ${nowLocal()}\n\n${msg}\n`);
     } finally {
       isRunning = false;
     }
