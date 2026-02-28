@@ -1326,4 +1326,8 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`Email configured: ${emailConfigured()}`);
   writePlaceholderShot();
   startTelegramPolling();
+  // Notify on startup — if this fires unexpectedly, a restart happened
+  setTimeout(() => {
+    sendTelegram(`🟢 <b>T-Bot is online</b>\nReady to receive commands.\nSend /run CODE to start.`).catch(()=>{});
+  }, 3000);
 });
