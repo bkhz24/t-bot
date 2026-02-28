@@ -154,11 +154,15 @@ async function sendEmail(subject, text) {
 }
 
 async function sendTelegram(message) {
-  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return { ok:false, skipped:true };
+  return sendTelegramToChat(TELEGRAM_CHAT_ID, message);
+}
+
+async function sendTelegramToChat(chatId, message) {
+  if (!TELEGRAM_TOKEN || !chatId) return { ok:false, skipped:true };
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const https = require("https");
-      const body = JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: "HTML" });
+      const body = JSON.stringify({ chat_id: chatId, text: message, parse_mode: "HTML" });
       await new Promise((resolve, reject) => {
         const req = https.request({
           hostname: "api.telegram.org",
@@ -1253,18 +1257,21 @@ async function startTelegramPolling() {
           const msg = update.message || update.channel_post;
           if (!msg) continue;
 
-          // Only accept commands from the authorized chat
           const fromChatId = String(msg.chat?.id || "");
+          const text = (msg.text || "").trim();
+          const fromName = msg.from?.first_name || msg.from?.username || "someone";
+
+          // /chatid works from ANY chat — so you can find the ID of a new group
+          if (/^\/chatid/i.test(text)) {
+            await sendTelegramToChat(fromChatId, `Chat ID: <code>${fromChatId}</code>\n\nPaste this into Railway as TELEGRAM_CHAT_ID`).catch(()=>{});
+            continue;
+          }
+
+          // Only accept other commands from the authorized chat
           if (fromChatId !== String(TELEGRAM_CHAT_ID)) {
             console.log(`Telegram: ignored message from unauthorized chat ${fromChatId}`);
             continue;
           }
-
-          const text = (msg.text || "").trim();
-          const fromName = msg.from?.first_name || msg.from?.username || "someone";
-          console.log(`Telegram command from ${fromName}: ${text}`);
-
-          // /status
           if (/^\/status/i.test(text)) {
             const statusMsg = isRunning
               ? `⏳ <b>Bot is currently running</b>\nRun ID: ${lastRunId}\nStarted: ${lastRunAt}`
