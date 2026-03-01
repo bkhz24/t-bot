@@ -388,8 +388,16 @@ async function login(page, account, loginUrl) {
   for (let attempt = 1; attempt <= LOGIN_ATTEMPTS; attempt++) {
     console.log(`Login attempt ${attempt}/${LOGIN_ATTEMPTS} for ${account.username} on ${loginUrl}`);
 
-    await page.goto(loginUrl, { waitUntil:"domcontentloaded", timeout:60000 }).catch(()=>null);
+    await page.goto(loginUrl, { waitUntil:"domcontentloaded", timeout:15000 }).catch(()=>null);
     await sleep(1500);
+
+    // If the page is a browser error page (domain dead/unreachable), bail immediately
+    const currentUrl = page.url() || "";
+    if (currentUrl.startsWith("chrome-error://") || currentUrl.startsWith("about:")) {
+      console.log(`  Domain unreachable (${currentUrl}), skipping all retries`);
+      return false;
+    }
+
     await closeOverlays(page);
 
     // Wait for fields
@@ -928,30 +936,48 @@ async function runFlow(page, loginUrl, orderCode) {
   await dumpStep(page, 'gate2-result', { gate2ok: gate2.ok, how: gate2.how });
   console.log('Gate 2 result:', JSON.stringify(gate2));
 
-  // ── SCREENSHOTS for Telegram ───────────────────────────────────────────────
+  // ── SCREENSHOTS + GATE 3: Position order tab ─────────────────────────────
   // Screenshot 1: Invited me tab showing the order row
   const shot1Path = `/tmp/shot-invitedme-${Date.now()}.png`;
   await page.screenshot({ path: shot1Path, fullPage: false }).catch(()=>null);
   console.log('Screenshot 1 (Invited me tab) saved');
 
-  // Screenshot 2: Click Position order tab and capture pending
+  // Gate 3 + Screenshot 2: Click Position order tab, look for Pending
   let shot2Path = null;
+  let gate3 = { ok:false, detail:'Pending not found in Position order tab' };
   const posTab = page.getByText(/position\s*order/i).first();
   if (await posTab.isVisible().catch(()=>false)) {
     await posTab.click({ timeout:5000 }).catch(()=>null);
     await sleep(2000);
+
+    // Look for "Pending" text on position order tab
+    const pendingResult = await page.evaluate(() => {
+      const txt = (document.body.innerText || '').replace(/\s+/g,' ');
+      if (/pending/i.test(txt)) {
+        const match = txt.match(/pending[^.]{0,200}/i);
+        return { found:true, text: match?.[0]?.slice(0,150) || 'Pending found' };
+      }
+      return { found:false };
+    }).catch(()=>({ found:false }));
+
+    if (pendingResult.found) {
+      gate3 = { ok:true, detail: pendingResult.text };
+      console.log('Gate 3 PASSED: Pending found in Position order tab');
+    } else {
+      console.log('Gate 3: Pending not yet visible in Position order tab (order may still be processing)');
+    }
+
     shot2Path = `/tmp/shot-positionorder-${Date.now()}.png`;
     await page.screenshot({ path: shot2Path, fullPage: false }).catch(()=>null);
     console.log('Screenshot 2 (Position order tab) saved');
   }
 
+  const allGatesPassed = gate2.ok && gate3.ok;
   return {
     ok: true,
-    reason: gate2.ok ? 'both_gates_passed' : 'gate1_confirmed',
-    detail: gate2.ok
-      ? `Gate1: API confirmed | Gate2: ${gate2.how} — ${gate2.detail}`
-      : `Gate1: API confirmed (resultCode:true) | Gate2: order row not yet visible`,
-    gate1, gate2,
+    reason: allGatesPassed ? 'all_gates_passed' : gate2.ok ? 'gate1_gate2_passed' : 'gate1_confirmed',
+    detail: `Gate1: API confirmed | Gate2: ${gate2.ok ? gate2.detail?.slice(0,80) : 'not found'} | Gate3 (Pending): ${gate3.ok ? 'FOUND ✓' : 'not yet visible'}`,
+    gate1, gate2, gate3,
     screenshots: { invitedMe: shot1Path, positionOrder: shot2Path }
   };
 }
@@ -994,7 +1020,7 @@ async function runAccountOnUrl(account, orderCode, loginUrl) {
     // Step B: Run main flow, retry once if kicked to login
     for (let attempt = 1; attempt <= 2; attempt++) {
       const res = await runFlow(page, loginUrl, orderCode);
-      if (res.ok) return { ok:true, detail:res.detail, reason:res.reason, gate1:res.gate1, gate2:res.gate2, warning:res.warning };
+      if (res.ok) return { ok:true, detail:res.detail, reason:res.reason, gate1:res.gate1, gate2:res.gate2, warning:res.warning, screenshots:res.screenshots };
 
       if (res.reason === "kicked_to_login" && attempt === 1) {
         console.log("Kicked to login mid-flow, re-logging in...");
@@ -1025,7 +1051,7 @@ async function runAccountAllUrls(account, orderCode, urls) {
     try {
       const r = await runAccountOnUrl(account, orderCode, loginUrl);
       console.log(`✓ SUCCESS: ${account.username} on ${loginUrl} | ${r.detail||r.reason||'ok'}`);
-      return { ok:true, site:loginUrl, note:r.detail, reason:r.reason, gate1:r.gate1, gate2:r.gate2, warning:r.warning };
+      return { ok:true, site:loginUrl, note:r.detail, reason:r.reason, gate1:r.gate1, gate2:r.gate2, warning:r.warning, screenshots:r.screenshots };
     } catch(e) {
       console.log(`✗ FAILED: ${loginUrl} for ${account.username}: ${e?.message||String(e)}`);
       lastErr = e;
@@ -1033,6 +1059,10 @@ async function runAccountAllUrls(account, orderCode, urls) {
       if (e.reason === 'bad_code') {
         console.log(`  ↳ Code rejected by server (errCode 100001) — skipping remaining URLs for ${account.username}`);
         break;
+      }
+      // If login fields never appeared (dead domain), skip immediately — don't retry 8 times
+      if (/stayed on login page|chrome-error/i.test(e?.message||'')) {
+        console.log(`  ↳ Domain appears unreachable, skipping to next URL`);
       }
     }
   }
@@ -1168,10 +1198,9 @@ function startRun(code, cfg) {
 
         try {
           if (r.ok) {
-            const g2confirmed = r.reason === 'both_gates_passed';
-            const g2note = g2confirmed
-              ? `Gate 2: ${(r.gate2?.how||'tab')} confirmed ✓`
-              : `Gate 2: order row not yet visible (normal)`;
+            const g2confirmed = r.reason !== 'gate1_confirmed';
+            const g3 = r.gate3 || {};
+            const g3note = g3.ok ? `Gate 3: Pending found ✓` : `Gate 3: Pending not yet visible`;
 
             await notify(
               `T-Bot | ${account.username} - ORDER CONFIRMED`,
@@ -1186,12 +1215,13 @@ function startRun(code, cfg) {
                 `PASSED — Server returned resultCode:true`,
                 r.gate1?.detail ? `Detail: ${r.gate1.detail}` : '',
                 ``,
-                `-- Gate 2: Visual Check --`,
-                g2confirmed
-                  ? `PASSED — ${r.gate2?.how}: ${(r.gate2?.detail||'').slice(0,150)}`
-                  : `NOTE — Order row not yet visible in tab (normal if page still loading)`,
+                `-- Gate 2: Invited me tab --`,
+                r.gate2?.ok ? `PASSED — ${r.gate2?.detail?.slice(0,100)}` : `NOTE — order row not yet visible`,
+                ``,
+                `-- Gate 3: Position order tab --`,
+                g3.ok ? `PASSED — ${g3.detail?.slice(0,100)}` : `NOTE — Pending not yet visible (may still be processing)`,
               ].filter(l => l !== null).join('\n'),
-              `✅ <b>ORDER CONFIRMED</b>\n<b>${account.username}</b>\n\n<b>Server proof:</b>\nresultCode: true\nerrCode: ${r.gate1?.errCode ?? 0}\nmsg: ${r.gate1?.errCodeDes || 'ok'}\nCode: <code>${code}</code>\nTime: ${nowLocal()}\n\n${g2note}`
+              `✅ <b>ORDER CONFIRMED</b>\n<b>${account.username}</b>\n\n<b>Server proof:</b>\nresultCode: true\nerrCode: ${r.gate1?.errCode ?? 0}\nmsg: ${r.gate1?.errCodeDes || 'ok'}\nCode: <code>${code}</code>\nTime: ${nowLocal()}\n\nGate 2 (Invited me): ${r.gate2?.ok ? '✓ '+r.gate2?.how : 'not found'}\n${g3note}`
             );
 
             // Send screenshots to Telegram
