@@ -192,6 +192,54 @@ async function sendTelegramToChat(chatId, message) {
   return { ok:false, error:"failed after 3 attempts" };
 }
 
+async function sendTelegramPhoto(chatId, imagePath, caption) {
+  if (!TELEGRAM_TOKEN || !chatId) return { ok:false, skipped:true };
+  try {
+    const https = require("https");
+    const fs = require("fs");
+    const path = require("path");
+    const boundary = `----TGBoundary${Date.now()}`;
+    const imageData = fs.readFileSync(imagePath);
+    const filename = path.basename(imagePath);
+
+    const parts = [
+      `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}`,
+      caption ? `--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}` : null,
+      `--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="${filename}"\r\nContent-Type: image/png\r\n\r\n`,
+    ].filter(Boolean);
+
+    const bodyParts = [];
+    for (const p of parts) bodyParts.push(Buffer.from(p + '\r\n'));
+    bodyParts.push(imageData);
+    bodyParts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+    const body = Buffer.concat(bodyParts);
+
+    await new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: "api.telegram.org",
+        path: `/bot${TELEGRAM_TOKEN}/sendPhoto`,
+        method: "POST",
+        headers: {
+          "Content-Type": `multipart/form-data; boundary=${boundary}`,
+          "Content-Length": body.length
+        }
+      }, (res) => {
+        let data = "";
+        res.on("data", c => data += c);
+        res.on("end", () => resolve(JSON.parse(data)));
+      });
+      req.on("error", reject);
+      req.write(body);
+      req.end();
+    });
+    console.log(`Telegram photo sent: ${filename}`);
+    return { ok:true };
+  } catch(e) {
+    console.log(`Telegram photo failed: ${e?.message||String(e)}`);
+    return { ok:false };
+  }
+}
+
 // Send Telegram notification (email removed - Telegram only)
 async function notify(subject, emailBody, telegramMsg) {
   await sendTelegram(telegramMsg || `${subject}\n\n${emailBody.slice(0,300)}`).catch(e => console.log("notify telegram error:", e?.message));
@@ -880,13 +928,31 @@ async function runFlow(page, loginUrl, orderCode) {
   await dumpStep(page, 'gate2-result', { gate2ok: gate2.ok, how: gate2.how });
   console.log('Gate 2 result:', JSON.stringify(gate2));
 
+  // ── SCREENSHOTS for Telegram ───────────────────────────────────────────────
+  // Screenshot 1: Invited me tab showing the order row
+  const shot1Path = `/tmp/shot-invitedme-${Date.now()}.png`;
+  await page.screenshot({ path: shot1Path, fullPage: false }).catch(()=>null);
+  console.log('Screenshot 1 (Invited me tab) saved');
+
+  // Screenshot 2: Click Position order tab and capture pending
+  let shot2Path = null;
+  const posTab = page.getByText(/position\s*order/i).first();
+  if (await posTab.isVisible().catch(()=>false)) {
+    await posTab.click({ timeout:5000 }).catch(()=>null);
+    await sleep(2000);
+    shot2Path = `/tmp/shot-positionorder-${Date.now()}.png`;
+    await page.screenshot({ path: shot2Path, fullPage: false }).catch(()=>null);
+    console.log('Screenshot 2 (Position order tab) saved');
+  }
+
   return {
     ok: true,
     reason: gate2.ok ? 'both_gates_passed' : 'gate1_confirmed',
     detail: gate2.ok
       ? `Gate1: API confirmed | Gate2: ${gate2.how} — ${gate2.detail}`
       : `Gate1: API confirmed (resultCode:true) | Gate2: order row not yet visible`,
-    gate1, gate2
+    gate1, gate2,
+    screenshots: { invitedMe: shot1Path, positionOrder: shot2Path }
   };
 }
 
@@ -1125,8 +1191,17 @@ function startRun(code, cfg) {
                   ? `PASSED — ${r.gate2?.how}: ${(r.gate2?.detail||'').slice(0,150)}`
                   : `NOTE — Order row not yet visible in tab (normal if page still loading)`,
               ].filter(l => l !== null).join('\n'),
-              `✅ <b>ORDER CONFIRMED</b>\n<b>${account.username}</b>\nCode: <code>${code}</code>\nTime: ${nowLocal()}\nGate 1: API confirmed ✓\n${g2note}`
+              `✅ <b>ORDER CONFIRMED</b>\n<b>${account.username}</b>\n\n<b>Server proof:</b>\nresultCode: true\nerrCode: ${r.gate1?.errCode ?? 0}\nmsg: ${r.gate1?.errCodeDes || 'ok'}\nCode: <code>${code}</code>\nTime: ${nowLocal()}\n\n${g2note}`
             );
+
+            // Send screenshots to Telegram
+            const shots = r.screenshots || {};
+            if (shots.invitedMe) {
+              await sendTelegramPhoto(TELEGRAM_CHAT_ID, shots.invitedMe, `📋 ${account.username} — Invited me tab (order row)`).catch(()=>null);
+            }
+            if (shots.positionOrder) {
+              await sendTelegramPhoto(TELEGRAM_CHAT_ID, shots.positionOrder, `📊 ${account.username} — Position order tab`).catch(()=>null);
+            }
           } else {
             lastError = `${account.username}: ${r.error}`;
             await notify(
