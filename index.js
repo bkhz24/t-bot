@@ -18,8 +18,8 @@ const DEBUG_CAPTURE      = envTruthy(process.env.DEBUG_CAPTURE || "1");
 const FORCE_MOBILE_MODE  = (process.env.FORCE_MOBILE || "auto").toString().trim().toLowerCase();
 
 // Login
-const LOGIN_ATTEMPTS      = Number(process.env.LOGIN_ATTEMPTS     || "6");
-const LOGIN_FIELD_WAIT_MS = Number(process.env.LOGIN_FIELD_WAIT_MS|| "20000");
+const LOGIN_ATTEMPTS      = Number(process.env.LOGIN_ATTEMPTS     || "3"); // reduced from 6 - bail faster on dead sites
+const LOGIN_FIELD_WAIT_MS = Number(process.env.LOGIN_FIELD_WAIT_MS|| "8000"); // reduced from 20s - fields appear fast on live sites
 const WAIT_AFTER_LOGIN_MS = Number(process.env.WAIT_AFTER_LOGIN_MS|| "2200");
 
 // Navigation
@@ -195,26 +195,28 @@ async function sendTelegramToChat(chatId, message) {
 async function sendTelegramPhoto(chatId, imagePath, caption) {
   if (!TELEGRAM_TOKEN || !chatId) return { ok:false, skipped:true };
   try {
-    const https = require("https");
     const fs = require("fs");
-    const path = require("path");
-    const boundary = `----TGBoundary${Date.now()}`;
+    if (!fs.existsSync(imagePath)) {
+      console.log(`Telegram photo: file not found: ${imagePath}`);
+      return { ok:false };
+    }
     const imageData = fs.readFileSync(imagePath);
-    const filename = path.basename(imagePath);
+    const boundary = `TGBound${Date.now()}`;
+    const CRLF = "\r\n";
 
-    const parts = [
-      `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}`,
-      caption ? `--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}` : null,
-      `--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="${filename}"\r\nContent-Type: image/png\r\n\r\n`,
-    ].filter(Boolean);
+    const head = Buffer.from(
+      `--${boundary}${CRLF}` +
+      `Content-Disposition: form-data; name="chat_id"${CRLF}${CRLF}${chatId}${CRLF}` +
+      (caption ? `--${boundary}${CRLF}Content-Disposition: form-data; name="caption"${CRLF}${CRLF}${caption}${CRLF}` : '') +
+      `--${boundary}${CRLF}` +
+      `Content-Disposition: form-data; name="photo"; filename="screenshot.png"${CRLF}` +
+      `Content-Type: image/png${CRLF}${CRLF}`
+    );
+    const tail = Buffer.from(`${CRLF}--${boundary}--${CRLF}`);
+    const body = Buffer.concat([head, imageData, tail]);
 
-    const bodyParts = [];
-    for (const p of parts) bodyParts.push(Buffer.from(p + '\r\n'));
-    bodyParts.push(imageData);
-    bodyParts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
-    const body = Buffer.concat(bodyParts);
-
-    await new Promise((resolve, reject) => {
+    const https = require("https");
+    const result = await new Promise((resolve, reject) => {
       const req = https.request({
         hostname: "api.telegram.org",
         path: `/bot${TELEGRAM_TOKEN}/sendPhoto`,
@@ -226,16 +228,22 @@ async function sendTelegramPhoto(chatId, imagePath, caption) {
       }, (res) => {
         let data = "";
         res.on("data", c => data += c);
-        res.on("end", () => resolve(JSON.parse(data)));
+        res.on("end", () => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.ok) resolve(parsed);
+            else reject(new Error(parsed.description || `Telegram photo error: ${data}`));
+          } catch { reject(new Error(`Bad response: ${data.slice(0,100)}`)); }
+        });
       });
       req.on("error", reject);
       req.write(body);
       req.end();
     });
-    console.log(`Telegram photo sent: ${filename}`);
+    console.log(`Telegram photo sent to ${chatId}: ${caption||'screenshot'}`);
     return { ok:true };
   } catch(e) {
-    console.log(`Telegram photo failed: ${e?.message||String(e)}`);
+    console.log(`Telegram photo FAILED: ${e?.message||String(e)}`);
     return { ok:false };
   }
 }
@@ -1226,11 +1234,12 @@ function startRun(code, cfg) {
 
             // Send screenshots to Telegram
             const shots = r.screenshots || {};
+            console.log(`Screenshots available: invitedMe=${shots.invitedMe||'none'}, positionOrder=${shots.positionOrder||'none'}`);
             if (shots.invitedMe) {
-              await sendTelegramPhoto(TELEGRAM_CHAT_ID, shots.invitedMe, `📋 ${account.username} — Invited me tab (order row)`).catch(()=>null);
+              await sendTelegramPhoto(TELEGRAM_CHAT_ID, shots.invitedMe, `📋 ${account.username} — Invited me tab`);
             }
             if (shots.positionOrder) {
-              await sendTelegramPhoto(TELEGRAM_CHAT_ID, shots.positionOrder, `📊 ${account.username} — Position order tab`).catch(()=>null);
+              await sendTelegramPhoto(TELEGRAM_CHAT_ID, shots.positionOrder, `📊 ${account.username} — Position order tab`);
             }
           } else {
             lastError = `${account.username}: ${r.error}`;
