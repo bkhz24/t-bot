@@ -18,8 +18,8 @@ const DEBUG_CAPTURE      = envTruthy(process.env.DEBUG_CAPTURE || "1");
 const FORCE_MOBILE_MODE  = (process.env.FORCE_MOBILE || "auto").toString().trim().toLowerCase();
 
 // Login
-const LOGIN_ATTEMPTS      = Number(process.env.LOGIN_ATTEMPTS     || "3"); // reduced from 6 - bail faster on dead sites
-const LOGIN_FIELD_WAIT_MS = Number(process.env.LOGIN_FIELD_WAIT_MS|| "8000"); // reduced from 20s - fields appear fast on live sites
+const LOGIN_ATTEMPTS      = Math.min(Number(process.env.LOGIN_ATTEMPTS || "3"), 3); // max 3 — bail fast on dead sites
+const LOGIN_FIELD_WAIT_MS = Number(process.env.LOGIN_FIELD_WAIT_MS|| "8000");
 const WAIT_AFTER_LOGIN_MS = Number(process.env.WAIT_AFTER_LOGIN_MS|| "2200");
 
 // Navigation
@@ -1160,7 +1160,8 @@ app.get("/debug/files", (req, res) => {
 });
 
 // ── Core run function (called from web UI or Telegram) ───────────────────────
-function startRun(code, cfg) {
+function startRun(code, cfg, urls) {
+  const runUrls = urls || LOGIN_URLS;
   isRunning   = true;
   lastError   = null;
   lastRunAt   = nowLocal();
@@ -1175,7 +1176,7 @@ function startRun(code, cfg) {
     console.log(`\n====== BOT RUN ${lastRunId} ======`);
     console.log(`Started: ${startedAt}`);
     console.log(`Accounts: ${cfg.accounts.length}`);
-    console.log(`Login URLs: ${LOGIN_URLS.join(", ")}`);
+    console.log(`Login URLs: ${runUrls.join(", ")}`);
     console.log(`Force mobile: ${FORCE_MOBILE_MODE}`);
     console.log(`Code length: ${code.length}`);
 
@@ -1191,7 +1192,7 @@ function startRun(code, cfg) {
         ``,
         `You will receive a message for each account and a final summary.`,
       ].join('\n'),
-      `🚀 <b>T-Bot STARTED</b>\nCode: <code>${code}</code>\nAccounts: ${cfg.accounts.length}\nTime: ${startedAt}`
+      `🚀 <b>T-Bot STARTED</b>\nCode: <code>${code}</code>\nAccounts: ${cfg.accounts.length}\nSites: ${runUrls.map(u => u.replace('https://','').replace('/pc/#/login','')).join(', ')}\nTime: ${startedAt}`
     );
 
     await sleep(4000);
@@ -1201,7 +1202,7 @@ function startRun(code, cfg) {
 
       for (const account of cfg.accounts) {
         console.log(`\n====== Account: ${account.username} ======`);
-        const r = await runAccountAllUrls(account, code, LOGIN_URLS);
+        const r = await runAccountAllUrls(account, code, runUrls);
         results.push({ username:account.username, ...r });
 
         try {
@@ -1396,10 +1397,23 @@ async function startTelegramPolling() {
             continue;
           }
 
-          // /run CODE
-          const runMatch = text.match(/^\/run\s+([A-Za-z0-9]+)/i);
+          // /run CODE [site1.com site2.com ...]
+          const runMatch = text.match(/^\/run\s+([A-Za-z0-9]+)(.*)/i);
           if (runMatch) {
             const code = runMatch[1].trim();
+            const rest = (runMatch[2] || "").trim();
+
+            // Parse optional domains from the rest of the message
+            // Accepts: xsqd.cc fwqsw.com dsj55.net (space or comma separated)
+            const domains = rest.length
+              ? rest.split(/[\s,]+/).map(s => s.trim().toLowerCase()).filter(s => s.includes('.'))
+              : [];
+
+            // Build PC-only login URLs from domains
+            const urls = domains.length
+              ? domains.map(d => `https://${d}/pc/#/login`)
+              : LOGIN_URLS;
+
             if (isRunning) {
               await sendTelegram(`⚠️ Bot is already running (Run ID: ${lastRunId}). Wait for it to finish.`).catch(()=>{});
               continue;
@@ -1409,16 +1423,22 @@ async function startTelegramPolling() {
               await sendTelegram(`❌ Cannot start — accounts not configured: ${cfg.error}`).catch(()=>{});
               continue;
             }
-            console.log(`Telegram trigger: /run ${code} from ${fromName}`);
-            await sendTelegram(`👍 Got it ${fromName}! Starting run with code <code>${code}</code>...`).catch(()=>{});
-            startRun(code, cfg);
+            const siteNote = domains.length ? `\nSites: ${domains.join(', ')}` : '';
+            console.log(`Telegram trigger: /run ${code} from ${fromName}${domains.length ? ` with sites: ${domains.join(', ')}` : ''}`);
+            await sendTelegram(`👍 Got it ${fromName}! Starting run with code <code>${code}</code>${siteNote}`).catch(()=>{});
+            startRun(code, cfg, urls);
             continue;
           }
 
           // Unknown command — send help
           if (text.startsWith('/')) {
             await sendTelegram(
-              `<b>T-Bot commands:</b>\n\n/run CODE — start a run\n    Example: <code>/run 1GR0QF3KL</code>\n\n/status — check if bot is running`
+              `<b>T-Bot commands:</b>\n\n` +
+              `/run CODE — use saved sites\n` +
+              `    Example: <code>/run 1GR0QF3KL</code>\n\n` +
+              `/run CODE site1 site2 ... — use specific sites\n` +
+              `    Example: <code>/run 1GR0QF3KL xsqd.cc fwqsw.com dsj55.net</code>\n\n` +
+              `/status — check if bot is running`
             ).catch(()=>{});
           }
         }
