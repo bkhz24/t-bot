@@ -18,8 +18,8 @@ const DEBUG_CAPTURE      = envTruthy(process.env.DEBUG_CAPTURE || "1");
 const FORCE_MOBILE_MODE  = (process.env.FORCE_MOBILE || "auto").toString().trim().toLowerCase();
 
 // Login
-const LOGIN_ATTEMPTS      = Math.min(Number(process.env.LOGIN_ATTEMPTS || "3"), 3); // max 3 — bail fast on dead sites
-const LOGIN_FIELD_WAIT_MS = Number(process.env.LOGIN_FIELD_WAIT_MS|| "8000");
+const LOGIN_ATTEMPTS      = Math.min(Number(process.env.LOGIN_ATTEMPTS || "3"), 3);
+const LOGIN_FIELD_WAIT_MS = Number(process.env.LOGIN_FIELD_WAIT_MS|| "15000"); // back to 15s — some sites load slowly
 const WAIT_AFTER_LOGIN_MS = Number(process.env.WAIT_AFTER_LOGIN_MS|| "2200");
 
 // Navigation
@@ -1398,15 +1398,14 @@ async function startTelegramPolling() {
           }
 
           // /run CODE [site1.com site2.com ...]
-          const runMatch = text.match(/^\/run\s+([A-Za-z0-9]+)(.*)/i);
+          const runMatch = text.match(/^\/run\s+([A-Za-z0-9]+)([\s\S]*)/i);
           if (runMatch) {
             const code = runMatch[1].trim();
             const rest = (runMatch[2] || "").trim();
 
-            // Parse optional domains from the rest of the message
-            // Accepts: xsqd.cc fwqsw.com dsj55.net (space or comma separated)
+            // Parse optional domains — handles spaces, commas, newlines between them
             const domains = rest.length
-              ? rest.split(/[\s,]+/).map(s => s.trim().toLowerCase()).filter(s => s.includes('.'))
+              ? rest.split(/[\s,\n\r]+/).map(s => s.trim().toLowerCase()).filter(s => s.includes('.'))
               : [];
 
             // Build PC-only login URLs from domains
