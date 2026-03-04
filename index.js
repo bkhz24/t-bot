@@ -1159,6 +1159,95 @@ app.get("/debug/files", (req, res) => {
   fs.createReadStream(full).pipe(res);
 });
 
+// ── Site health check ─────────────────────────────────────────────────────────
+async function isSiteReachable(url) {
+  const https = require("https");
+  const http  = require("http");
+  return new Promise((resolve) => {
+    try {
+      const mod = url.startsWith("https") ? https : http;
+      const req = mod.request(url, { method:"HEAD", timeout:5000 }, (res) => {
+        resolve(res.statusCode < 500);
+      });
+      req.on("error", () => resolve(false));
+      req.on("timeout", () => { req.destroy(); resolve(false); });
+      req.end();
+    } catch { resolve(false); }
+  });
+}
+
+async function filterReachableUrls(urls) {
+  console.log(`Checking ${urls.length} sites...`);
+  const checks = await Promise.all(urls.map(async u => {
+    const ok = await isSiteReachable(u);
+    console.log(`  ${ok ? '✓' : '✗'} ${u}`);
+    return ok ? u : null;
+  }));
+  return checks.filter(Boolean);
+}
+
+// ── Process one account and send notifications ────────────────────────────────
+async function processAccount(account, code, runUrls) {
+  console.log(`\n====== Account: ${account.username} ======`);
+  const r = await runAccountAllUrls(account, code, runUrls);
+
+  try {
+    if (r.ok) {
+      const g2confirmed = r.reason !== 'gate1_confirmed';
+      const g3 = r.gate3 || {};
+      const g3note = g3.ok ? `Gate 3: Pending found ✓` : `Gate 3: Pending not yet visible`;
+
+      await notify(
+        `T-Bot | ${account.username} - ORDER CONFIRMED`,
+        [
+          `ORDER CONFIRMED — server accepted the order.`,
+          ``,
+          `Account:  ${account.username}`,
+          `Site:     ${r.site || '-'}`,
+          `Time:     ${nowLocal()}`,
+          ``,
+          `-- Gate 1: Server API --`,
+          `PASSED — Server returned resultCode:true`,
+          r.gate1?.detail ? `Detail: ${r.gate1.detail}` : '',
+          ``,
+          `-- Gate 2: Invited me tab --`,
+          r.gate2?.ok ? `PASSED — ${r.gate2?.detail?.slice(0,100)}` : `NOTE — order row not yet visible`,
+          ``,
+          `-- Gate 3: Position order tab --`,
+          g3.ok ? `PASSED — ${g3.detail?.slice(0,100)}` : `NOTE — Pending not yet visible`,
+        ].filter(l => l !== null).join('\n'),
+        `✅ <b>ORDER CONFIRMED</b>\n<b>${account.username}</b>\n\n<b>Server proof:</b>\nresultCode: true\nerrCode: ${r.gate1?.errCode ?? 0}\nmsg: ${r.gate1?.errCodeDes || 'ok'}\nCode: <code>${code}</code>\nTime: ${nowLocal()}\n\nGate 2 (Invited me): ${r.gate2?.ok ? '✓ '+r.gate2?.how : 'not found'}\n${g3note}`
+      );
+
+      const shots = r.screenshots || {};
+      console.log(`Screenshots available: invitedMe=${shots.invitedMe||'none'}, positionOrder=${shots.positionOrder||'none'}`);
+      if (shots.invitedMe) await sendTelegramPhoto(TELEGRAM_CHAT_ID, shots.invitedMe, `📋 ${account.username} — Invited me tab`);
+      if (shots.positionOrder) await sendTelegramPhoto(TELEGRAM_CHAT_ID, shots.positionOrder, `📊 ${account.username} — Position order tab`);
+    } else {
+      lastError = `${account.username}: ${r.error}`;
+      await notify(
+        `T-Bot | ${account.username} - FAILED`,
+        [
+          `This account FAILED to place an order.`,
+          ``,
+          `Account: ${account.username}`,
+          `Time:    ${nowLocal()}`,
+          ``,
+          `Error: ${r.error}`,
+          ``,
+          r.gate1 ? `Gate 1: ${r.gate1.ok ? 'passed' : 'FAILED'} — ${r.gate1.detail || ''}` : '',
+          r.gate2 ? `Gate 2: ${r.gate2.ok ? 'passed' : 'FAILED'} — ${r.gate2.detail || ''}` : '',
+        ].filter(l => l !== null).join('\n'),
+        `❌ <b>FAILED</b>\n<b>${account.username}</b>\nTime: ${nowLocal()}\nError: ${r.error?.slice(0,120)}`
+      );
+    }
+  } catch(notifyErr) {
+    console.log(`Notify failed for ${account.username}:`, notifyErr?.message||String(notifyErr));
+  }
+
+  return { username: account.username, ...r };
+}
+
 // ── Core run function (called from web UI or Telegram) ───────────────────────
 function startRun(code, cfg, urls) {
   const runUrls = urls || LOGIN_URLS;
@@ -1182,127 +1271,26 @@ function startRun(code, cfg, urls) {
 
     await notify(
       `T-Bot STARTED | Code: ${code} | Run ${lastRunId}`,
-      [
-        `T-Bot has started a new run.`,
-        ``,
-        `Time:     ${startedAt}`,
-        `Run ID:   ${lastRunId}`,
-        `Accounts: ${cfg.accounts.length}`,
-        `Code:     ${code}`,
-        ``,
-        `You will receive a message for each account and a final summary.`,
-      ].join('\n'),
+      [`T-Bot has started a new run.`, ``, `Time: ${startedAt}`, `Accounts: ${cfg.accounts.length}`, `Code: ${code}`].join('\n'),
       `🚀 <b>T-Bot STARTED</b>\nCode: <code>${code}</code>\nAccounts: ${cfg.accounts.length}\nSites: ${runUrls.map(u => u.replace('https://','').replace('/pc/#/login','')).join(', ')}\nTime: ${startedAt}`
     );
 
-    await sleep(4000);
+    await sleep(2000);
 
     try {
-      const results = [];
-
-      for (const account of cfg.accounts) {
-        console.log(`\n====== Account: ${account.username} ======`);
-        const r = await runAccountAllUrls(account, code, runUrls);
-        results.push({ username:account.username, ...r });
-
-        try {
-          if (r.ok) {
-            const g2confirmed = r.reason !== 'gate1_confirmed';
-            const g3 = r.gate3 || {};
-            const g3note = g3.ok ? `Gate 3: Pending found ✓` : `Gate 3: Pending not yet visible`;
-
-            await notify(
-              `T-Bot | ${account.username} - ORDER CONFIRMED`,
-              [
-                `ORDER CONFIRMED — server accepted the order.`,
-                ``,
-                `Account:  ${account.username}`,
-                `Site:     ${r.site || '-'}`,
-                `Time:     ${nowLocal()}`,
-                ``,
-                `-- Gate 1: Server API --`,
-                `PASSED — Server returned resultCode:true`,
-                r.gate1?.detail ? `Detail: ${r.gate1.detail}` : '',
-                ``,
-                `-- Gate 2: Invited me tab --`,
-                r.gate2?.ok ? `PASSED — ${r.gate2?.detail?.slice(0,100)}` : `NOTE — order row not yet visible`,
-                ``,
-                `-- Gate 3: Position order tab --`,
-                g3.ok ? `PASSED — ${g3.detail?.slice(0,100)}` : `NOTE — Pending not yet visible (may still be processing)`,
-              ].filter(l => l !== null).join('\n'),
-              `✅ <b>ORDER CONFIRMED</b>\n<b>${account.username}</b>\n\n<b>Server proof:</b>\nresultCode: true\nerrCode: ${r.gate1?.errCode ?? 0}\nmsg: ${r.gate1?.errCodeDes || 'ok'}\nCode: <code>${code}</code>\nTime: ${nowLocal()}\n\nGate 2 (Invited me): ${r.gate2?.ok ? '✓ '+r.gate2?.how : 'not found'}\n${g3note}`
-            );
-
-            // Send screenshots to Telegram
-            const shots = r.screenshots || {};
-            console.log(`Screenshots available: invitedMe=${shots.invitedMe||'none'}, positionOrder=${shots.positionOrder||'none'}`);
-            if (shots.invitedMe) {
-              await sendTelegramPhoto(TELEGRAM_CHAT_ID, shots.invitedMe, `📋 ${account.username} — Invited me tab`);
-            }
-            if (shots.positionOrder) {
-              await sendTelegramPhoto(TELEGRAM_CHAT_ID, shots.positionOrder, `📊 ${account.username} — Position order tab`);
-            }
-          } else {
-            lastError = `${account.username}: ${r.error}`;
-            await notify(
-              `T-Bot | ${account.username} - FAILED`,
-              [
-                `This account FAILED to place an order.`,
-                ``,
-                `Account: ${account.username}`,
-                `Time:    ${nowLocal()}`,
-                `Run ID:  ${lastRunId}`,
-                ``,
-                `Error: ${r.error}`,
-                ``,
-                r.gate1 ? `Gate 1: ${r.gate1.ok ? 'passed' : 'FAILED'} — ${r.gate1.detail || ''}` : '',
-                r.gate2 ? `Gate 2: ${r.gate2.ok ? 'passed' : 'FAILED'} — ${r.gate2.detail || ''}` : '',
-              ].filter(l => l !== null).join('\n'),
-              `❌ <b>FAILED</b>\n<b>${account.username}</b>\nTime: ${nowLocal()}\nError: ${r.error?.slice(0,120)}`
-            );
-          }
-        } catch(notifyErr) {
-          console.log(`Notify failed for ${account.username}:`, notifyErr?.message||String(notifyErr));
-        }
-      }
+      const results = await runWithRetry(code, cfg, runUrls, startedAt);
 
       const finishedAt = nowLocal();
       const okCount    = results.filter(x => x.ok).length;
       const failCount  = results.filter(x => !x.ok).length;
-
-      const summaryLines = results.map(r => {
-        if (!r.ok) return `FAILED: ${r.username}\n    Error: ${r.error}`;
-        const g2note = r.reason === 'both_gates_passed' ? 'API + tab confirmed' : 'API confirmed';
-        return `CONFIRMED: ${r.username} (${r.site})\n    ${g2note}`;
-      });
-
-      const tgSummary = results.map(r =>
-        r.ok ? `✅ ${r.username}` : `❌ ${r.username}`
-      ).join('\n');
+      const tgSummary  = results.map(r => r.ok ? `✅ ${r.username}` : `❌ ${r.username}`).join('\n');
+      const allOk      = failCount === 0;
 
       console.log(`\n====== DONE: ${okCount} confirmed, ${failCount} failed ======`);
-      console.log(summaryLines.join('\n'));
 
-      const allOk = failCount === 0;
       await notify(
-        allOk
-          ? `T-Bot DONE | ${okCount}/${results.length} accounts confirmed`
-          : `T-Bot DONE | ${okCount} confirmed, ${failCount} FAILED`,
-        [
-          `T-Bot run complete.`,
-          ``,
-          `Started:  ${startedAt}`,
-          `Finished: ${finishedAt}`,
-          `Run ID:   ${lastRunId}`,
-          ``,
-          `-- Results --`,
-          `  Confirmed: ${okCount}`,
-          `  Failed:    ${failCount}`,
-          `  Total:     ${results.length}`,
-          ``,
-          `-- Per-account --`,
-          ...summaryLines,
-        ].join('\n'),
+        allOk ? `T-Bot DONE | ${okCount}/${results.length} confirmed` : `T-Bot DONE | ${okCount} confirmed, ${failCount} FAILED`,
+        [`T-Bot run complete.`, ``, `Started:  ${startedAt}`, `Finished: ${finishedAt}`, `Confirmed: ${okCount}`, `Failed: ${failCount}`].join('\n'),
         `${allOk ? '✅' : '⚠️'} <b>T-Bot DONE</b>\n${okCount}/${results.length} confirmed\nStarted: ${startedAt}\nFinished: ${finishedAt}\n\n${tgSummary}`
       );
     } catch(e) {
@@ -1315,6 +1303,41 @@ function startRun(code, cfg, urls) {
       isRunning = false;
     }
   })();
+}
+
+async function runWithRetry(code, cfg, runUrls, startedAt, attempt = 1) {
+  // Pre-flight: filter out unreachable sites
+  const liveUrls = await filterReachableUrls(runUrls);
+  if (liveUrls.length === 0) {
+    if (attempt === 1) {
+      console.log("All sites unreachable — waiting 60s then retrying...");
+      await sendTelegram(`⚠️ All sites unreachable, retrying in 60 seconds...`).catch(()=>{});
+      await sleep(60000);
+      return runWithRetry(code, cfg, runUrls, startedAt, 2);
+    }
+    throw new Error("All sites still unreachable after retry");
+  }
+
+  console.log(`Live sites (${liveUrls.length}): ${liveUrls.join(', ')}`);
+
+  // Run all accounts in PARALLEL
+  console.log(`Running ${cfg.accounts.length} accounts in parallel...`);
+  const results = await Promise.all(
+    cfg.accounts.map(account => processAccount(account, code, liveUrls))
+  );
+
+  const okCount   = results.filter(x => x.ok).length;
+  const failCount = results.filter(x => !x.ok).length;
+
+  // If everything failed and we haven't retried yet, wait and try again
+  if (okCount === 0 && attempt === 1) {
+    console.log("All accounts failed — waiting 60s then retrying...");
+    await sendTelegram(`⚠️ All accounts failed (likely site issue). Retrying in 60 seconds...`).catch(()=>{});
+    await sleep(60000);
+    return runWithRetry(code, cfg, runUrls, startedAt, 2);
+  }
+
+  return results;
 }
 
 app.post("/run", async (req, res) => {
