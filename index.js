@@ -555,24 +555,34 @@ async function gotoFuturesMobile(page) {
 
 // ── Navigation: Invited Me ────────────────────────────────────────────────────
 async function clickInvitedMe(page) {
-  const end = Date.now() + 10000;
+  const end = Date.now() + 12000;
   while (Date.now() < end) {
-    const tab = page.getByText(/invited\s*me/i).first();
-    if (await tab.isVisible().catch(()=>false)) {
-      await tab.click({ timeout:5000 }).catch(()=>null);
-      console.log("Clicked 'Invited me'");
-      // Wait until the order code input actually appears (up to 8s) before returning
-      const inputEnd = Date.now() + 8000;
-      while (Date.now() < inputEnd) {
-        const inp = page.locator(ORDER_CODE_SEL).first();
-        if (await inp.isVisible().catch(()=>false)) {
-          console.log("  Order code input visible");
-          return true;
+    // Try multiple selectors — PC and h5 use different tab structures
+    const selectors = [
+      () => page.getByText(/invited\s*me/i).first(),
+      () => page.locator('.tab-item, .van-tab, .tabs__item, [class*="tab"]').filter({ hasText: /invited/i }).first(),
+      () => page.locator('span, div, a').filter({ hasText: /^invited\s*me$/i }).first(),
+    ];
+
+    for (const getSel of selectors) {
+      const el = getSel();
+      if (await el.isVisible().catch(()=>false)) {
+        await el.click({ timeout:5000 }).catch(()=>null);
+        console.log("Clicked 'Invited me'");
+        await sleep(800);
+        // Wait for order code input to appear
+        const inputEnd = Date.now() + 8000;
+        while (Date.now() < inputEnd) {
+          const inp = page.locator(ORDER_CODE_SEL).first();
+          if (await inp.isVisible().catch(()=>false)) {
+            console.log("  Order code input visible");
+            return true;
+          }
+          await sleep(300);
         }
-        await sleep(300);
+        console.log("  Order code input not found after clicking Invited me");
+        return true;
       }
-      console.log("  Order code input not found after clicking Invited me");
-      return true; // tab was clicked, input just didn't appear - let runFlow handle it
     }
     await sleep(400);
   }
@@ -1320,13 +1330,13 @@ async function runWithRetry(code, cfg, runUrls, startedAt, attempt = 1) {
 
   console.log(`Live sites (${liveUrls.length}): ${liveUrls.join(', ')}`);
 
-  // Staggered parallel — accounts start 8 seconds apart to avoid triggering site blocks
-  console.log(`Running ${cfg.accounts.length} accounts with staggered start (8s apart)...`);
-  const results = await Promise.all(
-    cfg.accounts.map((account, i) =>
-      sleep(i * 8000).then(() => processAccount(account, code, liveUrls))
-    )
-  );
+  // Sequential only — parallel/staggered causes sites to block multiple sessions from same IP
+  console.log(`Running ${cfg.accounts.length} accounts sequentially...`);
+  const results = [];
+  for (const account of cfg.accounts) {
+    const r = await processAccount(account, code, liveUrls);
+    results.push(r);
+  }
 
   const okCount   = results.filter(x => x.ok).length;
   const failCount = results.filter(x => !x.ok).length;
