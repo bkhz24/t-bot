@@ -1433,9 +1433,12 @@ async function startTelegramPolling() {
               ? rest.split(/[\s,\n\r]+/).map(s => s.trim().toLowerCase()).filter(s => s.includes('.'))
               : [];
 
-            // Build PC-only login URLs from domains
+            // Build both PC and h5 login URLs from domains
             const urls = domains.length
-              ? domains.map(d => `https://${d}/pc/#/login`)
+              ? domains.flatMap(d => [
+                  `https://${d}/pc/#/login`,
+                  `https://${d}/h5/#/login`
+                ])
               : LOGIN_URLS;
 
             if (isRunning) {
