@@ -1320,13 +1320,13 @@ async function runWithRetry(code, cfg, runUrls, startedAt, attempt = 1) {
 
   console.log(`Live sites (${liveUrls.length}): ${liveUrls.join(', ')}`);
 
-  // Run accounts sequentially — parallel caused sites to block simultaneous logins
-  console.log(`Running ${cfg.accounts.length} accounts sequentially...`);
-  const results = [];
-  for (const account of cfg.accounts) {
-    const r = await processAccount(account, code, liveUrls);
-    results.push(r);
-  }
+  // Staggered parallel — accounts start 8 seconds apart to avoid triggering site blocks
+  console.log(`Running ${cfg.accounts.length} accounts with staggered start (8s apart)...`);
+  const results = await Promise.all(
+    cfg.accounts.map((account, i) =>
+      sleep(i * 8000).then(() => processAccount(account, code, liveUrls))
+    )
+  );
 
   const okCount   = results.filter(x => x.ok).length;
   const failCount = results.filter(x => !x.ok).length;
