@@ -968,14 +968,30 @@ async function runFlow(page, loginUrl, orderCode) {
     await posTab.click({ timeout:5000 }).catch(()=>null);
     await sleep(2000);
 
-    // Look for "Pending" text on position order tab
+    // Look for "Pending" text on position order tab — check multiple ways
     const pendingResult = await page.evaluate(() => {
-      const txt = (document.body.innerText || '').replace(/\s+/g,' ');
-      if (/pending/i.test(txt)) {
-        const match = txt.match(/pending[^.]{0,200}/i);
-        return { found:true, text: match?.[0]?.slice(0,150) || 'Pending found' };
+      // Method 1: innerText (visible text only)
+      const innerTxt = (document.body.innerText || '').replace(/\s+/g,' ');
+      if (/pending/i.test(innerTxt)) {
+        const match = innerTxt.match(/pending[^.]{0,200}/i);
+        return { found:true, text: match?.[0]?.slice(0,150) || 'Pending found (innerText)' };
       }
-      return { found:false };
+
+      // Method 2: textContent of all elements (catches hidden/shadow text)
+      const allEls = Array.from(document.querySelectorAll('*'));
+      for (const el of allEls) {
+        const t = (el.textContent || '').trim();
+        if (/^pending$/i.test(t)) {
+          return { found:true, text: `Pending found in element: ${el.tagName}.${el.className}` };
+        }
+      }
+
+      // Method 3: check raw innerHTML for "pending" string
+      if (/pending/i.test(document.body.innerHTML || '')) {
+        return { found:true, text: 'Pending found in page HTML' };
+      }
+
+      return { found:false, sample: innerTxt.slice(0, 300) };
     }).catch(()=>({ found:false }));
 
     if (pendingResult.found) {
