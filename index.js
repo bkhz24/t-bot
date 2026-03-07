@@ -283,11 +283,13 @@ async function captureFailure(page, tag, msg) {
   const dir = lastDebugDir || "/tmp";
   ensureDir(dir);
   const base = path.join(dir, `${sanitizeFilename(tag)}-${Date.now()}`);
+  const shotPath = `${base}.png`;
   const url = page.url() || "";
   console.log("FAIL:", msg, "| URL:", url);
-  try { await saveShot(page, `${base}.png`); } catch {}
+  try { await saveShot(page, shotPath); } catch { return null; }
   try { fs.writeFileSync(`${base}.html`, String(await page.content().catch(()=>""))); } catch {}
   try { fs.writeFileSync(`${base}.url.txt`, url); } catch {}
+  return shotPath;
 }
 
 // ── Selectors ─────────────────────────────────────────────────────────────────
@@ -968,31 +970,36 @@ async function runFlow(page, loginUrl, orderCode) {
     await posTab.click({ timeout:5000 }).catch(()=>null);
     await sleep(2000);
 
-    // Look for "Pending" text on position order tab — check multiple ways
-    const pendingResult = await page.evaluate(() => {
-      // Method 1: innerText (visible text only)
-      const innerTxt = (document.body.innerText || '').replace(/\s+/g,' ');
-      if (/pending/i.test(innerTxt)) {
-        const match = innerTxt.match(/pending[^.]{0,200}/i);
-        return { found:true, text: match?.[0]?.slice(0,150) || 'Pending found (innerText)' };
-      }
+    // Look for "Pending" using Playwright's native locator — more reliable than evaluate
+    let pendingResult = { found: false, text: '' };
 
-      // Method 2: textContent of all elements (catches hidden/shadow text)
-      const allEls = Array.from(document.querySelectorAll('*'));
-      for (const el of allEls) {
-        const t = (el.textContent || '').trim();
-        if (/^pending$/i.test(t)) {
-          return { found:true, text: `Pending found in element: ${el.tagName}.${el.className}` };
+    try {
+      // Try Playwright locator first
+      const pendingEl = page.getByText(/^pending$/i).first();
+      const pendingVisible = await pendingEl.isVisible({ timeout: 3000 }).catch(() => false);
+      if (pendingVisible) {
+        pendingResult = { found: true, text: 'Pending found (Playwright locator)' };
+      }
+    } catch {}
+
+    // Fallback: any element containing "pending"
+    if (!pendingResult.found) {
+      try {
+        const anyPending = page.locator('*').filter({ hasText: /pending/i }).first();
+        const anyVisible = await anyPending.isVisible({ timeout: 2000 }).catch(() => false);
+        if (anyVisible) {
+          pendingResult = { found: true, text: 'Pending found (any element)' };
         }
-      }
+      } catch {}
+    }
 
-      // Method 3: check raw innerHTML for "pending" string
-      if (/pending/i.test(document.body.innerHTML || '')) {
-        return { found:true, text: 'Pending found in page HTML' };
+    // Last resort: raw page content
+    if (!pendingResult.found) {
+      const content = await page.content().catch(() => '');
+      if (/pending/i.test(content)) {
+        pendingResult = { found: true, text: 'Pending found in page source' };
       }
-
-      return { found:false, sample: innerTxt.slice(0, 300) };
-    }).catch(()=>({ found:false }));
+    }
 
     if (pendingResult.found) {
       gate3 = { ok:true, detail: pendingResult.text };
@@ -1047,8 +1054,10 @@ async function runAccountOnUrl(account, orderCode, loginUrl) {
     // Step A: Login
     const loggedIn = await login(page, account, loginUrl);
     if (!loggedIn) {
-      await captureFailure(page, `${sanitizeFilename(account.username)}-login-failed`, "Login failed");
-      throw new Error("Login failed (stayed on login page)");
+      const loginFailShot = await captureFailure(page, `${sanitizeFilename(account.username)}-login-failed`, "Login failed");
+      const err = new Error("Login failed (stayed on login page)");
+      err.failShot = loginFailShot;
+      throw err;
     }
 
     // Step B: Run main flow, retry once if kicked to login
@@ -1063,11 +1072,11 @@ async function runAccountOnUrl(account, orderCode, loginUrl) {
         continue;
       }
 
-      await captureFailure(page, `${sanitizeFilename(account.username)}-flow-failed`,
+      const flowFailShot = await captureFailure(page, `${sanitizeFilename(account.username)}-flow-failed`,
         `Flow failed: ${res.reason}${res.detail ? ` | ${res.detail}` : ""}`);
-      // Use a special error class so runAccountAllUrls can bail immediately
       const err = new Error(`Flow failed: ${res.reason}${res.detail ? ` | ${res.detail}` : ""}`);
       err.reason = res.reason;
+      err.failShot = flowFailShot;
       throw err;
     }
 
@@ -1100,7 +1109,7 @@ async function runAccountAllUrls(account, orderCode, urls) {
       }
     }
   }
-  return { ok:false, error:lastErr?.message||"All URLs failed" };
+  return { ok:false, error:lastErr?.message||"All URLs failed", screenshots:{ failShot: lastErr?.failShot||null } };
 }
 
 // ── Express app ───────────────────────────────────────────────────────────────
@@ -1266,6 +1275,11 @@ async function processAccount(account, code, runUrls) {
         ].filter(l => l !== null).join('\n'),
         `❌ <b>FAILED</b>\n<b>${account.username}</b>\nTime: ${nowLocal()}\nError: ${r.error?.slice(0,120)}`
       );
+      // Send failure screenshot if available
+      const failShot = r.screenshots?.failShot;
+      if (failShot) {
+        await sendTelegramPhoto(TELEGRAM_CHAT_ID, failShot, `📸 ${account.username} — what the bot saw when it failed`).catch(()=>null);
+      }
     }
   } catch(notifyErr) {
     console.log(`Notify failed for ${account.username}:`, notifyErr?.message||String(notifyErr));
