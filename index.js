@@ -256,6 +256,7 @@ async function notify(subject, emailBody, telegramMsg) {
 // ── Debug artifacts ───────────────────────────────────────────────────────────
 let isRunning = false, lastRunAt = null, lastError = null;
 let lastRunId = null, lastDebugDir = null, lastShotPath = null;
+let lastUsedUrls = null; // remembered from previous run
 
 function writePlaceholderShot() {
   try {
@@ -1294,6 +1295,7 @@ function startRun(code, cfg, urls) {
   isRunning   = true;
   lastError   = null;
   lastRunAt   = nowLocal();
+  lastUsedUrls = runUrls; // remember for next run
   lastRunId   = crypto.randomBytes(6).toString("hex");
   lastDebugDir= `/tmp/debug-${lastRunId}`;
   ensureDir(lastDebugDir);
@@ -1479,7 +1481,7 @@ async function startTelegramPolling() {
                   `https://${d}/pc/#/login`,
                   `https://${d}/h5/#/login`
                 ])
-              : LOGIN_URLS;
+              : (lastUsedUrls || LOGIN_URLS);
 
             if (isRunning) {
               await sendTelegram(`⚠️ Bot is already running (Run ID: ${lastRunId}). Wait for it to finish.`).catch(()=>{});
@@ -1490,9 +1492,9 @@ async function startTelegramPolling() {
               await sendTelegram(`❌ Cannot start — accounts not configured: ${cfg.error}`).catch(()=>{});
               continue;
             }
-            const siteNote = domains.length ? `\nSites: ${domains.join(', ')}` : '';
-            console.log(`Telegram trigger: /run ${code} from ${fromName}${domains.length ? ` with sites: ${domains.join(', ')}` : ''}`);
-            await sendTelegram(`👍 Got it ${fromName}! Starting run with code <code>${code}</code>${siteNote}`).catch(()=>{});
+            const siteSource = domains.length ? `new sites: ${domains.join(', ')}` : lastUsedUrls ? `last sites: ${lastUsedUrls.map(u=>u.replace('https://','').replace('/pc/#/login','').replace('/h5/#/login','')).filter((v,i,a)=>a.indexOf(v)===i).join(', ')}` : `default sites`;
+            console.log(`Telegram trigger: /run ${code} from ${fromName} — ${siteSource}`);
+            await sendTelegram(`👍 Got it ${fromName}! Starting run with code <code>${code}</code>\n📍 Using ${siteSource}`).catch(()=>{});
             startRun(code, cfg, urls);
             continue;
           }
